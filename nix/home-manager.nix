@@ -174,7 +174,9 @@ in {
       example = "/home/alice/Documents/Notes";
       description = ''
         An Obsidian vault the agent may read and write without confirmation.
-        Sets `instructions.vault` and is added to every session's workspace.
+        Sets `instructions.vault`. The vault is named in the agent's
+        instructions but is not one of its workspace directories, so an
+        AGENTS.md in the vault is not loaded as instructions.
       '';
     };
 

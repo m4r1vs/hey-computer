@@ -73,7 +73,7 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
 
 ## Facts the code depends on (agy 1.5.13, measured)
 
-- Handshake: `initialize` → `session/new {cwd, mcpServers, additionalDirectories}` →
+- Handshake: `initialize` → `session/new {cwd, mcpServers}` →
   `session/set_config_option` (model, thought_level; mode=default if needed) →
   `session/prompt`; answers stream as `session/update`; the prompt returns a `stopReason`.
   No `authenticate` (the login is in the keyring, reached over the session bus).
@@ -83,7 +83,12 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
 - In default mode a tool call arrives as `session/request_permission` with `allow_once` /
   `reject_once`. A rejected call ends the turn with **no text**, so the daemon writes the
   message itself (`failed`/`denied`).
-- `additionalDirectories: [vault]` lets agy read and edit vault notes without prompts.
+- agy loads `AGENTS.md`, `GEMINI.md` and `.agents/` from every workspace directory as trusted
+  instructions: an `AGENTS.md` in a vault passed as `additionalDirectories` made it append a
+  word to every answer. The vault is therefore never a workspace directory. The agent reaches
+  it like any other folder (reads and edits arrived without a permission request, `find` as an
+  allowed `execute`), and the same `AGENTS.md` then had no effect, also on a follow-up after
+  the agent had read and edited the vault.
 - Timings: agent start 0.09–0.17 s; first session 0.8–1.2 s, later 0.02–0.06 s; a plain
   answer 1.5–2.8 s; one shell command 5–10 s (tool call to permission request alone was
   0.8 s in one run and 5.7 s in another). Hence inactivity timeouts, not total caps.

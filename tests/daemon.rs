@@ -508,7 +508,7 @@ async fn a_missing_agent_is_reported() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cold_agent_starts_on_the_first_request_and_the_vault_joins_the_workspace() {
+async fn a_cold_agent_starts_on_the_first_request_and_the_vault_stays_outside_the_workspace() {
     let h = Harness::start(SCRIPT, |c| {
         c.agent.warm_start = false;
         c.instructions.vault = PathBuf::from("/tmp/Someone's Vault");
@@ -518,12 +518,10 @@ async fn a_cold_agent_starts_on_the_first_request_and_the_vault_joins_the_worksp
     assert_eq!(h.log_count("start"), 0, "nothing starts before a request");
     assert_eq!(h.status().await.agent, AgentState::Down);
     assert_eq!(answer(&h.ask("plain", false).await), "Hello from the mock.");
-    assert_eq!(
-        h.log_count(r#"new mock-1 dirs=["/tmp/Someone's Vault"]"#),
-        1,
-        "{:?}",
-        h.log_lines()
-    );
+    // As a workspace directory, the vault's AGENTS.md would become standing
+    // instructions for the agent.
+    assert_eq!(h.log_count("new mock-1"), 1, "{:?}", h.log_lines());
+    assert_eq!(h.log_count("dirs="), 0, "{:?}", h.log_lines());
     let agents = std::fs::read_to_string(h.dir.join("state/workspace/AGENTS.md")).unwrap();
     assert!(agents.contains("`/tmp/Someone's Vault`"));
     h.stop().await;

@@ -675,13 +675,14 @@ impl Conductor {
                 "the assistant is not running",
             ));
         };
-        let mut params = json!({"cwd": paths.workspace, "mcpServers": []});
-        // The vault becomes part of the session's workspace, so the agent may
-        // read and write it like its own directory.
-        let vault = &self.config.instructions.vault;
-        if !vault.as_os_str().is_empty() {
-            params["additionalDirectories"] = json!([vault]);
-        }
+        // The vault is deliberately not passed as `additionalDirectories`:
+        // agy loads AGENTS.md, GEMINI.md and `.agents/` from every workspace
+        // directory as trusted instructions, so one file written into the
+        // vault (by a sync peer, a shared folder, or the agent itself after
+        // reading a hostile page) would steer every later request. Outside
+        // the workspace, the agent's reads and edits there arrive as
+        // permission requests, which the daemon allows.
+        let params = json!({"cwd": paths.workspace, "mcpServers": []});
         let result = live.conn.call("session/new", params, START_TIMEOUT).await;
         let result = match result {
             Ok(result) => result,
