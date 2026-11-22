@@ -30,6 +30,11 @@ const PROGRESS_EXPIRE_MS: u32 = 120_000;
 const CANCELLED_EXPIRE_MS: u32 = 2_000;
 /// The request echoed in the progress popup is cut here.
 const REQUEST_PREVIEW_CHARS: usize = 160;
+/// A viewer that exits with an error within this long is reported as
+/// failed; one that is still running then has its window up.
+const VIEWER_GRACE: Duration = Duration::from_millis(1500);
+/// How much of a failed viewer's stderr goes into the message.
+const VIEWER_STDERR_KEPT: usize = 400;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Presentation {
@@ -435,7 +440,7 @@ impl Worker {
             return;
         }
 
-        match open_viewer(&self.config.viewer, &file) {
+        match open_viewer(&self.config.viewer, &file).await {
             Ok(()) => {
                 self.notify(
                     "Answer opened",
@@ -447,7 +452,9 @@ impl Worker {
                 .await;
             }
             Err(e) => {
-                tracing::warn!("cannot start the viewer: {e:#}");
+                // Its stderr could quote the answer, so it stays at debug.
+                tracing::warn!("the viewer did not start");
+                tracing::debug!("the viewer: {e:#}");
                 let body = format!("{e:#}\n{}", file.display());
                 self.notify(
                     "Cannot open the viewer",
@@ -602,8 +609,13 @@ fn answer_stamp(path: &Path) -> (u128, u64) {
     (stamp, id)
 }
 
-/// Start the viewer on `file` and let it run on its own.
-fn open_viewer(argv: &[String], file: &Path) -> anyhow::Result<()> {
+/// Start the viewer on `file` and let it run on its own. A viewer that
+/// fails at once (`systemd-run` without a user manager, a missing display)
+/// is reported with what it said, instead of an "Answer opened" with no
+/// window behind it.
+async fn open_viewer(argv: &[String], file: &Path) -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+
     let file = file.to_string_lossy().into_owned();
     let mut args: Vec<String> = argv[1..]
         .iter()
@@ -617,16 +629,50 @@ fn open_viewer(argv: &[String], file: &Path) -> anyhow::Result<()> {
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         // Its own process group: a viewer is a window of its own and must not
         // get the daemon's signals.
         .process_group(0)
         .spawn()
         .map_err(|e| anyhow::anyhow!("starting {program}: {e}"))?;
-    tokio::spawn(async move {
-        let _ = child.wait().await;
+
+    // Read all of stderr, so a chatty viewer never blocks on a full pipe,
+    // and keep its start for the message.
+    let mut stderr = child.stderr.take();
+    let said = tokio::spawn(async move {
+        let mut kept = Vec::new();
+        let mut buffer = [0u8; 4096];
+        while let Some(pipe) = stderr.as_mut() {
+            match pipe.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) if kept.len() < VIEWER_STDERR_KEPT => kept.extend_from_slice(&buffer[..n]),
+                Ok(_) => {}
+            }
+        }
+        kept
     });
-    Ok(())
+
+    match tokio::time::timeout(VIEWER_GRACE, child.wait()).await {
+        Ok(Ok(status)) if !status.success() => {
+            let said = said.await.unwrap_or_default();
+            let said = String::from_utf8_lossy(&said);
+            let said = truncate(said.trim(), VIEWER_STDERR_KEPT);
+            if said.is_empty() {
+                anyhow::bail!("{program} failed ({status})");
+            }
+            anyhow::bail!("{program} failed ({status}): {said}");
+        }
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(anyhow::anyhow!("waiting for {program}: {e}")),
+        Err(_) => {
+            // Still running: a window is up.
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+                let _ = said.await;
+            });
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -790,5 +836,56 @@ mod tests {
         assert_eq!(left, 3);
         assert!(!files[0].exists() && !files[1].exists() && files[4].exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Show one long answer through `Desktop` with `viewer`, a notifier that
+    /// records its calls, and return the recorded calls.
+    async fn show_long_answer(name: &str, viewer: &[&str]) -> String {
+        let dir = std::env::temp_dir().join(format!("hc-viewer-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let config = PresentConfig {
+            notifier: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("echo \"$*\" >> '{}'; echo 7", calls.display()),
+                "sh".to_string(),
+            ],
+            viewer: viewer.iter().map(|a| a.to_string()).collect(),
+            ..PresentConfig::default()
+        };
+        let desktop = Desktop::spawn(&config, dir.join("answers"));
+        desktop.present(Presentation::Answer {
+            id: 1,
+            text: "# Heading\n\nbody".to_string(),
+            denied: vec![],
+        });
+        desktop.finish().await;
+        let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).unwrap();
+        recorded
+    }
+
+    #[tokio::test]
+    async fn a_viewer_that_fails_at_once_is_reported_with_what_it_said() {
+        let calls = show_long_answer(
+            "fails",
+            &["/bin/sh", "-c", "echo 'no display here' >&2; exit 3", "sh"],
+        )
+        .await;
+        assert!(calls.contains("Cannot open the viewer"), "{calls}");
+        assert!(calls.contains("no display here"), "{calls}");
+        assert!(!calls.contains("Answer opened"), "{calls}");
+    }
+
+    #[tokio::test]
+    async fn a_viewer_that_keeps_running_is_an_opened_answer() {
+        let started = std::time::Instant::now();
+        let calls = show_long_answer("runs", &["/bin/sh", "-c", "sleep 3", "sh"]).await;
+        assert!(calls.contains("Answer opened"), "{calls}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let calls = show_long_answer("quick", &["/bin/sh", "-c", "exit 0", "sh"]).await;
+        assert!(calls.contains("Answer opened"), "{calls}");
     }
 }
