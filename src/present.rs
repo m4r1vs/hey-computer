@@ -136,38 +136,55 @@ pub fn escape_markup(text: &str) -> String {
 
 /// A short answer as notification markup: escaped, with `**bold**` and
 /// `` `code` `` rendered, since models use them even when asked not to.
+///
+/// Code spans are found first and their content is left alone, so `**`
+/// inside one (`2**8`, `**/*.rs`) cannot open a bold tag that would close
+/// inside another; Pango refuses the whole body when tags do not nest.
 pub fn to_markup(text: &str) -> String {
-    let escaped = escape_markup(text.trim());
-    let bold = pair_up(&escaped, "**", "<b>", "</b>");
-    pair_up(&bold, "`", "<tt>", "</tt>")
-}
-
-/// Replace `marker`…`marker` pairs on one line with `open`…`close`. An
-/// unpaired marker stays as it is.
-fn pair_up(text: &str, marker: &str, open: &str, close: &str) -> String {
-    text.split('\n')
+    escape_markup(text.trim())
+        .split('\n')
         .map(|line| {
-            let pieces: Vec<&str> = line.split(marker).collect();
-            if pieces.len() < 3 {
-                return line.to_string();
-            }
-            let pairs = (pieces.len() - 1) / 2;
             let mut out = String::new();
-            for (i, piece) in pieces.iter().enumerate() {
-                if i > 0 {
-                    let marker_index = i - 1;
-                    if marker_index < pairs * 2 {
-                        out.push_str(if marker_index % 2 == 0 { open } else { close });
-                    } else {
-                        out.push_str(marker);
+            for (code, piece) in spans(line, "`") {
+                if code {
+                    out.push_str("<tt>");
+                    out.push_str(piece);
+                    out.push_str("</tt>");
+                } else {
+                    for (bold, piece) in spans(piece, "**") {
+                        if bold {
+                            out.push_str("<b>");
+                            out.push_str(piece);
+                            out.push_str("</b>");
+                        } else {
+                            out.push_str(piece);
+                        }
                     }
                 }
-                out.push_str(piece);
             }
             out
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Cut `text` at `marker` pairs: (true, inside) for each paired span,
+/// (false, outside) for the rest. An unpaired last marker stays in the
+/// text as it is.
+fn spans<'a>(text: &'a str, marker: &str) -> Vec<(bool, &'a str)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find(marker) {
+        let after = &rest[open + marker.len()..];
+        let Some(close) = after.find(marker) else {
+            break;
+        };
+        out.push((false, &rest[..open]));
+        out.push((true, &after[..close]));
+        rest = &after[close + marker.len()..];
+    }
+    out.push((false, rest));
+    out
 }
 
 /// The first thing worth naming in a long answer: its first heading or line,
@@ -690,6 +707,54 @@ mod tests {
         assert_eq!(to_markup("a `b` c `d"), "a <tt>b</tt> c `d");
         // Pairs do not reach across lines.
         assert_eq!(to_markup("**a\nb**"), "**a\nb**");
+    }
+
+    /// The tags in `markup` open and close in order, as Pango demands.
+    fn nests(markup: &str) -> bool {
+        let mut open = Vec::new();
+        let mut rest = markup;
+        while let Some(start) = rest.find('<') {
+            let Some(end) = rest[start..].find('>') else {
+                return false;
+            };
+            let tag = &rest[start + 1..start + end];
+            if let Some(name) = tag.strip_prefix('/') {
+                if open.pop() != Some(name) {
+                    return false;
+                }
+            } else {
+                open.push(tag);
+            }
+            rest = &rest[start + end + 1..];
+        }
+        open.is_empty()
+    }
+
+    #[test]
+    fn markup_in_code_spans_is_left_alone_and_tags_nest() {
+        assert_eq!(
+            to_markup("In Python, `2**8` is 256 and `2**10` is 1024."),
+            "In Python, <tt>2**8</tt> is 256 and <tt>2**10</tt> is 1024."
+        );
+        assert_eq!(
+            to_markup("**bold `code** tail`"),
+            "**bold <tt>code** tail</tt>"
+        );
+        assert_eq!(
+            to_markup("Use `**/*.rs` with **ripgrep**."),
+            "Use <tt>**/*.rs</tt> with <b>ripgrep</b>."
+        );
+        for text in [
+            "In Python, `2**8` is 256 and `2**10` is 1024.",
+            "**bold `code** tail`",
+            "`a**` b **c` d**",
+            "***x*** and `y`` z",
+            "**a** `b` **c `d` e** f`",
+            "<b>`x`</b> **<i>**",
+        ] {
+            let markup = to_markup(text);
+            assert!(nests(&markup), "{text:?} gave {markup:?}");
+        }
     }
 
     #[test]
