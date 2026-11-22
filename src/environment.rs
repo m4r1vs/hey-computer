@@ -252,6 +252,56 @@ fn write_file(path: &Path, text: &str) -> Result<()> {
     std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))
 }
 
+/// Where agy 1.5 keeps what was said: one database per conversation, a
+/// `brain/<conversation>` directory with full transcripts, and a log per
+/// agent process. Relative to the agent's directory.
+const HISTORY: &[&str] = &[
+    "antigravity-cli/conversations",
+    "antigravity-cli/brain",
+    "antigravity-cli/log",
+];
+
+/// Delete conversations and logs older than `days` (zero keeps all). Only
+/// called while the agent is not running. agy's other files (settings, its
+/// conversation summary index, caches) are left alone.
+pub fn prune_history(agent_dir: &Path, days: f64) {
+    if days <= 0.0 || !days.is_finite() {
+        return;
+    }
+    let Some(cutoff) = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs_f64(days * 86_400.0))
+    else {
+        return;
+    };
+    let mut removed = 0;
+    for dir in HISTORY {
+        let Ok(entries) = std::fs::read_dir(agent_dir.join(dir)) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            // Not followed: a link is removed as a link.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.modified().map_or(true, |m| m >= cutoff) {
+                continue;
+            }
+            let result = if meta.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            match result {
+                Ok(()) => removed += 1,
+                Err(e) => tracing::debug!("cannot remove {}: {e}", path.display()),
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::info!("removed {removed} conversations and logs older than {days} days");
+    }
+}
 /// Settings keys as a flat map, for `debug prepare`.
 pub fn settings_for_display(config: &Config) -> Result<Map<String, Value>> {
     match settings(config)? {
@@ -367,6 +417,52 @@ mod tests {
         };
         config.instructions.skills = vec![root.clone()];
         assert!(prepare(&config).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn old_conversations_and_logs_are_pruned_and_the_rest_kept() {
+        let root = scratch("history");
+        let agy = root.join("agy/antigravity-cli");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
+        let touch = |path: &Path, when: Option<std::time::SystemTime>| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x").unwrap();
+            if let Some(when) = when {
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_modified(when)
+                    .unwrap();
+            }
+        };
+        touch(&agy.join("conversations/old.db"), Some(old));
+        touch(&agy.join("conversations/new.db"), None);
+        touch(&agy.join("log/acp-server-old.log"), Some(old));
+        touch(
+            &agy.join("brain/old/.system_generated/logs/transcript.jsonl"),
+            None,
+        );
+        std::fs::File::open(agy.join("brain/old"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        touch(&agy.join("brain/new/transcript.jsonl"), None);
+        touch(&agy.join("conversation_summaries.db"), Some(old));
+        touch(&agy.join("settings.json"), Some(old));
+
+        prune_history(&root.join("agy"), 0.0);
+        assert!(agy.join("conversations/old.db").exists(), "zero keeps all");
+
+        prune_history(&root.join("agy"), 7.0);
+        assert!(!agy.join("conversations/old.db").exists());
+        assert!(!agy.join("log/acp-server-old.log").exists());
+        assert!(!agy.join("brain/old").exists());
+        assert!(agy.join("conversations/new.db").exists());
+        assert!(agy.join("brain/new/transcript.jsonl").exists());
+        assert!(agy.join("conversation_summaries.db").exists());
+        assert!(agy.join("settings.json").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

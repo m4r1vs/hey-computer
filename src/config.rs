@@ -45,6 +45,10 @@ pub struct Agent {
     /// First delay before restarting an agent that died; it doubles with
     /// every failure in a row, up to a minute.
     pub restart_delay_secs: f64,
+    /// agy keeps every conversation (requests, answers, tool output) in its
+    /// directory. Before each agent start, conversations and logs older than
+    /// this many days are deleted. Zero keeps them all.
+    pub history_days: f64,
     /// Merged over the agent's `settings.json` that the daemon writes.
     pub settings: toml::Table,
 }
@@ -113,6 +117,7 @@ impl Default for Agent {
             idle_stop_secs: 0.0,
             inactivity_timeout_secs: 45.0,
             restart_delay_secs: 1.0,
+            history_days: 7.0,
             settings: toml::Table::new(),
         }
     }
@@ -214,6 +219,10 @@ impl Config {
             if value > MAX_SECS {
                 bail!("{key} must be at most {MAX_SECS} seconds (a year), not {value}");
             }
+        }
+        let days = self.agent.history_days;
+        if !days.is_finite() || !(0.0..=3650.0).contains(&days) {
+            bail!("agent.history_days must be between 0 and 3650, not {days}");
         }
         if self.agent.restart_delay_secs > MAX_RESTART_DELAY_SECS {
             bail!(

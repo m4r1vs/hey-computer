@@ -216,6 +216,7 @@ warm_start = true                   # start with the daemon, and restart after a
 idle_stop_secs = 0                  # stop the agent after this long unused; 0 = never
 inactivity_timeout_secs = 45        # cancel a request after this long without an update
 restart_delay_secs = 1              # doubles with every failure in a row, up to 60 s
+history_days = 7                    # delete agy's conversations older than this at agent start; 0 = keep
 
 [agent.settings]                    # merged over the generated agy settings.json
 # showTips = false
@@ -452,6 +453,23 @@ application for you also lets it start a command outside the service.
   technical barrier between reading a note and posting it to the web. Do not
   point it at vaults, folders or pages you do not trust, and keep backups.
 - agy's own allow and deny rules and its safety checks are not relied on.
+
+## What is kept, and where
+
+- **The daemon's log** (the journal, under systemd) has request numbers,
+  sizes, timings and tool kinds at the default level. Request and answer
+  text, commands and the agent's last words before a crash appear only with
+  `-v` (debug level).
+- **Long answers** are files in `$XDG_RUNTIME_DIR/hey-computer/` (memory,
+  gone at logout); the newest `present.keep_answers` are kept.
+- **agy keeps everything that was said**, as any agy session does: per
+  conversation a database under `agy/antigravity-cli/conversations/`, full
+  transcripts under `agy/antigravity-cli/brain/`, a log per agent process
+  under `agy/antigravity-cli/log/`, and a summary index, all in the state
+  directory. Before each agent start the daemon deletes conversations and logs
+  older than `agent.history_days` (7 by default; 0 keeps them). The summary
+  index (`conversation_summaries.db`) is agy's own and is not touched.
+- Requests and answers go to Google's model service, as with any agy use.
 
 ## Measured
 

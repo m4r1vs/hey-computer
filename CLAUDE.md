@@ -110,7 +110,8 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   `hyprctl instances -j` finds the live instance.
 
 Not yet seen: agy's real wording for an expired login (tested only against the mock's
-`session_error`). agy's own history under the state directory is never pruned.
+`session_error`). agy's conversations, transcripts and logs (`agy/antigravity-cli/{conversations,brain,log}`)
+are pruned to `agent.history_days` before each agent start, never while agy runs.
 
 ## Testing
 

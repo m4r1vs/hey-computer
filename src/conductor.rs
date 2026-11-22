@@ -424,6 +424,8 @@ impl Conductor {
         let started = Instant::now();
         let paths =
             environment::prepare(&self.config).context("preparing the agent's directory")?;
+        // The agent is not running, so nothing it has open is deleted.
+        environment::prune_history(&paths.agent_dir, self.config.agent.history_days);
         let argv = paths.agent_command(&self.config);
         let (conn, incoming) = Connection::spawn(&argv, &paths.workspace)?;
         let init = conn
