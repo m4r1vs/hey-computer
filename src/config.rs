@@ -61,8 +61,9 @@ pub struct Conversation {
 #[serde(default, deny_unknown_fields)]
 pub struct Permissions {
     /// Command words the agent is refused, so that it gets a clean answer it
-    /// can report. A courtesy, not a boundary: the service is what keeps
-    /// privileged commands from working.
+    /// can report. A courtesy, not a boundary: string matching can always be
+    /// got round, and see the README's permission model for what the service
+    /// itself does and does not stop.
     pub deny: Vec<String>,
 }
 

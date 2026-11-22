@@ -56,7 +56,7 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
 - `environment`: the agent's private `--gemini-dir` (settings.json, linked skills) and the
   workspace with the generated `AGENTS.md`. Rewritten before every agent start.
 - `policy`: the deny list, matched as command words through wrappers, `sh -c`, pipes and
-  `$(…)`. A courtesy; the boundary is `NoNewPrivileges` on the service.
+  `$(…)`, and behind `systemd-run`. A courtesy, not a boundary.
 - `present`: `Presenter` trait; `Desktop` runs the notifier (an argument vector,
   notify-send by default, so tests and hand runs can swap in a recording script) and the
   viewer; `Recorder` for tests. `is_short`/`is_rich` decide notification versus viewer.
@@ -97,7 +97,10 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   are the generated defaults; both changed between the two runs.
 - Under `NoNewPrivileges=yes` agy starts and answers normally, and `sudo -n true` run by the
   agent prints `The "no new privileges" flag is set, which prevents sudo from running as
-  root.` (checked in a transient user unit with the module's PATH and properties).
+  root.` (checked in a transient user unit with the module's PATH and properties). It is
+  not a sandbox: `systemd-run --user …` from inside such a unit runs with `NoNewPrivs: 0`
+  (checked), and so does anything the compositor or D-Bus activation starts. The README's
+  permission model says so plainly; never describe NoNewPrivileges as a boundary.
 - Marker: unique GApplication; with a reachable session bus a second `marker --preview`
   merges into the first window as an editor tab. Unsetting `DBUS_SESSION_BUS_ADDRESS` is not
   enough (GLib falls back to `$XDG_RUNTIME_DIR/bus`); `DBUS_SESSION_BUS_ADDRESS=disabled:`

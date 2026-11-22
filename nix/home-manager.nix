@@ -162,9 +162,9 @@ in {
         Directories searched after the packages, so the agent finds the
         user's own programs (on NixOS, `hyprctl` lives here). Directories that
         do not exist are harmless. `/run/wrappers/bin` holds `sudo` on NixOS:
-        it is on the PATH so that a privileged command fails because of
-        NoNewPrivileges, which is the boundary, rather than for want of a
-        program.
+        it is on the PATH so that a privileged command the agent runs itself
+        fails with a clear message because of NoNewPrivileges, rather than for
+        want of a program.
       '';
     };
 
@@ -289,10 +289,12 @@ in {
         Restart = "on-failure";
         RestartSec = 2;
         /*
-        The permission boundary. The agent runs every command without
-        confirmation; with no_new_privs set, no setuid program (sudo, su,
-        pkexec, …) can raise its privileges, however the command is spelled.
-        The deny list in the configuration only gives the model a clean
+        The agent runs every command without confirmation. With no_new_privs
+        set, a setuid program (sudo, su, pkexec, …) that the agent runs itself
+        cannot raise its privileges, however the command is spelled. It is
+        not a sandbox: a command the agent has the systemd user manager or
+        the compositor start runs without the flag (see the README's
+        permission model). The deny list only gives the model a clean
         refusal.
         */
         NoNewPrivileges = true;

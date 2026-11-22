@@ -1010,7 +1010,7 @@ async fn turn(
         _ if !denied.is_empty() => Outcome::failed(
             FailReason::Denied,
             format!(
-                "The assistant wanted to run `{}`, which needs root. Privileged commands are refused and cannot work here.",
+                "The assistant wanted to run `{}`, which would become root. Such commands are refused.",
                 denied.join("`, `")
             ),
         ),

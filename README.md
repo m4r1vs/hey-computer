@@ -16,7 +16,7 @@ spoken to over the [Agent Client Protocol](https://agentclientprotocol.com)
 behaves like it can be configured instead.
 
 **Read [the permission model](#permission-model) before you enable it.** The
-agent runs commands without asking.
+agent runs commands without asking, and on many machines it can become root.
 
 ## How it works
 
@@ -220,7 +220,7 @@ follow_up_secs = 90                 # a request this soon after an answer contin
 
 [permissions]
 # Command words refused before they run, so the model gets a clean answer it
-# can report. A courtesy, not the boundary (see below).
+# can report. A courtesy, not a boundary (see the permission model below).
 deny = ["sudo", "su", "doas", "pkexec", "run0"]
 
 [instructions]
@@ -238,8 +238,9 @@ viewer = []                         # e.g. ["marker", "--preview", "{file}"]; em
 keep_answers = 20                   # answer files kept in $XDG_RUNTIME_DIR/hey-computer
 ```
 
-The deny list matches command words, also behind `env`, `timeout`, `nice` and
-similar wrappers, inside `sh -c '…'`, after pipes and `;`, and inside `$(…)`.
+The deny list matches command words, also behind `env`, `timeout`, `nice`,
+`systemd-run` and similar wrappers, inside `sh -c '…'`, after pipes and `;`,
+and inside `$(…)`.
 A refused command is reported in the answer, or, when nothing else happened,
 as a failure that names it.
 
@@ -386,21 +387,48 @@ are no confirmation buttons. It can read and write your files, the vault, run
 programs, drive your desktop and reach the web. Treat enabling it like giving
 someone your unlocked session.
 
-- **The boundary is the operating system**: the service runs with
-  `NoNewPrivileges=yes`, so no setuid program (sudo, su, pkexec, doas, …) can
-  raise its privileges, however the command is spelt (`bash -c`, `env`, an
-  absolute path, a script it writes first). Checked: run by the agent inside a
-  unit with the service's properties, `sudo -n true` printed
-  `sudo: The "no new privileges" flag is set, which prevents sudo from running
-  as root.` (without the flag the same command asks for a password). Root-owned
-  services reached over D-Bus or sockets are not setuid and are **not**
-  stopped by this: whatever they let your user do without a password
-  (typically suspend, reboot or power off through logind in an active
-  session, mounting removable media, a Docker socket your user can use), the
-  agent can do too.
+**Think of the agent as your user account without your password.** Whatever
+your account can do without typing a password, the agent can do too, and that
+can include becoming root. There is no sandbox, and there cannot be one while
+the agent is meant to drive your desktop: everything that lets it start an
+application for you also lets it start a command outside the service.
+
+- **What `NoNewPrivileges=yes` does.** A setuid program the agent runs itself
+  (sudo, su, pkexec, doas, …) cannot raise its privileges, however the command
+  is spelt (`bash -c`, `env`, an absolute path, a script it writes first).
+  Checked: run by the agent inside a unit with the service's properties,
+  `sudo -n true` printed `sudo: The "no new privileges" flag is set, which
+  prevents sudo from running as root.` That is what stops the plain attempt,
+  including a `NOPASSWD` sudo rule or a face or fingerprint login that would
+  otherwise let it through without asking you.
+- **What it does not do.** The flag binds only the service's own processes.
+  A command the agent has another of your processes start runs without it:
+  `systemd-run --user …` (the systemd user manager), the compositor's `exec`
+  (`hyprctl dispatch …`), D-Bus activation, or a file it writes that you or
+  your session run later (shell start-up files, autostart entries, user
+  units). Checked: `systemd-run --user --wait --pipe grep NoNewPrivs
+  /proc/self/status`, run from inside a unit with the flag, printed
+  `NoNewPrivs: 0`, and a setuid program started that way runs as root.
+- **So on these machines the agent can become root without asking you:**
+  where your account has a `NOPASSWD` sudo or doas rule; where sudo or polkit
+  accepts a face or fingerprint (howdy, fprintd); where your user (or a group
+  it is in, such as `wheel`) is in Nix's `trusted-users`, which the Nix manual
+  calls equivalent to root and which needs no setuid at all; where you are in
+  the `docker` or `libvirt` group or similar groups that hand out root-owned
+  sockets; and wherever a polkit rule lets your user do something as root
+  without a password. Root-owned services reached over D-Bus or sockets are
+  not setuid and are never stopped by the flag: whatever they let your user do
+  (suspend, reboot or power off through logind in an active session, mounting
+  removable media), the agent can do too. If any of this applies to you, the
+  agent has root in practice; do not enable it, or remove those grants.
 - **The deny list is a courtesy**: refusing `sudo` and friends by command
-  word gives the model a clean "refused" it can report, instead of a confusing
-  error. String matching cannot be a boundary and is not meant as one.
+  word, also behind `systemd-run`, gives the model a clean "refused" it can
+  report, instead of a confusing error. String matching cannot be a boundary
+  and is not meant as one.
+- **A real boundary** would be a separate user account for the agent, or a
+  session bus filter (`xdg-dbus-proxy`) plus hiding the user manager's and the
+  compositor's sockets. Both take away what the assistant is for (starting
+  your applications, your keyring login, notifications), so neither is done.
 - **Prompt injection is the real risk.** The content of notes, files, command
   output and web pages reaches the model as text. The instructions tell it to
   treat such text as data, but a model can be steered by text it reads, and an
