@@ -151,6 +151,8 @@ struct Shared {
 pub struct Handle {
     shared: Arc<Mutex<Shared>>,
     messages: mpsc::UnboundedSender<Message>,
+    /// Set at shutdown; interrupts whatever the conductor is waiting on.
+    stop: Arc<CancelToken>,
 }
 
 impl Handle {
@@ -230,6 +232,7 @@ impl Handle {
 
     /// Stop the conductor and the agent; waits for neither.
     pub fn shutdown(&self) {
+        self.stop.cancel(FailReason::AgentDown);
         let _ = self.messages.send(Message::Shutdown);
     }
 }
@@ -245,12 +248,14 @@ pub fn spawn(config: Arc<Config>, presenter: Arc<dyn Presenter>) -> (Handle, Joi
         handled: 0,
     }));
     let (messages, inbox) = mpsc::unbounded_channel();
+    let stop = Arc::new(CancelToken::default());
     let conductor = Conductor {
         policy: Policy::new(&config.permissions.deny),
         config,
         presenter,
         shared: Arc::clone(&shared),
         inbox,
+        stop: Arc::clone(&stop),
         live: None,
         paths: None,
         conversation: None,
@@ -259,7 +264,14 @@ pub fn spawn(config: Arc<Config>, presenter: Arc<dyn Presenter>) -> (Handle, Joi
         last_used: Instant::now(),
     };
     let task = tokio::spawn(conductor.run());
-    (Handle { shared, messages }, task)
+    (
+        Handle {
+            shared,
+            messages,
+            stop,
+        },
+        task,
+    )
 }
 
 /// A running agent.
@@ -285,6 +297,7 @@ struct Conductor {
     policy: Policy,
     shared: Arc<Mutex<Shared>>,
     inbox: mpsc::UnboundedReceiver<Message>,
+    stop: Arc<CancelToken>,
     live: Option<Live>,
     paths: Option<Paths>,
     conversation: Option<Conversation>,
@@ -312,12 +325,21 @@ enum Step {
 
 impl Conductor {
     async fn run(mut self) {
+        let stop = Arc::clone(&self.stop);
         if self.config.agent.warm_start {
-            self.start_warm().await;
+            // A start that hangs must not hold up a shutdown; dropping it
+            // kills the half-started agent.
+            tokio::select! {
+                () = self.start_warm() => {}
+                _ = stop.cancelled() => {}
+            }
         }
         loop {
             let restart_at = self.restart_at;
             let idle_at = self.idle_deadline();
+            if stop.reason().is_some() {
+                break;
+            }
             tokio::select! {
                 message = self.inbox.recv() => match message {
                     Some(Message::Ask(ask)) => self.take(ask).await,
@@ -326,7 +348,10 @@ impl Conductor {
                 event = next_event(&mut self.live) => self.between_turns(event).await,
                 () = sleep_until(restart_at) => {
                     self.restart_at = None;
-                    self.start_warm().await;
+                    tokio::select! {
+                        () = self.start_warm() => {}
+                        _ = stop.cancelled() => {}
+                    }
                 }
                 () = sleep_until(idle_at) => {
                     tracing::info!("stopping the idle agent");
@@ -335,11 +360,10 @@ impl Conductor {
             }
         }
         // Whatever is still queued gets an answer.
-        while let Ok(Message::Ask(ask)) = self.inbox.try_recv() {
-            self.finish(
-                ask,
-                Outcome::failed(FailReason::AgentDown, "the daemon is shutting down"),
-            );
+        while let Ok(message) = self.inbox.try_recv() {
+            if let Message::Ask(ask) = message {
+                self.finish(ask, cancelled(FailReason::AgentDown));
+            }
         }
         self.stop_agent().await;
     }
@@ -543,14 +567,17 @@ impl Conductor {
         );
         tracing::debug!("request {}: {:?}", ask.id, ask.text);
 
+        let stop = Arc::clone(&self.stop);
         if self.live.is_none() {
             self.restart_at = None;
+            // Only a shutdown interrupts the start. A newer request (a quick
+            // "no, I meant…") needs the same agent, so killing this one half
+            // started would only make it pay for a second start.
             let start = tokio::select! {
                 result = self.start_agent() => result,
-                reason = token.cancelled() => {
+                reason = stop.cancelled() => {
                     // The half-started agent was dropped, which killed it.
                     self.set_agent(AgentState::Down);
-                    self.schedule_restart_if_warm();
                     return cancelled(reason);
                 }
             };
@@ -561,14 +588,21 @@ impl Conductor {
                     format!("Cannot start the assistant: {e:#}"),
                 );
             }
+            if let Some(reason) = token.reason() {
+                return cancelled(reason);
+            }
         }
 
+        let interrupts = Interrupts {
+            request: &token,
+            stop: &stop,
+        };
         let session = tokio::select! {
             result = self.session_for(ask.new) => match result {
                 Ok(session) => session,
                 Err(outcome) => return outcome,
             },
-            reason = token.cancelled() => return cancelled(reason),
+            reason = interrupts.wait() => return cancelled(reason),
         };
 
         let Some(mut live) = self.live.take() else {
@@ -580,7 +614,7 @@ impl Conductor {
             &mut live,
             &session,
             &ask.text,
-            &token,
+            interrupts,
             &self.policy,
             inactivity,
             ask.id,
@@ -796,7 +830,26 @@ fn cancelled(reason: FailReason) -> Outcome {
 fn cancel_message(reason: FailReason) -> &'static str {
     match reason {
         FailReason::Superseded => "A newer request replaced this one.",
+        // Only the daemon's own shutdown cancels with this reason.
+        FailReason::AgentDown => "The daemon is shutting down.",
         _ => "The request was cancelled.",
+    }
+}
+
+/// What may end a request early: its own cancellation (a newer request,
+/// `cancel`, a client that left) or the daemon's shutdown.
+#[derive(Clone, Copy)]
+struct Interrupts<'a> {
+    request: &'a CancelToken,
+    stop: &'a CancelToken,
+}
+
+impl Interrupts<'_> {
+    async fn wait(self) -> FailReason {
+        tokio::select! {
+            reason = self.request.cancelled() => reason,
+            reason = self.stop.cancelled() => reason,
+        }
     }
 }
 
@@ -849,7 +902,7 @@ async fn turn(
     live: &mut Live,
     session: &str,
     text: &str,
-    token: &CancelToken,
+    interrupts: Interrupts<'_>,
     policy: &Policy,
     inactivity: Duration,
     id: u64,
@@ -875,7 +928,7 @@ async fn turn(
             event = live.incoming.recv() => Step::Event(event),
             result = &mut response => Step::Responded(result),
             () = tokio::time::sleep_until(deadline.into()) => Step::Quiet,
-            reason = token.cancelled() => Step::Cancelled(reason),
+            reason = interrupts.wait() => Step::Cancelled(reason),
         };
         match step {
             Step::Responded(result) => break Ok(result),

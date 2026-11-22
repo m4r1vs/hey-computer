@@ -20,12 +20,26 @@ use crate::{environment, ipc};
 
 /// A client gets this long to send its request line.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// At shutdown, queued notifications get this long to be shown.
+const PRESENT_GRACE: Duration = Duration::from_secs(5);
+/// At shutdown, waiting clients get this long to be sent their outcome.
+const REPLY_GRACE: Duration = Duration::from_secs(1);
 
 /// Run the daemon with the desktop presenter until SIGTERM or SIGINT.
 pub async fn run(config: Config, socket: &Path) -> Result<()> {
     let answers = ipc::runtime_dir().join("hey-computer");
-    let presenter: Arc<dyn Presenter> = Desktop::spawn(&config.present, answers);
-    serve(config, socket, presenter, termination()).await
+    let desktop = Desktop::spawn(&config.present, answers);
+    let presenter: Arc<dyn Presenter> = desktop.clone();
+    let result = serve(config, socket, presenter, termination()).await;
+    // The last popup replaces "Thinking…"; without it that one would stay up
+    // until it expires.
+    if tokio::time::timeout(PRESENT_GRACE, desktop.finish())
+        .await
+        .is_err()
+    {
+        tracing::warn!("gave up on the last notifications after {PRESENT_GRACE:?}");
+    }
+    result
 }
 
 /// Serve on `socket` until `shutdown` completes.
@@ -56,12 +70,13 @@ pub async fn serve(
 
     let (handle, mut conductor) = conductor::spawn(Arc::new(config), presenter);
     tokio::pin!(shutdown);
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     let handle = handle.clone();
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         if let Err(e) = connection(&handle, stream).await {
                             tracing::debug!("client connection: {e:#}");
                         }
@@ -73,6 +88,8 @@ pub async fn serve(
                 }
             },
             () = &mut shutdown => break,
+            // Finished connections are collected as they end.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
             // The conductor only ends when told to. If it ended on its own
             // (a panic), the daemon would accept requests and answer none;
             // exiting with an error lets systemd restart it instead.
@@ -87,11 +104,23 @@ pub async fn serve(
     }
 
     tracing::info!("shutting down");
-    handle.shutdown();
-    let _ = conductor.await;
+    // Closed at once, so a client that comes now is told the daemon is not
+    // running instead of waiting on a socket nobody accepts from.
+    drop(listener);
     if let Err(e) = std::fs::remove_file(socket) {
         tracing::warn!("cannot remove {}: {e}", socket.display());
     }
+    // Cancels the running request too: with an agent that keeps working,
+    // waiting for the turn would hold up a restart until systemd kills us.
+    handle.shutdown();
+    let _ = conductor.await;
+    // Every request has its outcome now; let the clients waiting for one
+    // get it before the process ends. A client that never sent a line is
+    // not waited for.
+    let _ = tokio::time::timeout(REPLY_GRACE, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
     Ok(())
 }
 

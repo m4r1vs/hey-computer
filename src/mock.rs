@@ -41,6 +41,8 @@ use crate::lines::{self, Line};
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Script {
+    /// Answer `initialize` only after this long, like an agent slow to start.
+    pub init_delay_ms: u64,
     /// Fail `initialize` with this message.
     pub init_error: Option<String>,
     /// Fail every `session/new` with this message, as an expired login does.
@@ -229,15 +231,20 @@ impl Mock {
                     self.error(id, -32000, message);
                     return;
                 }
-                self.respond(
-                    id,
-                    json!({
-                        "protocolVersion": 1,
-                        "agentCapabilities": {"loadSession": false, "sessionCapabilities": {"close": {}}},
-                        "agentInfo": {"name": "mock-agent", "version": "0.0.0"},
-                        "authMethods": [],
-                    }),
-                );
+                let delay = Duration::from_millis(self.script.init_delay_ms);
+                let id = id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    self.respond(
+                        &id,
+                        json!({
+                            "protocolVersion": 1,
+                            "agentCapabilities": {"loadSession": false, "sessionCapabilities": {"close": {}}},
+                            "agentInfo": {"name": "mock-agent", "version": "0.0.0"},
+                            "authMethods": [],
+                        }),
+                    );
+                });
             }
             "session/new" => {
                 if let Some(message) = &self.script.session_error {

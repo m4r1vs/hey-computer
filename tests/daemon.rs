@@ -166,6 +166,22 @@ impl Harness {
         }
     }
 
+    /// Stop the daemon as SIGTERM does; returns how long that took.
+    async fn shut_down(&mut self) -> Duration {
+        let started = Instant::now();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            tokio::time::timeout(Duration::from_secs(30), task)
+                .await
+                .expect("the daemon stops")
+                .unwrap()
+                .unwrap();
+        }
+        started.elapsed()
+    }
+
     async fn stop(mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -564,4 +580,85 @@ async fn a_config_out_of_range_is_refused_at_start() {
     assert!(error.to_string().contains("idle_stop_secs"), "{error}");
     assert!(!socket.exists());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shutdown_cancels_the_running_request_at_once() {
+    // The harness's inactivity timeout is 5 s; the shutdown must not wait
+    // for it, nor for an agent that keeps working.
+    let mut h = Harness::warm().await;
+    let (id, mut waiting) = h.ask_waiting("slow").await;
+    h.wait_log("prompt mock-1 slow").await;
+    let took = h.shut_down().await;
+    assert!(took < Duration::from_secs(2), "shutdown took {took:?}");
+    assert_eq!(
+        waiting.next(Some(Duration::from_secs(5))).await.unwrap(),
+        Reply::Failed {
+            id,
+            reason: FailReason::AgentDown,
+            message: "The daemon is shutting down.".to_string()
+        }
+    );
+    assert_eq!(h.log_count("cancel mock-1"), 1);
+    assert!(!h.socket.exists());
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shutdown_replaces_the_progress_popup() {
+    let mut h = Harness::warm().await;
+    let (id, _client) = ipc::ask(&h.socket, "slow", false, false).await.unwrap();
+    h.wait_log("prompt mock-1 slow").await;
+    let took = h.shut_down().await;
+    assert!(took < Duration::from_secs(2), "shutdown took {took:?}");
+    let items = h.recorder.items();
+    assert_eq!(
+        items.last(),
+        Some(&Presentation::Failure {
+            id,
+            reason: FailReason::AgentDown,
+            message: "The daemon is shutting down.".to_string()
+        }),
+        "{items:?}"
+    );
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shutdown_does_not_wait_for_a_hung_start() {
+    let script = r#"{"init_delay_ms": 60000, "default": ["echo"]}"#;
+    let mut h = Harness::start(script, |_| {}).await;
+    h.wait_log("start").await;
+    let took = h.shut_down().await;
+    assert!(took < Duration::from_secs(2), "shutdown took {took:?}");
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_correction_during_a_cold_start_keeps_the_starting_agent() {
+    let script = r#"{"init_delay_ms": 600, "turns": [{"match": "plain", "steps": [{"chunk": "Hello from the mock."}]}], "default": ["echo"]}"#;
+    let h = Harness::start(script, |c| c.agent.warm_start = false).await;
+    let (first, _client) = ipc::ask(&h.socket, "plain", false, false).await.unwrap();
+    h.wait_log("start").await;
+    // "No, I meant…" while the agent is still starting.
+    assert_eq!(answer(&h.ask("plain", false).await), "Hello from the mock.");
+    assert_eq!(h.log_count("start"), 1, "{:?}", h.log_lines());
+    let items = h
+        .recorder
+        .wait_for(Duration::from_secs(5), |items| {
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::Failure { .. }))
+        })
+        .await
+        .unwrap();
+    assert!(
+        items.contains(&Presentation::Failure {
+            id: first,
+            reason: FailReason::Superseded,
+            message: "A newer request replaced this one.".to_string()
+        }),
+        "{items:?}"
+    );
+    h.stop().await;
 }
