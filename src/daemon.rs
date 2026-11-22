@@ -1,7 +1,7 @@
 //! The long-lived half: the socket, and the conductor behind it.
 
 use std::future::Future;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +27,7 @@ const REPLY_GRACE: Duration = Duration::from_secs(1);
 
 /// Run the daemon with the desktop presenter until SIGTERM or SIGINT.
 pub async fn run(config: Config, socket: &Path) -> Result<()> {
-    let answers = ipc::runtime_dir().join("hey-computer");
+    let answers = ipc::runtime_dir()?.join("hey-computer");
     let desktop = Desktop::spawn(&config.present, answers);
     let presenter: Arc<dyn Presenter> = desktop.clone();
     let result = serve(config, socket, presenter, termination()).await;
@@ -154,13 +154,20 @@ async fn bind(path: &Path) -> Result<UnixListener> {
             path.display()
         );
     }
-    // Nothing answered, so any socket here is stale.
-    match std::fs::remove_file(path) {
-        Ok(()) => tracing::debug!("removed the stale socket at {}", path.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(e).with_context(|| format!("removing the stale socket {}", path.display()));
+    // Nothing answered, so a socket here is stale. Anything else is not
+    // ours to delete: a mistyped --socket must not cost the user a file.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing the stale socket {}", path.display()))?;
+            tracing::debug!("removed the stale socket at {}", path.display());
         }
+        Ok(_) => bail!(
+            "{} exists and is not a socket; refusing to replace it",
+            path.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("checking {}", path.display())),
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)

@@ -138,7 +138,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
     }
 
     let config = Config::load(cli.config.as_deref())?;
-    let socket = ipc::socket_path(cli.socket.as_deref());
+    let socket = ipc::socket_path(cli.socket.as_deref())?;
 
     match cli.command {
         Command::Daemon => {
@@ -190,7 +190,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
                     debug::prompt(config, text_or_stdin(text).await?).await?
                 }
                 DebugCommand::Present { text } => {
-                    debug::present(&config, text_or_stdin(text).await?).await;
+                    debug::present(&config, text_or_stdin(text).await?).await?;
                     true
                 }
                 DebugCommand::MockAgent { .. } => unreachable!("handled above"),

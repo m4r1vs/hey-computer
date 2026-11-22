@@ -65,8 +65,8 @@ pub async fn prompt(config: Config, text: String) -> Result<bool> {
 }
 
 /// Show `text` the way the daemon would show an answer to it.
-pub async fn present(config: &Config, text: String) {
-    let answers = ipc::runtime_dir().join("hey-computer");
+pub async fn present(config: &Config, text: String) -> Result<()> {
+    let answers = ipc::runtime_dir()?.join("hey-computer");
     let desktop = Desktop::spawn(&config.present, answers);
     let presenter: Arc<Desktop> = Arc::clone(&desktop);
     presenter.present(Presentation::Progress {
@@ -79,4 +79,5 @@ pub async fn present(config: &Config, text: String) {
         denied: Vec::new(),
     });
     desktop.finish().await;
+    Ok(())
 }

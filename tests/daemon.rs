@@ -666,3 +666,23 @@ async fn a_correction_during_a_cold_start_keeps_the_starting_agent() {
     );
     h.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_at_the_socket_path_is_not_replaced() {
+    let dir = std::env::temp_dir().join(format!("hc-notsock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("notes.md");
+    std::fs::write(&path, "keep me").unwrap();
+    let config = Config {
+        state_dir: dir.join("state"),
+        ..Config::default()
+    };
+    let presenter: Arc<dyn Presenter> = Recorder::new();
+    let error = daemon::serve(config, &path, presenter, async {})
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not a socket"), "{error}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

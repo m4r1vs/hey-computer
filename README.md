@@ -119,7 +119,10 @@ hey-computer [--config FILE] [--socket PATH] [-v|-vv] COMMAND
   request too long for the daemon, a daemon that does not answer) is a
   notification too.
 - The socket is `--socket`, else `$HEY_COMPUTER_SOCKET`, else
-  `$XDG_RUNTIME_DIR/hey-computer.sock`.
+  `$XDG_RUNTIME_DIR/hey-computer.sock`. Without `XDG_RUNTIME_DIR`,
+  `/tmp/hey-computer-UID` is used, and only if it is a directory of your
+  own that nobody else can enter. The daemon replaces a stale socket at that
+  path but refuses to start when something else is there.
 
 Hidden commands for checking one part at a time:
 `hey-computer debug config` (check the configuration and print it with every

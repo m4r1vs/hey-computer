@@ -19,23 +19,49 @@ const MAX_REPLY_LINE: usize = 64 * 1024 * 1024;
 /// `--socket`, then `$HEY_COMPUTER_SOCKET`, then
 /// `$XDG_RUNTIME_DIR/hey-computer.sock`, with a `/tmp` fallback for sessions
 /// without a runtime directory.
-pub fn socket_path(explicit: Option<&Path>) -> PathBuf {
+pub fn socket_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
-        return path.to_path_buf();
+        return Ok(path.to_path_buf());
     }
     if let Some(path) = std::env::var_os("HEY_COMPUTER_SOCKET").filter(|p| !p.is_empty()) {
-        return PathBuf::from(path);
+        return Ok(PathBuf::from(path));
     }
-    runtime_dir().join("hey-computer.sock")
+    Ok(runtime_dir()?.join("hey-computer.sock"))
 }
 
-/// `$XDG_RUNTIME_DIR`, or a per-user directory under `/tmp`.
-pub fn runtime_dir() -> PathBuf {
+/// `$XDG_RUNTIME_DIR`, or else `/tmp/hey-computer-UID`.
+///
+/// The fallback has a name anyone can predict, so it is used only if it is
+/// a real directory of this user that nobody else can enter: another user
+/// who created it first could otherwise put a socket of their own there and
+/// receive the requests.
+pub fn runtime_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
+        return Ok(PathBuf::from(dir));
     }
-    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
-    PathBuf::from(format!("/tmp/hey-computer-{user}"))
+    // SAFETY: geteuid cannot fail and touches no memory.
+    let uid = unsafe { libc::geteuid() };
+    let dir = PathBuf::from(format!("/tmp/hey-computer-{uid}"));
+    private_fallback(&dir, uid)?;
+    Ok(dir)
+}
+
+fn private_fallback(dir: &Path, uid: u32) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+    }
+    let meta =
+        std::fs::symlink_metadata(dir).with_context(|| format!("checking {}", dir.display()))?;
+    if !meta.file_type().is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+        bail!(
+            "{} is not a private directory of this user; set XDG_RUNTIME_DIR, or remove it",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// The daemon is not there to ask.
@@ -127,5 +153,40 @@ pub async fn ask(path: &Path, text: &str, wait: bool, new: bool) -> Result<(u64,
         Reply::Accepted { id } => Ok((id, client)),
         Reply::Error { message } => bail!("{message}"),
         other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_fallback_runtime_directory_must_be_private_and_ours() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = unsafe { libc::geteuid() };
+        let dir = std::env::temp_dir().join(format!("hc-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        private_fallback(&dir, uid).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        // Again, now that it exists.
+        private_fallback(&dir, uid).unwrap();
+
+        // Someone else's directory, or one others can enter, is refused.
+        assert!(private_fallback(&dir, uid + 1).is_err());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_fallback(&dir, uid).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // A link to a private directory is not one.
+        let target = dir.with_extension("target");
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&target, &dir).unwrap();
+        assert!(private_fallback(&dir, uid).is_err());
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
     }
 }
