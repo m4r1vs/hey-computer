@@ -1,0 +1,24 @@
+[package]
+name = "hey-computer"
+version = "0.1.0"
+edition = "2024"
+description = "A voice assistant daemon that keeps one ACP agent warm and answers one-shot requests"
+license = "MIT"
+repository = "https://github.com/m4r1vs/hey-computer"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+dirs = "7.0.0"
+# kill(2) on the agent's process group.
+libc = "0.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "process", "sync", "time", "io-util", "io-std", "signal", "fs"] }
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+strip = true
