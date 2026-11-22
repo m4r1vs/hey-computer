@@ -150,6 +150,11 @@ impl Default for Present {
     }
 }
 
+/// The longest duration any setting may have: a year.
+pub const MAX_SECS: f64 = 365.0 * 24.0 * 3600.0;
+/// Restarts back off up to this.
+pub const MAX_RESTART_DELAY_SECS: f64 = 60.0;
+
 /// Seconds from the config as a `Duration`; zero or less means "never".
 pub fn secs(value: f64) -> Option<Duration> {
     (value > 0.0 && value.is_finite()).then(|| Duration::from_secs_f64(value))
@@ -204,6 +209,16 @@ impl Config {
             if !value.is_finite() || value < 0.0 {
                 bail!("{key} must be zero or a positive number of seconds, not {value}");
             }
+            // Far beyond any sensible setting, and well inside what a
+            // Duration added to an Instant can hold.
+            if value > MAX_SECS {
+                bail!("{key} must be at most {MAX_SECS} seconds (a year), not {value}");
+            }
+        }
+        if self.agent.restart_delay_secs > MAX_RESTART_DELAY_SECS {
+            bail!(
+                "agent.restart_delay_secs must be at most {MAX_RESTART_DELAY_SECS}, the longest the back-off waits"
+            );
         }
         if self.agent.inactivity_timeout_secs == 0.0 {
             bail!(
@@ -305,5 +320,32 @@ mod tests {
         let mut config = Config::default();
         config.instructions.vault = PathBuf::from("Notes");
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn durations_beyond_a_year_are_refused() {
+        // 1e19 s does not fit a Duration added to an Instant; it panicked the
+        // conductor after passing validation.
+        let mut config = Config::default();
+        config.agent.idle_stop_secs = 1e19;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.conversation.follow_up_secs = 1e19;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.agent.inactivity_timeout_secs = MAX_SECS + 1.0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.agent.restart_delay_secs = 61.0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.agent.idle_stop_secs = MAX_SECS;
+        config.conversation.follow_up_secs = MAX_SECS;
+        config.agent.restart_delay_secs = 60.0;
+        config.validate().unwrap();
     }
 }

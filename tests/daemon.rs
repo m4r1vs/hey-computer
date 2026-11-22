@@ -543,3 +543,25 @@ async fn an_idle_agent_is_stopped_and_comes_back_on_demand() {
     assert_eq!(h.log_count("start"), 2);
     h.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_config_out_of_range_is_refused_at_start() {
+    // 1e19 s used to pass and then panic the conductor, leaving a daemon
+    // that accepted requests and answered none.
+    let dir = std::env::temp_dir().join(format!("hc-range-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("s.sock");
+    let mut config = Config {
+        state_dir: dir.join("state"),
+        ..Config::default()
+    };
+    config.agent.idle_stop_secs = 1e19;
+    let presenter: Arc<dyn Presenter> = Recorder::new();
+    let error = daemon::serve(config, &socket, presenter, async {})
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("idle_stop_secs"), "{error}");
+    assert!(!socket.exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -35,6 +35,9 @@ pub async fn serve(
     presenter: Arc<dyn Presenter>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    // `Config::load` validates too, but a config built in code (the tests,
+    // another front end) comes here directly.
+    config.validate()?;
     // The socket first: a second daemon started by mistake must be refused
     // before it touches the running one's agent directory.
     let listener = bind(socket).await?;
@@ -51,7 +54,7 @@ pub async fn serve(
     tracing::info!("agent directory {}", paths.agent_dir.display());
     tracing::info!("listening on {}", socket.display());
 
-    let (handle, conductor) = conductor::spawn(Arc::new(config), presenter);
+    let (handle, mut conductor) = conductor::spawn(Arc::new(config), presenter);
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -70,6 +73,16 @@ pub async fn serve(
                 }
             },
             () = &mut shutdown => break,
+            // The conductor only ends when told to. If it ended on its own
+            // (a panic), the daemon would accept requests and answer none;
+            // exiting with an error lets systemd restart it instead.
+            ended = &mut conductor => {
+                let _ = std::fs::remove_file(socket);
+                return Err(match ended {
+                    Err(e) if e.is_panic() => anyhow::anyhow!("the conductor panicked"),
+                    _ => anyhow::anyhow!("the conductor stopped unexpectedly"),
+                });
+            }
         }
     }
 

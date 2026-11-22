@@ -19,7 +19,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::acp::{self, CallError, Connection, Incoming};
-use crate::config::{Config, secs};
+use crate::config::{Config, MAX_RESTART_DELAY_SECS, secs};
 use crate::environment::{self, Paths};
 use crate::policy::Policy;
 use crate::present::{Presentation, Presenter};
@@ -33,7 +33,7 @@ const CONFIG_TIMEOUT: Duration = Duration::from_secs(10);
 /// finished the turn after this long is treated as wedged and restarted.
 const CANCEL_GRACE: Duration = Duration::from_secs(3);
 /// Restarts back off up to this.
-const MAX_RESTART_DELAY: Duration = Duration::from_secs(60);
+const MAX_RESTART_DELAY: Duration = Duration::from_secs(MAX_RESTART_DELAY_SECS as u64);
 /// An agent that lived this long before dying starts the back-off afresh.
 const HEALTHY_RUN: Duration = Duration::from_secs(60);
 
@@ -347,7 +347,7 @@ impl Conductor {
     fn idle_deadline(&self) -> Option<Instant> {
         let idle = secs(self.config.agent.idle_stop_secs)?;
         self.live.as_ref()?;
-        Some(self.last_used + idle)
+        self.last_used.checked_add(idle)
     }
 
     fn set_agent(&self, state: AgentState) {
@@ -460,7 +460,8 @@ impl Conductor {
     fn schedule_restart(&mut self) {
         let base = self.config.agent.restart_delay_secs.max(0.05);
         let factor = 2f64.powi(self.failures.min(10) as i32);
-        let delay = Duration::from_secs_f64(base * factor).min(MAX_RESTART_DELAY);
+        // Capped before it becomes a Duration, which panics on huge values.
+        let delay = Duration::from_secs_f64((base * factor).min(MAX_RESTART_DELAY.as_secs_f64()));
         self.failures += 1;
         self.restart_at = Some(Instant::now() + delay);
         tracing::info!("restarting the agent in {:.1} s", delay.as_secs_f64());
@@ -595,7 +596,7 @@ impl Conductor {
                 conversation.last = Instant::now();
                 conversation.turns += 1;
                 let until = secs(self.config.conversation.follow_up_secs)
-                    .map(|window| conversation.last + window);
+                    .and_then(|window| conversation.last.checked_add(window));
                 self.set_follow_up(until);
             }
         } else {
