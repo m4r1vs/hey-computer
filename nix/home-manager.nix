@@ -113,7 +113,7 @@ in {
           agent.inactivity_timeout_secs = 60;
           conversation.follow_up_secs = 120;
           permissions.deny = ["sudo" "su" "doas" "pkexec" "run0" "shutdown"];
-          instructions.extra = "Prefer metric units. My city is Berlin.";
+          instructions.extra = "Prefer metric units. Answer in kilometres and degrees Celsius.";
           present.max_chars = 300;
         }
       '';

@@ -5,8 +5,8 @@ description: Queries and drives the user's Hyprland desktop (0.55 or newer, Lua 
 
 # Hyprland desktop
 
-The desktop is Hyprland with a Lua configuration. Everything below was checked
-against Hyprland 0.55.4.
+The desktop is Hyprland with a Lua configuration. Unless marked otherwise,
+everything below was run against Hyprland 0.55.4.
 
 ## Dispatching: Lua expressions, not the old words
 
@@ -17,12 +17,11 @@ double quotes for Lua strings inside it.
 
 ```bash
 hyprctl dispatch 'hl.dsp.focus({ workspace = 3 })'                   # go to workspace 3
-hyprctl dispatch 'hl.dsp.focus({ workspace = "m+1" })'               # next workspace on this monitor ("m-1": previous)
-hyprctl dispatch 'hl.dsp.focus({ window = "class:firefox" })'        # focus a window (switches to its workspace)
+hyprctl dispatch 'hl.dsp.focus({ window = "class:firefox" })'        # focus a window
 hyprctl dispatch 'hl.dsp.window.move({ workspace = 2, follow = false })'  # move the active window, stay here
 hyprctl dispatch 'hl.dsp.window.close({ window = "address:0x55d0c0ffee00" })'
-hyprctl dispatch 'hl.dsp.window.fullscreen()'                        # toggle fullscreen of the active window
 hyprctl dispatch 'hl.dsp.workspace.toggle_special("name")'           # show or hide a special workspace
+hyprctl dispatch 'hl.dsp.window.fullscreen()'                        # fullscreen the active window (not observed)
 ```
 
 Window selectors that work: `class:NAME` (a regular expression such as
@@ -31,8 +30,8 @@ Window selectors that work: `class:NAME` (a regular expression such as
 
 **hyprctl exits 0 even when the dispatch failed.** Read its output:
 
-- `ok`: the dispatcher ran. It does **not** prove that a selector matched
-  anything: closing a window that does not exist also prints `ok`.
+- `ok`: the dispatcher ran. It does **not** prove that the window you meant
+  was found or closed: query again to see what changed.
 - `error: …`: a Lua error, for example a mistyped dispatcher name or the old
   syntax.
 - `warning: … window not found`: the selector matched nothing.
@@ -84,8 +83,10 @@ hyprctl dispatch 'hl.dsp.exec_cmd("foot", { workspace = "4 silent" })'   # on wo
 hyprctl dispatch 'hl.dsp.exec_cmd("[workspace 5 silent] foot")'          # the same, as a rule prefix
 ```
 
-The new window opens on the active workspace unless a rule says otherwise. To
-open a web address in the user's default browser:
+The new window opens on the active workspace unless a rule says otherwise.
+The command line runs in Hyprland's environment, so the program must be on
+Hyprland's PATH. To open a web address in the user's default browser, the
+usual way (not run here) is
 `hyprctl dispatch 'hl.dsp.exec_cmd("xdg-open https://example.org")'`.
 
 ## Notifications

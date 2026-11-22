@@ -278,7 +278,7 @@ told about Obsidian.
     extraPackages = [pkgs.python3];
     settings = {
       conversation.follow_up_secs = 120;
-      instructions.extra = "Prefer metric units. I live in Berlin.";
+      instructions.extra = "Prefer metric units. Answer in kilometres and degrees Celsius.";
     };
   };
 }
