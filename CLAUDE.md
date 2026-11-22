@@ -61,7 +61,8 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   notify-send by default, so tests and hand runs can swap in a recording script) and the
   viewer; `Recorder` for tests. `is_short`/`is_rich` decide notification versus viewer.
   `to_markup` cuts code spans out before pairing `**`, so the Pango markup always nests.
-  `disarm_html` rewrites every `<` outside code (`&lt;` in text, `\lt` in math) before the
+  `disarm_html` rewrites every `<` outside code (`&lt;` in text, `\lt` in math) and turns
+  remote images into links (Marker fetched them at once) before the
   answer file is written: Marker renders in a web view. A viewer that fails within 1.5 s is
   reported instead of "Answer opened".
 - `mock`: a scripted ACP agent, run as the hidden `debug mock-agent SCRIPT`, so the package

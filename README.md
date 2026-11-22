@@ -377,12 +377,16 @@ buttons (it is an editor at heart), syntax highlighting treats an umlaut as a
 word boundary, level-two headings are only a little larger than body text
 (level one clearly so), and its last release is from 2023.
 
-**Raw HTML is disarmed.** Marker renders Markdown in a web view, where raw
-HTML in an answer (quoted from a web page, say) would run scripts and fetch
-images. Before the answer file is written, every `<` outside code becomes
-`&lt;` in text and KaTeX's `\lt` in math, so it shows as `<` and nothing in it
-is HTML. Code spans, fenced blocks and autolinks (`<https://…>`) are left as
-they are. A viewer of your own gets the same file.
+**Raw HTML and remote images are disarmed.** Marker renders Markdown in a web
+view, where raw HTML in an answer (quoted from a web page, say) would run
+scripts, and a remote image would be fetched as soon as the answer is shown
+(checked: `![x](http://…)` was requested at once). Before the answer file is
+written, every `<` outside code becomes `&lt;` in text and KaTeX's `\lt` in
+math, so it shows as `<` and nothing in it is HTML, and a remote or reference
+image becomes a link (`[image: x](http://…)`), fetched only if you click it.
+Code spans, fenced blocks, autolinks (`<https://…>`) and local images are left
+as they are. Inline HTML a model uses for layout (`<br>`, `<sup>`) therefore
+shows as text. A viewer of your own gets the same file.
 
 A floating rule for Hyprland's Lua configuration (checked with 0.55.4):
 

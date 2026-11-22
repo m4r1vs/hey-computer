@@ -258,7 +258,7 @@ fn disarm_line(line: &str, in_math: &mut bool) -> String {
             None => return math(rest),
         }
     }
-    while let Some(i) = rest.find(['`', '<', '$', '\\']) {
+    while let Some(i) = rest.find(['`', '<', '$', '\\', '!']) {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
         // The closing delimiter of a span that opens here, if any.
@@ -292,6 +292,10 @@ fn disarm_line(line: &str, in_math: &mut bool) -> String {
         {
             out.push_str(&math(&rest[..end]));
             rest = &rest[end..];
+        } else if rest.starts_with("![") && is_remote_image(rest) {
+            // Shown as a link: the web view would fetch it at once.
+            out.push_str("[image: ");
+            rest = &rest[2..];
         } else if rest.starts_with("\\<") {
             // Markdown's own escape for a `<` shown as it is.
             out.push_str("&lt;");
@@ -304,7 +308,7 @@ fn disarm_line(line: &str, in_math: &mut bool) -> String {
             out.push_str("&lt;");
             rest = &rest[1..];
         } else {
-            // A lone `$` or `\`.
+            // A lone `$`, `\` or `!`.
             let c = rest.chars().next().map_or(1, char::len_utf8);
             out.push_str(&rest[..c]);
             rest = &rest[c..];
@@ -319,15 +323,38 @@ fn math(text: &str) -> String {
     text.replace('<', "\\lt ")
 }
 
+/// `![alt](http…)`, `![alt](//host/…)` or a reference image `![alt][ref]`
+/// (whose target may well be remote). A local image stays an image.
+fn is_remote_image(text: &str) -> bool {
+    let Some(close) = text.find(']') else {
+        return false;
+    };
+    let after = &text[close + 1..];
+    if after.starts_with('[') {
+        return true;
+    }
+    let Some(target) = after.strip_prefix('(') else {
+        return false;
+    };
+    let target = target
+        .trim_start()
+        .trim_start_matches('<')
+        .to_ascii_lowercase();
+    ["http://", "https://", "//", "ftp://"]
+        .iter()
+        .any(|scheme| target.starts_with(scheme))
+}
+
 /// `<https://…>`, `<http://…>` or `<mailto:…>`, closed before any space.
 fn is_autolink(text: &str) -> bool {
     let inner = &text[1..];
-    ["https://", "http://", "mailto:"]
-        .iter()
-        .any(|scheme| inner.starts_with(scheme))
-        && inner
-            .find(|c: char| c == '>' || c.is_whitespace() || c == '<')
-            .is_some_and(|end| inner[end..].starts_with('>'))
+    ["https://", "http://", "mailto:"].iter().any(|scheme| {
+        inner
+            .get(..scheme.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
+    }) && inner
+        .find(|c: char| c == '>' || c.is_whitespace() || c == '<')
+        .is_some_and(|end| inner[end..].starts_with('>'))
 }
 
 /// The first thing worth naming in a long answer: its first heading or line,
@@ -1052,6 +1079,16 @@ mod tests {
         assert_eq!(disarm_html("$5 or $"), "$5 or $");
         assert!(!disarm_html("$5 <img src=x> $6").contains('<'));
         assert_eq!(disarm_html("\\<b>"), "&lt;b>");
+        // A remote image would be fetched as soon as the answer is shown; it
+        // becomes a link. A local one stays.
+        assert_eq!(
+            disarm_html("![a <b> plot](https://x.example/p.png) and ![ref][1]!"),
+            "[image: a &lt;b> plot](https://x.example/p.png) and [image: ref][1]!"
+        );
+        assert_eq!(
+            disarm_html("![plot](/tmp/plot.png) ![p]( <HTTP://x/y.png>) `![x](http://y)`"),
+            "![plot](/tmp/plot.png) [image: p]( <HTTP://x/y.png>) `![x](http://y)`"
+        );
         // Code spans, fenced blocks and autolinks are left alone.
         assert_eq!(
             disarm_html("Use `a<b` or ``x<`y``."),
