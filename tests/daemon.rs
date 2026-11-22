@@ -469,7 +469,12 @@ async fn a_second_client_is_served_while_a_request_runs() {
 async fn a_second_daemon_refuses_the_socket() {
     let h = Harness::warm().await;
     let presenter: Arc<dyn Presenter> = Recorder::new();
-    let error = daemon::serve(Config::default(), &h.socket, presenter, async {})
+    // Its own state directory: the default one is the user's.
+    let config = Config {
+        state_dir: h.dir.join("second"),
+        ..Config::default()
+    };
+    let error = daemon::serve(config, &h.socket, presenter, async {})
         .await
         .unwrap_err();
     assert!(error.to_string().contains("already listening"), "{error}");

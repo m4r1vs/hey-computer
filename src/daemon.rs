@@ -13,10 +13,10 @@ use tokio::sync::oneshot;
 
 use crate::conductor::{self, Handle, Sink};
 use crate::config::Config;
-use crate::ipc;
 use crate::lines::{self, Line};
 use crate::present::{Desktop, Presenter};
 use crate::protocol::{self, FailReason, MAX_REQUEST_LINE, Reply, Request};
+use crate::{environment, ipc};
 
 /// A client gets this long to send its request line.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,6 +35,11 @@ pub async fn serve(
     presenter: Arc<dyn Presenter>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    // Once here, so that a skill directory that does not exist stops the
+    // daemon at start instead of failing every agent start after it. The
+    // conductor prepares it again before each start, to pick up changes.
+    let paths = environment::prepare(&config).context("preparing the agent's directory")?;
+    tracing::info!("agent directory {}", paths.agent_dir.display());
     let listener = bind(socket).await?;
     tracing::info!("listening on {}", socket.display());
 
