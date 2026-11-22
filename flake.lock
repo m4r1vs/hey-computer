@@ -1,5 +1,25 @@
 {
   "nodes": {
+    "home-manager": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1795340038,
+        "narHash": "sha256-RtgZbV+4BDtJqMImbiPJri3fmVDbCbrz/B0cuPQUJQY=",
+        "owner": "nix-community",
+        "repo": "home-manager",
+        "rev": "03885bcd0b477bdecebebc57b213b0f8f0826d51",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "home-manager",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1795234589,
@@ -16,9 +36,28 @@
         "type": "github"
       }
     },
+    "obsidian-skills": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1795194247,
+        "narHash": "sha256-L6qIfM2TKp+g3j0J2SxfWf5qeqahCe7+YcSOMPoePOs=",
+        "owner": "obsidianmd",
+        "repo": "obsidian-skills",
+        "rev": "b110b2f8e9eb1f287892f937050dfd40af862cbb",
+        "type": "github"
+      },
+      "original": {
+        "owner": "obsidianmd",
+        "repo": "obsidian-skills",
+        "rev": "b110b2f8e9eb1f287892f937050dfd40af862cbb",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "home-manager": "home-manager",
+        "nixpkgs": "nixpkgs",
+        "obsidian-skills": "obsidian-skills"
       }
     }
   },

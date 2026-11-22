@@ -2,14 +2,30 @@
   description = "hey-computer: a voice assistant daemon that keeps one ACP agent warm";
 
   inputs = {
-    # A consuming flake may make this follow its own nixpkgs; the package
+    # A consuming flake should make this follow its own nixpkgs; the package
     # needs nothing newer than a Rust toolchain that knows edition 2024.
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+
+    # Only for checking the Home Manager module here (checks.module); the
+    # module itself does not use it. A consumer should make it follow its own.
+    home-manager = {
+      url = "github:nix-community/home-manager";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    # The Obsidian skills linked into the agent's directory. Pinned to a
+    # commit so that what the agent is told does not change under it.
+    obsidian-skills = {
+      url = "github:obsidianmd/obsidian-skills/b110b2f8e9eb1f287892f937050dfd40af862cbb";
+      flake = false;
+    };
   };
 
   outputs = {
     self,
     nixpkgs,
+    home-manager,
+    obsidian-skills,
     ...
   }: let
     supportedSystems = [
@@ -30,13 +46,27 @@
       pkgs.rustPlatform.buildRustPackage {
         pname = "hey-computer";
         version = "0.1.0";
-        src = pkgs.lib.cleanSource ./.;
+        # Only what the build reads, so editing the docs or the Nix files
+        # does not rebuild the program.
+        src = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            ./rustfmt.toml
+            ./src
+            ./tests
+            ./skills
+          ];
+        };
 
         cargoLock.lockFile = ./Cargo.lock;
 
         nativeBuildInputs = [pkgs.makeWrapper];
 
         postInstall = ''
+          mkdir -p $out/share/hey-computer
+          cp -r skills $out/share/hey-computer/skills
           wrapProgram $out/bin/hey-computer \
             --prefix PATH : "${pkgs.lib.makeBinPath (runtimeTools pkgs)}"
         '';
@@ -49,6 +79,11 @@
           mainProgram = "hey-computer";
         };
       };
+
+    homeManagerModule = import ./nix/home-manager.nix {
+      inherit self;
+      obsidianSkills = obsidian-skills;
+    };
   in {
     overlays.default = final: _prev: {
       hey-computer = mkPackage final;
@@ -57,6 +92,8 @@
     packages = forAllSystems (system: {
       default = mkPackage (pkgsFor system);
     });
+
+    homeManagerModules.default = homeManagerModule;
 
     checks = forAllSystems (system: let
       pkgs = pkgsFor system;
@@ -78,11 +115,19 @@
 
       fmt =
         pkgs.runCommand "hey-computer-fmt" {
-          nativeBuildInputs = [pkgs.rustfmt];
+          nativeBuildInputs = [pkgs.rustfmt pkgs.alejandra];
         } ''
           find ${./src} ${./tests} -name '*.rs' -exec rustfmt --check --edition 2024 {} +
+          alejandra --check --quiet ${./flake.nix} ${./nix}
           touch $out
         '';
+
+      # The module in a minimal Home Manager configuration: an option typo
+      # fails here, and the generated configuration and service are checked.
+      module = import ./nix/module-check.nix {
+        inherit pkgs home-manager;
+        module = homeManagerModule;
+      };
     });
 
     formatter = forAllSystems (system: (pkgsFor system).alejandra);
