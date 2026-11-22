@@ -35,12 +35,20 @@ pub async fn serve(
     presenter: Arc<dyn Presenter>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    // Once here, so that a skill directory that does not exist stops the
-    // daemon at start instead of failing every agent start after it. The
-    // conductor prepares it again before each start, to pick up changes.
-    let paths = environment::prepare(&config).context("preparing the agent's directory")?;
-    tracing::info!("agent directory {}", paths.agent_dir.display());
+    // The socket first: a second daemon started by mistake must be refused
+    // before it touches the running one's agent directory.
     let listener = bind(socket).await?;
+    // Prepared once here, so that a skill directory that does not exist
+    // stops the daemon at start instead of failing every agent start after
+    // it. The conductor prepares it again before each start.
+    let paths = match environment::prepare(&config) {
+        Ok(paths) => paths,
+        Err(e) => {
+            let _ = std::fs::remove_file(socket);
+            return Err(e.context("preparing the agent's directory"));
+        }
+    };
+    tracing::info!("agent directory {}", paths.agent_dir.display());
     tracing::info!("listening on {}", socket.display());
 
     let (handle, conductor) = conductor::spawn(Arc::new(config), presenter);

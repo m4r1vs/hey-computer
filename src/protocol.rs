@@ -7,7 +7,9 @@
 //!   daemon presents the answer itself.
 //! - `{"type":"ask","text":"…","wait":true}` → `accepted`, then one
 //!   `answer` or `failed` line; the daemon presents nothing. Closing the
-//!   connection before that cancels the request.
+//!   connection before that cancels the request, and so does shutting down
+//!   only the writing side (as `socat` and `nc -N` do at the end of input):
+//!   a waiting client keeps its side open until the answer arrives.
 //! - `"new": true` on an ask starts a fresh conversation.
 //! - `{"type":"cancel"}` → `{"type":"cancelled","id":1}` (`null` when nothing
 //!   was running).
