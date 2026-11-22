@@ -60,6 +60,10 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
 - `present`: `Presenter` trait; `Desktop` runs the notifier (an argument vector,
   notify-send by default, so tests and hand runs can swap in a recording script) and the
   viewer; `Recorder` for tests. `is_short`/`is_rich` decide notification versus viewer.
+  `to_markup` cuts code spans out before pairing `**`, so the Pango markup always nests.
+  `disarm_html` rewrites every `<` outside code (`&lt;` in text, `\lt` in math) before the
+  answer file is written: Marker renders in a web view. A viewer that fails within 1.5 s is
+  reported instead of "Answer opened".
 - `mock`: a scripted ACP agent, run as the hidden `debug mock-agent SCRIPT`, so the package
   installs one binary. Script format and log lines are documented at the top of `mock.rs`.
 - `debug`: hidden commands that check one part at a time (`config`, `instructions`,
@@ -123,7 +127,14 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   with the daemon's own message, follow-ups inside and outside the window, cancellation by a
   newer request, `cancel`, a client that hangs up, crash and restart, inactivity timeout,
   malformed and oversized agent lines, malformed requests, a second client, a second daemon,
-  an expired login (mock), a missing agent, cold start, idle stop.
+  a missing login (mock, in agy's words), a missing agent, cold start, idle stop, a shutdown
+  during a turn and during a hanging start (both must end within 2 s), a correction while the
+  agent starts (one start, not two), a config out of range, a file at the socket path. The
+  mock's `init_delay_ms` makes a slow start. `tests/cli.rs` runs the binary as a voice front
+  end would: every refusal of an `ask` without `--print` must be a notification.
+- The late-chunk check in `a_newer_request_cancels_the_running_one` fails every time when
+  neither `cancel_turn` nor `drain_stale` reads the cancelled turn's last update; keep the
+  run loop `biased` (inbox first), or it passes by luck.
 - Real checks against agy cost the user's quota and run commands without confirmation: use
   only harmless prompts (one word, arithmetic, `hyprctl version`, a note in a scratch vault),
   a scratch `state_dir`, an own socket (`--socket` or `HEY_COMPUTER_SOCKET`), and a recording
