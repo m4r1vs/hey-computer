@@ -87,6 +87,25 @@ impl fmt::Display for CallError {
 
 impl std::error::Error for CallError {}
 
+/// How the agent ended: its exit status and the last lines of its stderr,
+/// which are shown to the user but logged at debug only (they are agy's,
+/// and nothing says what they may contain).
+#[derive(Debug, Clone)]
+pub struct Ended {
+    pub status: String,
+    pub tail: String,
+}
+
+impl fmt::Display for Ended {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.status)?;
+        if !self.tail.is_empty() {
+            write!(f, ": {}", self.tail)?;
+        }
+        Ok(())
+    }
+}
+
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CallError>>>>>;
 
 pub struct Connection {
@@ -236,8 +255,8 @@ impl Connection {
             .unwrap_or_default()
     }
 
-    /// Why the agent is gone: its exit status and what it said last.
-    pub async fn reap(mut self) -> String {
+    /// Why the agent is gone.
+    pub async fn reap(mut self) -> Ended {
         let status = match tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await {
             Ok(Ok(status)) => status.to_string(),
             Ok(Err(e)) => format!("unknown exit ({e})"),
@@ -248,12 +267,8 @@ impl Connection {
         };
         // The stderr reader may still be draining the last lines.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let tail = self.stderr_tail();
-        if tail.is_empty() {
-            status
-        } else {
-            format!("{status}: {}", last_lines(&tail, 3))
-        }
+        let tail = last_lines(&self.stderr_tail(), 3);
+        Ended { status, tail }
     }
 
     /// Stop the agent: SIGTERM, then SIGKILL, each to the whole process

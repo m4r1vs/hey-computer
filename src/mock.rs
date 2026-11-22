@@ -333,8 +333,12 @@ impl Mock {
             .map(|t| t.steps.clone())
             .unwrap_or_else(|| self.script.default.clone());
 
+        // Updates can still arrive between the cancel and the response (agy
+        // sent one); a late chunk makes sure the daemon does not carry it
+        // into the next answer.
         let cancelled = || {
             self.log.line("turn cancelled");
+            self.chunk(&session, " (late chunk of a cancelled turn)");
             self.respond(&id, json!({"stopReason": "cancelled"}));
         };
 

@@ -414,9 +414,11 @@ impl Conductor {
         let result = match init {
             Ok(result) => result,
             Err(e) => {
-                let detail = conn.reap().await;
+                // Nothing has been asked yet, so its stderr can only be about
+                // starting up (a missing login, say) and may be logged.
+                let ended = conn.reap().await;
                 return Err(anyhow!(
-                    "the agent did not initialize ({e}); it ended with {detail}"
+                    "the agent did not initialize ({e}); it ended with {ended}"
                 ));
             }
         };
@@ -468,8 +470,10 @@ impl Conductor {
     /// is meant to stay up.
     async fn agent_died(&mut self, live: Live) -> String {
         let lived = live.started.elapsed();
-        let detail = live.conn.reap().await;
-        tracing::warn!("the agent exited: {detail}");
+        let ended = live.conn.reap().await;
+        // Its last words may quote a request, so they stay at debug.
+        tracing::warn!("the agent exited: {}", ended.status);
+        tracing::debug!("the agent's last stderr: {}", ended.tail);
         self.conversation = None;
         self.set_follow_up(None);
         self.set_agent(AgentState::Down);
@@ -479,7 +483,7 @@ impl Conductor {
         if self.config.agent.warm_start {
             self.schedule_restart();
         }
-        detail
+        ended.to_string()
     }
 
     async fn between_turns(&mut self, event: Option<Incoming>) {
@@ -1033,10 +1037,10 @@ async fn cancel_turn(
         .notify("session/cancel", json!({"sessionId": session}));
     let deadline = tokio::time::Instant::now() + CANCEL_GRACE;
     loop {
+        // Events first, as in `turn`: the old turn's last chunks must be read
+        // here, or a follow-up in the same session would start with them.
         tokio::select! {
-            result = &mut *response => {
-                return matches!(result, Ok(Ok(_)) | Ok(Err(CallError::Rpc(_))));
-            }
+            biased;
             event = live.incoming.recv() => match event {
                 None | Some(Incoming::Exited) => return false,
                 Some(Incoming::Permission { id, .. }) => {
@@ -1044,6 +1048,9 @@ async fn cancel_turn(
                 }
                 Some(Incoming::Update { .. }) => {}
             },
+            result = &mut *response => {
+                return matches!(result, Ok(Ok(_)) | Ok(Err(CallError::Rpc(_))));
+            }
             () = tokio::time::sleep_until(deadline) => {
                 tracing::warn!("the agent did not stop the turn within {CANCEL_GRACE:?}");
                 return false;
