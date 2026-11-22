@@ -795,7 +795,7 @@ impl Conductor {
         match error {
             CallError::Rpc(e) => {
                 tracing::warn!("{method} failed: {e}");
-                Outcome::failed(FailReason::AgentError, e.to_string())
+                Outcome::failed(FailReason::AgentError, agent_error_message(&e))
             }
             CallError::Closed => {
                 let detail = match self.live.take() {
@@ -849,6 +849,23 @@ fn deliver(presenter: Option<&Arc<dyn Presenter>>, ask: Ask, outcome: Outcome) {
         }
     }
 }
+
+/// What to tell the user when the agent refused a call. agy 1.5 answers
+/// `session/new` with `-32000 Authentication required` when it has no login
+/// (seen with the keyring out of reach); that alone does not say what to do.
+fn agent_error_message(error: &acp::RpcError) -> String {
+    if error.code == AUTH_REQUIRED || error.message.contains("Authentication required") {
+        format!(
+            "The assistant is not signed in ({error}). Sign in once with an interactive `agy` \
+             session, or run `agy acp --login`, then ask again."
+        )
+    } else {
+        error.to_string()
+    }
+}
+
+/// ACP's error code for a missing or expired login.
+const AUTH_REQUIRED: i64 = -32000;
 
 fn cancelled(reason: FailReason) -> Outcome {
     Outcome::failed(reason, cancel_message(reason))

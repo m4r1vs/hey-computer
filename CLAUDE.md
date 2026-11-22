@@ -108,10 +108,12 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
 - Hyprland 0.55 with a Lua config: `hyprctl dispatch X` evaluates `hl.dispatch(X)`; errors
   still exit 0; a stale `HYPRLAND_INSTANCE_SIGNATURE` gives exit 4, and
   `hyprctl instances -j` finds the live instance.
-
-Not yet seen: agy's real wording for an expired login (tested only against the mock's
-`session_error`). agy's conversations, transcripts and logs (`agy/antigravity-cli/{conversations,brain,log}`)
-are pruned to `agent.history_days` before each agent start, never while agy runs.
+- Without a login (seen with the keyring out of reach, `DBUS_SESSION_BUS_ADDRESS=disabled:`),
+  agy starts normally and fails `session/new` with `-32000 Authentication required` (ACP's
+  `auth_required`). The daemon turns that into a message naming `agy acp --login`. An
+  expired (rather than missing) login was not seen; it is assumed to look the same.
+- agy's conversations, transcripts and logs (`agy/antigravity-cli/{conversations,brain,log}`)
+  are pruned to `agent.history_days` before each agent start, never while agy runs.
 
 ## Testing
 

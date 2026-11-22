@@ -167,7 +167,7 @@ empty. `reason` is one of:
 | `superseded` | a newer request replaced it |
 | `timeout` | the agent sent nothing for `agent.inactivity_timeout_secs` |
 | `agent_down` | the agent could not be started, or exited mid-request |
-| `agent_error` | the agent refused the request (for example an expired login); `message` is what it said |
+| `agent_error` | the agent refused the request; `message` is what it said. Without a login agy says `Authentication required`, and the message adds how to sign in (`agy acp --login`) |
 | `denied` | the only thing the agent tried was refused by the deny list |
 | `empty` | the agent finished without saying anything |
 

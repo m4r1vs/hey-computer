@@ -502,13 +502,16 @@ async fn a_second_daemon_refuses_the_socket() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_expired_login_is_reported_in_the_agents_words() {
-    let script = r#"{"session_error": "Authentication required: sign in again with agy", "default": ["echo"]}"#;
+async fn a_missing_login_is_reported_with_what_to_do() {
+    // agy 1.5.13 without a login: session/new fails with -32000
+    // "Authentication required", and nothing else.
+    let script = r#"{"session_error": "Authentication required", "default": ["echo"]}"#;
     let h = Harness::start(script, |_| {}).await;
     let reply = h.ask("anything", false).await;
     let (reason, message) = failure(&reply);
     assert_eq!(reason, FailReason::AgentError);
-    assert_eq!(message, "Authentication required: sign in again with agy");
+    assert!(message.contains("(Authentication required)"), "{message}");
+    assert!(message.contains("agy acp --login"), "{message}");
     h.stop().await;
 }
 
