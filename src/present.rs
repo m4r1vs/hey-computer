@@ -72,10 +72,13 @@ impl From<&PresentConfig> for Limits {
 
 /// Whether an answer fits a notification: short, few lines, and nothing a
 /// notification cannot render (a heading, a table, a code block, math).
+///
+/// Blank lines do not count: models often put each of three sentences in a
+/// paragraph of its own, and that still fits a notification.
 pub fn is_short(text: &str, limits: Limits) -> bool {
     let text = text.trim();
     text.chars().count() <= limits.max_chars
-        && text.lines().count() <= limits.max_lines
+        && text.lines().filter(|l| !l.trim().is_empty()).count() <= limits.max_lines
         && !is_rich(text)
 }
 
@@ -641,6 +644,8 @@ mod tests {
             "Es ist 14:32.",
             "Hyprland 0.55.4, built from the release tag.",
             "Line one.\nLine two.\nLine three.\nLine four.",
+            "It is sunny.\n\nIt is 20 degrees.\n\nNo rain today.",
+            "One.\n\n\nTwo.\n \nThree.\n\nFour.",
             "It costs $5 and the other one $10.",
             "Use **hyprctl** to ask the compositor.",
             "- milk\n- eggs",
