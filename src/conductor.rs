@@ -341,6 +341,11 @@ impl Conductor {
                 break;
             }
             tokio::select! {
+                // A queued request goes first; whatever the agent sent in the
+                // meantime is read by `drain_stale` before the request runs.
+                // In a fixed order, a late update of a cancelled turn is
+                // handled the same way every time.
+                biased;
                 message = self.inbox.recv() => match message {
                     Some(Message::Ask(ask)) => self.take(ask).await,
                     Some(Message::Shutdown) | None => break,
@@ -511,6 +516,25 @@ impl Conductor {
         ended.to_string()
     }
 
+    /// Read what the agent sent since the last turn ended: an update of a
+    /// cancelled turn that came after its answer, a permission request that
+    /// nothing waits for, or its exit. Without this, a follow-up in the same
+    /// session would begin with the cancelled turn's last words.
+    async fn drain_stale(&mut self) {
+        loop {
+            let event = match self.live.as_mut().map(|live| live.incoming.try_recv()) {
+                Some(Ok(event)) => Some(event),
+                Some(Err(mpsc::error::TryRecvError::Empty)) | None => return,
+                Some(Err(mpsc::error::TryRecvError::Disconnected)) => None,
+            };
+            let ended = matches!(event, None | Some(Incoming::Exited));
+            self.between_turns(event).await;
+            if ended {
+                return;
+            }
+        }
+    }
+
     async fn between_turns(&mut self, event: Option<Incoming>) {
         match event {
             None | Some(Incoming::Exited) => {
@@ -567,6 +591,7 @@ impl Conductor {
         );
         tracing::debug!("request {}: {:?}", ask.id, ask.text);
 
+        self.drain_stale().await;
         let stop = Arc::clone(&self.stop);
         if self.live.is_none() {
             self.restart_at = None;

@@ -308,6 +308,10 @@ async fn a_newer_request_cancels_the_running_one() {
     h.wait_log("prompt mock-1 slow").await;
 
     let second = h.ask("plain", false).await;
+    // The mock sends a late chunk on every cancel; it must not reach the
+    // next answer in the same session. With the queued request always taken
+    // first, this fails every time when neither the cancel nor the start of
+    // the next request reads it away.
     assert_eq!(answer(&second), "Hello from the mock.");
 
     let first_reply = waiting.next(Some(Duration::from_secs(5))).await.unwrap();
