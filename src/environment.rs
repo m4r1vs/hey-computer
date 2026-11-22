@@ -79,11 +79,15 @@ pub fn prepare(config: &Config) -> Result<Paths> {
 ///   approval arrives as a permission request, which the daemon answers. agy's
 ///   own default, `auto`, would let its classifier decide instead.
 /// - `toolPermission = "request-review"` asks for shell, web and MCP tools.
-/// - `enableTerminalSandbox = false`: on hosts where the sandbox cannot start
-///   (measured on NixOS: `sbox: exec /proc/self/exe`), every shell command
-///   first failed inside it and was then retried outside, after two model
-///   safety checks, about 9 s of a 10 s command. With the sandbox off the
-///   command goes straight to the permission request.
+/// - `enableTerminalSandbox = false`. Where agy's sandbox cannot run (seen on
+///   NixOS with agy 1.5.13: "connecting to sandbox server … connection reset
+///   by peer"), a shell command first fails inside it, is retried outside, and
+///   reaches the permission request only after agy's own safety checks. One
+///   `hyprctl version` turn, measured with the same prompt: 16.6 s with the
+///   sandbox on (`proceed-in-sandbox`), 6.4 s with it off, where the command
+///   goes straight to the permission request (0.8 s after the tool call). The
+///   sandbox would add nothing here anyway: every command it would contain is
+///   then allowed to run outside it.
 /// - `artifactReviewPolicy = "always-proceed"`: nobody is there to review a
 ///   plan the agent might ask feedback on.
 fn settings(config: &Config) -> Result<Value> {
