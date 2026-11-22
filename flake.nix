@@ -80,7 +80,7 @@
         pkgs.runCommand "hey-computer-fmt" {
           nativeBuildInputs = [pkgs.rustfmt];
         } ''
-          find ${./src} -name '*.rs' -exec rustfmt --check --edition 2024 {} +
+          find ${./src} ${./tests} -name '*.rs' -exec rustfmt --check --edition 2024 {} +
           touch $out
         '';
     });
