@@ -750,7 +750,25 @@ fn answer_stamp(path: &Path) -> (u128, u64) {
 /// is reported with what it said, instead of an "Answer opened" with no
 /// window behind it.
 async fn open_viewer(argv: &[String], file: &Path) -> anyhow::Result<()> {
-    use tokio::io::AsyncReadExt;
+    use std::io::{Read, Seek};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Its stderr goes to a file, not a pipe: with a pipe, the viewer's first
+    // write after the daemon exits (a restart, a config change) would kill
+    // it with SIGPIPE, and its window with it. The file is unlinked at once;
+    // the viewer keeps writing to it until it exits.
+    let log_path = file.with_extension("viewer-stderr");
+    let mut log = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&log_path)
+        .map_err(|e| anyhow::anyhow!("creating {}: {e}", log_path.display()))?;
+    let _ = std::fs::remove_file(&log_path);
+    let stderr = log
+        .try_clone()
+        .map_err(|e| anyhow::anyhow!("sharing {}: {e}", log_path.display()))?;
 
     let file = file.to_string_lossy().into_owned();
     let mut args: Vec<String> = argv[1..]
@@ -765,32 +783,20 @@ async fn open_viewer(argv: &[String], file: &Path) -> anyhow::Result<()> {
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(stderr))
         // Its own process group: a viewer is a window of its own and must not
         // get the daemon's signals.
         .process_group(0)
         .spawn()
         .map_err(|e| anyhow::anyhow!("starting {program}: {e}"))?;
 
-    // Read all of stderr, so a chatty viewer never blocks on a full pipe,
-    // and keep its start for the message.
-    let mut stderr = child.stderr.take();
-    let said = tokio::spawn(async move {
-        let mut kept = Vec::new();
-        let mut buffer = [0u8; 4096];
-        while let Some(pipe) = stderr.as_mut() {
-            match pipe.read(&mut buffer).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) if kept.len() < VIEWER_STDERR_KEPT => kept.extend_from_slice(&buffer[..n]),
-                Ok(_) => {}
-            }
-        }
-        kept
-    });
-
     match tokio::time::timeout(VIEWER_GRACE, child.wait()).await {
         Ok(Ok(status)) if !status.success() => {
-            let said = said.await.unwrap_or_default();
+            let mut said = Vec::new();
+            let _ = log.rewind();
+            let _ = (&mut log)
+                .take(VIEWER_STDERR_KEPT as u64 * 4)
+                .read_to_end(&mut said);
             let said = String::from_utf8_lossy(&said);
             let said = truncate(said.trim(), VIEWER_STDERR_KEPT);
             if said.is_empty() {
@@ -801,10 +807,10 @@ async fn open_viewer(argv: &[String], file: &Path) -> anyhow::Result<()> {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(anyhow::anyhow!("waiting for {program}: {e}")),
         Err(_) => {
-            // Still running: a window is up.
+            // Still running: a window is up. Reaped while the daemon runs;
+            // after that it is the scope's or init's.
             tokio::spawn(async move {
                 let _ = child.wait().await;
-                let _ = said.await;
             });
             Ok(())
         }

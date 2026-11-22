@@ -90,3 +90,44 @@ fn a_daemon_that_is_not_running_is_a_notification_but_an_empty_request_is_not() 
     assert_eq!(code, Some(2), "{stderr}");
     assert!(notified.is_empty(), "{notified}");
 }
+
+#[test]
+fn a_viewer_outlives_the_daemon_even_when_it_writes_to_stderr() {
+    // A viewer's stderr was a pipe into the daemon: its first write after a
+    // restart of the daemon killed it with SIGPIPE, and its window with it.
+    let dir = scratch("outlives");
+    let mark = dir.join("still-alive");
+    let config = dir.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[present]\nnotifications = false\nviewer = [\"/bin/sh\", \"-c\", \"sleep 2; echo late >&2; sleep 0.5; echo ok > '{}'\", \"sh\"]\n",
+            mark.display()
+        ),
+    )
+    .unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .args(["debug", "present", "# A long answer"])
+        .env("XDG_RUNTIME_DIR", &dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(!mark.exists(), "the viewer is still running");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !mark.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(mark.exists(), "the viewer died after the daemon left");
+    // Nothing but the answer is left behind.
+    let left: Vec<_> = std::fs::read_dir(dir.join("hey-computer"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.len() == 1 && left[0].ends_with(".md"), "{left:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
