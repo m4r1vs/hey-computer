@@ -195,6 +195,141 @@ fn spans<'a>(text: &'a str, marker: &str) -> Vec<(bool, &'a str)> {
     out
 }
 
+/// The answer with raw HTML made harmless for the viewer: no `<` is left
+/// outside code.
+///
+/// The model's answer can quote a web page or a note, and the viewer renders
+/// Markdown in a web view: a `<script>` would run there and an `<img>` would
+/// be fetched, outside the daemon and with nobody asking. So every `<` in
+/// text becomes `&lt;` (a Markdown renderer shows it as `<`), and every `<`
+/// in math becomes `\lt ` (KaTeX typesets it as `<`; Marker shows math
+/// verbatim, so `&lt;` would appear there as it is). Code spans, fenced
+/// blocks and autolinks such as `<https://example.org>` are left alone: they
+/// are shown literally anyway.
+pub fn disarm_html(markdown: &str) -> String {
+    let mut out = String::with_capacity(markdown.len());
+    let mut fence: Option<String> = None;
+    let mut in_math = false;
+    for line in markdown.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        let marker: String = trimmed
+            .chars()
+            .take_while(|&c| c == '`' || c == '~')
+            .collect();
+        let is_fence = !in_math
+            && indent <= 3
+            && marker.len() >= 3
+            && marker
+                .chars()
+                .all(|c| c == marker.chars().next().unwrap_or('`'));
+        match &fence {
+            Some(open) => {
+                if is_fence
+                    && marker.starts_with(open.as_str())
+                    && trimmed[marker.len()..].trim().is_empty()
+                {
+                    fence = None;
+                }
+                out.push_str(line);
+            }
+            None if is_fence => {
+                fence = Some(marker);
+                out.push_str(line);
+            }
+            None => out.push_str(&disarm_line(line, &mut in_math)),
+        }
+    }
+    out
+}
+
+/// One line outside a fenced block. `in_math` carries a `$$` display block
+/// over to the next line.
+fn disarm_line(line: &str, in_math: &mut bool) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    if *in_math {
+        match rest.find("$$") {
+            Some(end) => {
+                out.push_str(&math(&rest[..end + 2]));
+                rest = &rest[end + 2..];
+                *in_math = false;
+            }
+            None => return math(rest),
+        }
+    }
+    while let Some(i) = rest.find(['`', '<', '$', '\\']) {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        // The closing delimiter of a span that opens here, if any.
+        let span = |open: &str, close: &str| {
+            rest.strip_prefix(open)
+                .and_then(|inner| inner.find(close))
+                .map(|end| open.len() + end + close.len())
+        };
+        if rest.starts_with('`') {
+            // A code span closes with a run of as many backticks.
+            let run = rest.len() - rest.trim_start_matches('`').len();
+            let end = span(&rest[..run], &rest[..run]).unwrap_or(run);
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+        } else if rest.starts_with("$$") {
+            match span("$$", "$$") {
+                Some(end) => {
+                    out.push_str(&math(&rest[..end]));
+                    rest = &rest[end..];
+                }
+                None => {
+                    // A display block that goes on below.
+                    *in_math = true;
+                    out.push_str(&math(rest));
+                    return out;
+                }
+            }
+        } else if let Some(end) = span("$", "$")
+            .or_else(|| span("\\(", "\\)"))
+            .or_else(|| span("\\[", "\\]"))
+        {
+            out.push_str(&math(&rest[..end]));
+            rest = &rest[end..];
+        } else if rest.starts_with("\\<") {
+            // Markdown's own escape for a `<` shown as it is.
+            out.push_str("&lt;");
+            rest = &rest[2..];
+        } else if rest.starts_with('<') && is_autolink(rest) {
+            let end = rest.find('>').map_or(rest.len(), |e| e + 1);
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+        } else if rest.starts_with('<') {
+            out.push_str("&lt;");
+            rest = &rest[1..];
+        } else {
+            // A lone `$` or `\`.
+            let c = rest.chars().next().map_or(1, char::len_utf8);
+            out.push_str(&rest[..c]);
+            rest = &rest[c..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Math with `<` spelt as KaTeX's `\lt`.
+fn math(text: &str) -> String {
+    text.replace('<', "\\lt ")
+}
+
+/// `<https://…>`, `<http://…>` or `<mailto:…>`, closed before any space.
+fn is_autolink(text: &str) -> bool {
+    let inner = &text[1..];
+    ["https://", "http://", "mailto:"]
+        .iter()
+        .any(|scheme| inner.starts_with(scheme))
+        && inner
+            .find(|c: char| c == '>' || c.is_whitespace() || c == '<')
+            .is_some_and(|end| inner[end..].starts_with('>'))
+}
+
 /// The first thing worth naming in a long answer: its first heading or line,
 /// without Markdown markers.
 pub fn headline(text: &str, max: usize) -> String {
@@ -406,6 +541,7 @@ impl Worker {
             document.push_str(&refused);
         }
         document.push('\n');
+        let document = disarm_html(&document);
         let file = match write_answer(&self.answers_dir, id, &document, self.config.keep_answers) {
             Ok(file) => file,
             Err(e) => {
@@ -887,5 +1023,45 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
         let calls = show_long_answer("quick", &["/bin/sh", "-c", "exit 0", "sh"]).await;
         assert!(calls.contains("Answer opened"), "{calls}");
+    }
+
+    #[test]
+    fn raw_html_is_disarmed_outside_code() {
+        assert_eq!(
+            disarm_html("Hi <script>alert(1)</script> <img src=http://x/a.png>\n"),
+            "Hi &lt;script>alert(1)&lt;/script> &lt;img src=http://x/a.png>\n"
+        );
+        // Math keeps its comparison as KaTeX's \lt, in every delimiter, and
+        // across the lines of a display block.
+        assert_eq!(
+            disarm_html("$a<b$ and $$x < y$$, \\(p<q\\) \\[r<s\\]"),
+            "$a\\lt b$ and $$x \\lt  y$$, \\(p\\lt q\\) \\[r\\lt s\\]"
+        );
+        assert_eq!(
+            disarm_html("$$\n\\sum_i x_i < n\n$$ then <i>\n"),
+            "$$\n\\sum_i x_i \\lt  n\n$$ then &lt;i>\n"
+        );
+        // Money is not math, and HTML between two prices is still disarmed
+        // (as math, which is harmless).
+        assert_eq!(disarm_html("$5 or $"), "$5 or $");
+        assert!(!disarm_html("$5 <img src=x> $6").contains('<'));
+        assert_eq!(disarm_html("\\<b>"), "&lt;b>");
+        // Code spans, fenced blocks and autolinks are left alone.
+        assert_eq!(
+            disarm_html("Use `a<b` or ``x<`y``."),
+            "Use `a<b` or ``x<`y``."
+        );
+        let fenced = "```html\n<div>\n```\nafter <b>\n~~~~\n<p>\n~~~\nstill <in>\n~~~~\n";
+        assert_eq!(
+            disarm_html(fenced),
+            "```html\n<div>\n```\nafter &lt;b>\n~~~~\n<p>\n~~~\nstill <in>\n~~~~\n"
+        );
+        assert_eq!(
+            disarm_html("See <https://example.org/a?b=1> or <mailto:a@example.org>."),
+            "See <https://example.org/a?b=1> or <mailto:a@example.org>."
+        );
+        assert_eq!(disarm_html("<https://x y>"), "&lt;https://x y>");
+        // An unclosed backtick does not hide what follows.
+        assert_eq!(disarm_html("a ` <b>"), "a ` &lt;b>");
     }
 }

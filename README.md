@@ -373,7 +373,15 @@ Marker then cannot save its own preferences.
 
 What Marker does not do: its preview window still has "Open" and "Save"
 buttons (it is an editor at heart), syntax highlighting treats an umlaut as a
-word boundary, and its last release is from 2023.
+word boundary, level-two headings are only a little larger than body text
+(level one clearly so), and its last release is from 2023.
+
+**Raw HTML is disarmed.** Marker renders Markdown in a web view, where raw
+HTML in an answer (quoted from a web page, say) would run scripts and fetch
+images. Before the answer file is written, every `<` outside code becomes
+`&lt;` in text and KaTeX's `\lt` in math, so it shows as `<` and nothing in it
+is HTML. Code spans, fenced blocks and autolinks (`<https://…>`) are left as
+they are. A viewer of your own gets the same file.
 
 A floating rule for Hyprland's Lua configuration (checked with 0.55.4):
 
