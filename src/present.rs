@@ -318,24 +318,26 @@ impl Worker {
             }
             Presentation::Answer { id, text, denied } => self.answer(id, &text, &denied).await,
             Presentation::Failure {
-                reason: FailReason::Superseded,
+                reason: reason @ (FailReason::Cancelled | FailReason::Superseded),
                 ..
             } => {
-                // The newer request's progress popup takes this one's place.
-            }
-            Presentation::Failure {
-                reason: FailReason::Cancelled,
-                ..
-            } => {
+                // Short-lived, so a popup does not linger when the newer
+                // request shows none (one asked with `wait`). A superseded
+                // request's popup id is kept for the next progress popup,
+                // which then replaces this one in place.
                 if let Some(replaces) = self.progress.take() {
-                    self.notify(
-                        FailReason::Cancelled.headline(),
-                        "",
-                        Urgency::Low,
-                        CANCELLED_EXPIRE_MS,
-                        Some(replaces),
-                    )
-                    .await;
+                    let shown = self
+                        .notify(
+                            reason.headline(),
+                            "",
+                            Urgency::Low,
+                            CANCELLED_EXPIRE_MS,
+                            Some(replaces),
+                        )
+                        .await;
+                    if reason == FailReason::Superseded {
+                        self.progress = shown;
+                    }
                 }
             }
             Presentation::Failure {
