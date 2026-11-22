@@ -545,6 +545,7 @@ impl Conductor {
                 reason = token.cancelled() => {
                     // The half-started agent was dropped, which killed it.
                     self.set_agent(AgentState::Down);
+                    self.schedule_restart_if_warm();
                     return cancelled(reason);
                 }
             };
@@ -860,9 +861,13 @@ async fn turn(
     let at = || started.elapsed().as_secs_f64();
 
     let ended = loop {
+        // Events first: the reader queues every update before it hands over
+        // the response that follows them, so the last chunks would otherwise
+        // be lost to a response that is already waiting.
         let step = tokio::select! {
-            result = &mut response => Step::Responded(result),
+            biased;
             event = live.incoming.recv() => Step::Event(event),
+            result = &mut response => Step::Responded(result),
             () = tokio::time::sleep_until(deadline.into()) => Step::Quiet,
             reason = token.cancelled() => Step::Cancelled(reason),
         };
