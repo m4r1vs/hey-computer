@@ -13,11 +13,8 @@ use tokio::io::AsyncReadExt;
 use hey_computer::config::Config;
 use hey_computer::ipc::{self, NotRunning};
 use hey_computer::present::{self, Urgency};
-use hey_computer::protocol::{Reply, Request};
+use hey_computer::protocol::{self, MAX_REQUEST_LINE, Reply, Request};
 use hey_computer::{daemon, debug, mock};
-
-/// A request read from stdin is cut off here; speech never comes close.
-const MAX_STDIN: u64 = 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "hey-computer", version, about, long_about = None)]
@@ -222,21 +219,40 @@ async fn ask(
     print: bool,
     new: bool,
 ) -> Result<ExitCode> {
-    let text = text_or_stdin(words).await?;
-    if text.trim().is_empty() {
+    // Every refusal after this point is also a notification (see below).
+    let text = text_or_stdin(words).await;
+    if let Ok(text) = &text
+        && text.trim().is_empty()
+    {
         eprintln!("hey-computer: the request is empty; nothing was asked");
         return Ok(ExitCode::from(2));
     }
 
-    let (id, mut client) = match ipc::ask(socket, &text, print, new).await {
+    let accepted = match text {
+        Ok(text) => match request_size(&text, print, new) {
+            Ok(()) => ipc::ask(socket, &text, print, new).await,
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
+    let (id, mut client) = match accepted {
         Ok(accepted) => accepted,
         Err(e) => {
-            // Usually started by a voice command, where nobody reads stderr.
-            if e.downcast_ref::<NotRunning>().is_some() {
+            // Usually started by a voice command, where nobody reads stderr;
+            // with --print the caller reads it.
+            if !print || e.downcast_ref::<NotRunning>().is_some() {
+                let (summary, body) = if e.downcast_ref::<NotRunning>().is_some() {
+                    (
+                        "The assistant is not running",
+                        "Start it with: systemctl --user start hey-computer".to_string(),
+                    )
+                } else {
+                    ("The assistant did not take the request", format!("{e:#}"))
+                };
                 present::notify(
                     &config.present,
-                    "The assistant is not running",
-                    &present::escape_markup("Start it with: systemctl --user start hey-computer"),
+                    summary,
+                    &present::escape_markup(&body),
                     Urgency::Normal,
                     8_000,
                     None,
@@ -267,18 +283,41 @@ async fn ask(
     }
 }
 
-/// The words joined with spaces, or all of stdin when there are none.
+/// Refuse a request the daemon would refuse, before connecting: its line,
+/// once encoded (escaping makes it longer than the text), must fit.
+fn request_size(text: &str, wait: bool, new: bool) -> Result<()> {
+    let line = protocol::encode(&Request::Ask {
+        text: text.to_string(),
+        wait,
+        new,
+    });
+    if line.len() + 1 > MAX_REQUEST_LINE {
+        anyhow::bail!(
+            "the request is {} bytes, more than the {MAX_REQUEST_LINE} the daemon takes",
+            text.len()
+        );
+    }
+    Ok(())
+}
+
+/// The words joined with spaces, or all of stdin when there are none. Stdin
+/// is read only as far as a request can go.
 async fn text_or_stdin(words: Vec<String>) -> Result<String> {
     if !words.is_empty() {
         return Ok(words.join(" "));
     }
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     tokio::io::stdin()
-        .take(MAX_STDIN)
-        .read_to_string(&mut text)
+        .take(MAX_REQUEST_LINE as u64 + 1)
+        .read_to_end(&mut bytes)
         .await
         .context("reading the request from stdin")?;
-    Ok(text)
+    if bytes.len() > MAX_REQUEST_LINE {
+        anyhow::bail!(
+            "the request on stdin is longer than the {MAX_REQUEST_LINE} bytes the daemon takes"
+        );
+    }
+    String::from_utf8(bytes).context("the request on stdin is not UTF-8")
 }
 
 #[cfg(test)]

@@ -108,14 +108,16 @@ hey-computer [--config FILE] [--socket PATH] [-v|-vv] COMMAND
 | Command | What it does |
 |---|---|
 | `daemon` | Run the daemon. |
-| `ask [--print] [--new] [--] [TEXT...]` | Hand the daemon a request: the arguments joined by spaces, or stdin (up to 1 MiB) when there are none. Without `--print` it exits 0 as soon as the daemon has accepted the request, and the daemon shows the answer. With `--print` it waits, prints the answer on stdout and exits 0, or prints the failure on stderr and exits 1; the daemon shows nothing. `--new` starts a new conversation. Ctrl-C while waiting cancels the request. |
+| `ask [--print] [--new] [--] [TEXT...]` | Hand the daemon a request: the arguments joined by spaces, or stdin when there are none (up to 256 KiB, the most the daemon takes). Without `--print` it exits 0 as soon as the daemon has accepted the request, and the daemon shows the answer. With `--print` it waits, prints the answer on stdout and exits 0, or prints the failure on stderr and exits 1; the daemon shows nothing. `--new` starts a new conversation. Ctrl-C while waiting cancels the request. |
 | `cancel` | Cancel the running request: `cancelled request N` or `nothing to cancel`. |
 | `status [--json]` | For example `agent ready, idle, follow-ups for 78 s, 7 handled`. |
 
 - An empty or whitespace-only request is reported on stderr and exits 2.
 - When the daemon is not running, `ask` says so on stderr, sends a
   notification "The assistant is not running" (a voice command has nobody
-  watching stderr), and exits 1.
+  watching stderr), and exits 1. Without `--print`, any other refusal (a
+  request too long for the daemon, a daemon that does not answer) is a
+  notification too.
 - The socket is `--socket`, else `$HEY_COMPUTER_SOCKET`, else
   `$XDG_RUNTIME_DIR/hey-computer.sock`.
 
