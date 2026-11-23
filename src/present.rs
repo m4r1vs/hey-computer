@@ -110,18 +110,99 @@ pub fn is_rich(text: &str) -> bool {
     })
 }
 
-/// `$…$` with a LaTeX command inside. A plain `$` is money ("$5 and $10").
+/// Inline `$…$` containing LaTeX syntax (`\`, `^`, `_`).
+///
+/// Follows Pandoc's `tex_math_dollars` spacing rules (no whitespace right
+/// inside either `$`) and rejects a closing `$` immediately followed by an
+/// alphanumeric character, `{`, or `\`, so currency ("$5 and $10",
+/// "$5_000-$10_000") and shell variables ("$FOO_BAR and $BAZ_QUX",
+/// "$HOME/$USER_DIR", "${A_B}/${C_D}") stay in notifications while inline math
+/// like `$x^2 + y^2 = z^2$` and `$a_i < b_i$` goes to the viewer. Inline code
+/// spans are skipped so shell examples in backticks never trigger math.
 fn has_latex_inline_math(text: &str) -> bool {
-    text.lines().any(|line| {
-        let pieces: Vec<&str> = line.split('$').collect();
-        // Pieces 1, 3, 5, … sit between an opening and a closing dollar.
-        pieces
-            .iter()
-            .enumerate()
-            .skip(1)
-            .step_by(2)
-            .any(|(i, piece)| i + 1 < pieces.len() && piece.contains('\\'))
-    })
+    text.lines().any(line_has_latex_inline_math)
+}
+
+fn line_has_latex_inline_math(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut open: Option<usize> = None;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                // Skip escaped `\`, `$`, and `` ` `` so `\$` is never a
+                // delimiter, `\\$` still closes math, and `` \` `` does not
+                // start a code span.
+                if matches!(bytes.get(i + 1), Some(b'\\' | b'$' | b'`')) {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            b'`' => {
+                let run = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+                if let Some(end) = find_closing_backticks(&bytes[i + run..], run) {
+                    // Code spans take precedence over `$…$`; an earlier
+                    // unclosed `$` was plain text (e.g. currency).
+                    open = None;
+                    i += run + end;
+                } else {
+                    i += run;
+                }
+            }
+            b'$' => {
+                let run = bytes[i..].iter().take_while(|&&b| b == b'$').count();
+                if run > 1 {
+                    // Display math `$$` is handled by `is_rich`; never split a
+                    // multi-dollar run into inline delimiters.
+                    open = None;
+                    i += run;
+                    continue;
+                }
+                let before = line[..i].chars().next_back();
+                let after = line[i + 1..].chars().next();
+                let valid_open = after.is_some_and(|c| !c.is_whitespace());
+                if let Some(start) = open {
+                    let valid_close = before.is_some_and(|c| !c.is_whitespace())
+                        && after.is_none_or(|c| !c.is_alphanumeric() && c != '{' && c != '\\');
+                    if valid_close {
+                        if line[start..i].contains(['\\', '^', '_']) {
+                            return true;
+                        }
+                        open = None;
+                    } else {
+                        // A lone `$` (e.g. "$5 for $x^2$") failed to close;
+                        // let this `$` try as a fresh opener instead.
+                        open = valid_open.then_some(i + 1);
+                    }
+                } else {
+                    open = valid_open.then_some(i + 1);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// Byte offset immediately after the first run of exactly `run` backticks in
+/// `bytes`, or `None` when the backtick run is unclosed.
+fn find_closing_backticks(bytes: &[u8], run: usize) -> Option<usize> {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let n = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            if n == run {
+                return Some(i + n);
+            }
+            i += n;
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// Escape text for Pango markup, as `g_markup_escape_text` does.
@@ -954,6 +1035,8 @@ mod tests {
             "It is sunny.\n\nIt is 20 degrees.\n\nNo rain today.",
             "One.\n\n\nTwo.\n \nThree.\n\nFour.",
             "It costs $5 and the other one $10.",
+            "Set $FOO_BAR and $BAZ_QUX.",
+            "PATH=$HOME/$USER",
             "Use **hyprctl** to ask the compositor.",
             "- milk\n- eggs",
         ] {
@@ -975,10 +1058,94 @@ mod tests {
             "| a | b |\n|---|---|",
             "The sum is $$\\sum_i x_i$$",
             "The root is $\\sqrt{2}$.",
+            "Pythagoras: $x^2 + y^2 = z^2$.",
+            "When $a_i < b_i$, swap them.",
             "Euler: \\(e^{i\\pi}\\)",
         ] {
             assert!(!is_short(text, LIMITS), "{text}");
         }
+    }
+
+    #[test]
+    fn inline_math_detection_handles_scripts_currency_and_shell_vars() {
+        for math in [
+            "$\\sqrt{2}$",
+            "$a \\le b$",
+            "$e^{i\\pi}$",
+            "$\\$5^2$",
+            "$a\\\\$",
+            "$\\`a$",
+            "$x^2$",
+            "$x^2 + y^2 = z^2$",
+            "$a_i < b_i$",
+            "$x_1 + x_2 = 1$",
+            "$O(n^2)$",
+            "$a_{n+1} = 2a_n$",
+            "($a_i < b_i$)",
+            "**$x^2$**",
+            "_$x^2$_",
+            "$x^2$-axis",
+            "$a_1$/$b_2$",
+            "Lösung: $x^2$—fertig.",
+            "It costs $5 for $x^2$ units.",
+            "It costs $5 ($x^2$)",
+            "It costs $5 ($\\sqrt{2}$)",
+            "Costs \\$5, so $x^2$ applies.",
+            "$a$ + $x^2$",
+            "$a$+$x^2$",
+            "Use `$a_b$` and $x^2$.",
+            "Unclosed ` backtick before $x^2$.",
+            "\\\\$x^2$",
+        ] {
+            assert!(has_latex_inline_math(math), "{math}");
+        }
+
+        for plain in [
+            "",
+            "$",
+            "$$",
+            "$$$",
+            "$$x^2$$",
+            "$x^2",
+            "x^2$",
+            "\\$x^2$",
+            "$x^2\\$",
+            "\\\\\\$x^2$",
+            "Costs \\$5 and \\$10.",
+            "The cost is $5 and $10.",
+            "price is $5_000 to $10_000",
+            "price is $5_000-$10_000",
+            "$5_000/$10_000",
+            "It costs $5 (C:\\tmp) and $10.",
+            "PATH=$HOME/$USER",
+            "PATH=$HOME_DIR/$USER_DIR",
+            "$FOO_BAR and $BAZ_QUX",
+            "$FOO_BAR/$BAZ_QUX",
+            "${FOO_BAR}/${BAZ_QUX}",
+            "${FOO_BAR} and ${BAZ_QUX}",
+            "$ x^2 $",
+            "$x^2 $",
+            "$ x^2$",
+            "$\tx^2$",
+            "$\u{a0}x^2$",
+            "$ \\sqrt{2} $",
+            "$x^2$s",
+            "$x^2$ä",
+            "$a_b$1",
+            "$a$ and $b$",
+            "$a$—foo_bar—$",
+            "`$x^2$`",
+            "``$x^2$``",
+            "`` ` $x^2$ ``",
+            "Check `$XDG_CONFIG_HOME` and `$XDG_STATE_HOME`.",
+            "It costs $5 (`$a_b$`) today.",
+            "$x^2 +\ny^2$",
+            "Cost: $5\nnote: a_b$",
+            "$x^2\n\n+ y^2$",
+        ] {
+            assert!(!has_latex_inline_math(plain), "{plain}");
+        }
+        assert!(is_rich("$$x^2$$"));
     }
 
     #[test]
