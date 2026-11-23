@@ -10,10 +10,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::process::Command;
 use tokio::sync::{Notify, mpsc};
+use tokio::task::JoinSet;
 
 use crate::config::Present as PresentConfig;
 use crate::protocol::FailReason;
@@ -433,16 +434,30 @@ pub struct Desktop {
 
 impl Desktop {
     pub fn spawn(config: &PresentConfig, answers_dir: PathBuf) -> Arc<Self> {
+        Self::spawn_with_grace(config, answers_dir, VIEWER_GRACE)
+    }
+
+    fn spawn_with_grace(
+        config: &PresentConfig,
+        answers_dir: PathBuf,
+        viewer_grace: Duration,
+    ) -> Arc<Self> {
         let (queue, mut items) = mpsc::unbounded_channel();
         let mut worker = Worker {
             config: config.clone(),
             answers_dir,
             progress: None,
+            watchers: JoinSet::new(),
+            viewer_grace,
         };
         let task = tokio::spawn(async move {
             while let Some(item) = items.recv().await {
                 worker.show(item).await;
             }
+            // Let any viewer started in the last VIEWER_GRACE finish its
+            // early-exit check before exit; long-running viewers are already
+            // handed off to detached reapers.
+            while worker.watchers.join_next().await.is_some() {}
         });
         Arc::new(Self {
             queue: Mutex::new(Some(queue)),
@@ -475,6 +490,9 @@ struct Worker {
     answers_dir: PathBuf,
     /// The "Thinking…" popup on screen, which the next popup replaces.
     progress: Option<u32>,
+    /// Bounded early-exit watchers for recently launched viewers.
+    watchers: JoinSet<()>,
+    viewer_grace: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -485,6 +503,7 @@ pub enum Urgency {
 
 impl Worker {
     async fn show(&mut self, item: Presentation) {
+        while self.watchers.try_join_next().is_some() {}
         match item {
             Presentation::Progress { request, .. } => {
                 if !self.config.progress {
@@ -603,32 +622,28 @@ impl Worker {
             return;
         }
 
-        match open_viewer(&self.config.viewer, &file).await {
-            Ok(()) => {
-                self.notify(
-                    "Answer opened",
-                    &escape_markup(&headline(text, 120)),
-                    Urgency::Low,
-                    0,
-                    replaces,
-                )
-                .await;
-            }
+        let viewer = match spawn_viewer(&self.config.viewer, &file) {
+            Ok(viewer) => viewer,
             Err(e) => {
-                // Its stderr could quote the answer, so it stays at debug.
-                tracing::warn!("the viewer did not start");
-                tracing::debug!("the viewer: {e:#}");
-                let body = format!("{e:#}\n{}", file.display());
-                self.notify(
-                    "Cannot open the viewer",
-                    &escape_markup(&body),
-                    Urgency::Normal,
-                    FAILURE_EXPIRE_MS,
-                    replaces,
-                )
-                .await;
+                report_viewer_failure(&self.config, &file, &format!("{e:#}"), replaces).await;
+                return;
             }
-        }
+        };
+        let opened_id = self
+            .notify(
+                "Answer opened",
+                &escape_markup(&headline(text, 120)),
+                Urgency::Low,
+                0,
+                replaces,
+            )
+            .await;
+        // Watch for an early exit in the background so "Thinking…" is replaced
+        // at once and the worker is not blocked on a viewer that stays running.
+        let config = self.config.clone();
+        let grace = self.viewer_grace;
+        self.watchers
+            .spawn(watch_viewer(config, viewer, file, opened_id, grace));
     }
 
     /// Show one popup; returns its id so the next one can replace it.
@@ -772,12 +787,17 @@ fn answer_stamp(path: &Path) -> (u128, u64) {
     (stamp, id)
 }
 
-/// Start the viewer on `file` and let it run on its own. A viewer that
-/// fails at once (`systemd-run` without a user manager, a missing display)
-/// is reported with what it said, instead of an "Answer opened" with no
-/// window behind it.
-async fn open_viewer(argv: &[String], file: &Path) -> anyhow::Result<()> {
-    use std::io::{Read, Seek};
+struct SpawnedViewer {
+    program: String,
+    child: tokio::process::Child,
+    log: std::fs::File,
+    started: Instant,
+}
+
+/// Start the viewer on `file` and return the running child with its unlinked
+/// stderr file so "Answer opened" can be shown at once while [`watch_viewer`]
+/// checks for an early exit.
+fn spawn_viewer(argv: &[String], file: &Path) -> anyhow::Result<SpawnedViewer> {
     use std::os::unix::fs::OpenOptionsExt;
 
     // Its stderr goes to a file, not a pipe: with a pipe, the viewer's first
@@ -785,7 +805,7 @@ async fn open_viewer(argv: &[String], file: &Path) -> anyhow::Result<()> {
     // it with SIGPIPE, and its window with it. The file is unlinked at once;
     // the viewer keeps writing to it until it exits.
     let log_path = file.with_extension("viewer-stderr");
-    let mut log = std::fs::OpenOptions::new()
+    let log = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
@@ -806,7 +826,7 @@ async fn open_viewer(argv: &[String], file: &Path) -> anyhow::Result<()> {
         args.push(file.clone());
     }
     let program = argv[0].replace("{file}", &file);
-    let mut child = Command::new(&program)
+    let child = Command::new(&program)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -817,31 +837,103 @@ async fn open_viewer(argv: &[String], file: &Path) -> anyhow::Result<()> {
         .spawn()
         .map_err(|e| anyhow::anyhow!("starting {program}: {e}"))?;
 
-    match tokio::time::timeout(VIEWER_GRACE, child.wait()).await {
-        Ok(Ok(status)) if !status.success() => {
-            let mut said = Vec::new();
-            let _ = log.rewind();
-            let _ = (&mut log)
-                .take(VIEWER_STDERR_KEPT as u64 * 4)
-                .read_to_end(&mut said);
-            let said = String::from_utf8_lossy(&said);
-            let said = truncate(said.trim(), VIEWER_STDERR_KEPT);
-            if said.is_empty() {
-                anyhow::bail!("{program} failed ({status})");
+    Ok(SpawnedViewer {
+        program,
+        child,
+        log,
+        started: Instant::now(),
+    })
+}
+
+/// Wait up to `grace` for a spawned viewer to exit; notify only if it fails.
+/// A viewer still running past `grace` is handed off to a detached reaper.
+async fn watch_viewer(
+    config: PresentConfig,
+    mut viewer: SpawnedViewer,
+    file: PathBuf,
+    replaces: Option<u32>,
+    grace: Duration,
+) {
+    let waited = match viewer.child.try_wait() {
+        Ok(Some(status)) => Ok(Ok(status)),
+        Ok(None) => {
+            let remaining = grace.saturating_sub(viewer.started.elapsed());
+            if remaining.is_zero() {
+                Err(())
+            } else {
+                tokio::time::timeout(remaining, viewer.child.wait())
+                    .await
+                    .map_err(|_| ())
             }
-            anyhow::bail!("{program} failed ({status}): {said}");
         }
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(anyhow::anyhow!("waiting for {program}: {e}")),
-        Err(_) => {
-            // Still running: a window is up. Reaped while the daemon runs;
-            // after that it is the scope's or init's.
+        Err(e) => Ok(Err(e)),
+    };
+
+    match waited {
+        Ok(Ok(status)) if !status.success() => {
+            let detail = viewer_failure_detail(&viewer.program, status, &mut viewer.log);
+            drop(viewer.log);
+            report_viewer_failure(&config, &file, &detail, replaces).await;
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            drop(viewer.log);
+            let detail = format!("waiting for {}: {e}", viewer.program);
+            report_viewer_failure(&config, &file, &detail, replaces).await;
+        }
+        Err(()) => {
+            // Still running: a window is up. Drop our stderr handle so the
+            // daemon holds no extra fd, and reap the child while the daemon
+            // runs; after that it is the scope's or init's.
+            drop(viewer.log);
+            let mut child = viewer.child;
             tokio::spawn(async move {
                 let _ = child.wait().await;
             });
-            Ok(())
         }
     }
+}
+
+fn viewer_failure_detail(
+    program: &str,
+    status: std::process::ExitStatus,
+    log: &mut std::fs::File,
+) -> String {
+    use std::io::{Read, Seek};
+
+    let mut said = Vec::new();
+    let _ = log.rewind();
+    let _ = (&mut *log)
+        .take(VIEWER_STDERR_KEPT as u64 * 4)
+        .read_to_end(&mut said);
+    let said = String::from_utf8_lossy(&said);
+    let said = truncate(said.trim(), VIEWER_STDERR_KEPT);
+    if said.is_empty() {
+        format!("{program} failed ({status})")
+    } else {
+        format!("{program} failed ({status}): {said}")
+    }
+}
+
+async fn report_viewer_failure(
+    config: &PresentConfig,
+    file: &Path,
+    detail: &str,
+    replaces: Option<u32>,
+) {
+    // Its stderr could quote the answer, so it stays at debug.
+    tracing::warn!("the viewer did not start");
+    tracing::debug!("the viewer: {detail}");
+    let body = format!("{detail}\n{}", file.display());
+    notify(
+        config,
+        "Cannot open the viewer",
+        &escape_markup(&body),
+        Urgency::Normal,
+        FAILURE_EXPIRE_MS,
+        replaces,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -1007,14 +1099,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Show one long answer through `Desktop` with `viewer`, a notifier that
-    /// records its calls, and return the recorded calls.
-    async fn show_long_answer(name: &str, viewer: &[&str]) -> String {
-        let dir = std::env::temp_dir().join(format!("hc-viewer-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let calls = dir.join("notify.log");
-        let config = PresentConfig {
+    fn recording_config(calls: &Path, viewer: &[&str]) -> PresentConfig {
+        PresentConfig {
             notifier: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
@@ -1023,7 +1109,17 @@ mod tests {
             ],
             viewer: viewer.iter().map(|a| a.to_string()).collect(),
             ..PresentConfig::default()
-        };
+        }
+    }
+
+    /// Show one long answer through `Desktop` with `viewer`, a notifier that
+    /// records its calls, and return the recorded calls.
+    async fn show_long_answer(name: &str, viewer: &[&str]) -> String {
+        let dir = std::env::temp_dir().join(format!("hc-viewer-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let config = recording_config(&calls, viewer);
         let desktop = Desktop::spawn(&config, dir.join("answers"));
         desktop.present(Presentation::Answer {
             id: 1,
@@ -1043,19 +1139,125 @@ mod tests {
             &["/bin/sh", "-c", "echo 'no display here' >&2; exit 3", "sh"],
         )
         .await;
-        assert!(calls.contains("Cannot open the viewer"), "{calls}");
-        assert!(calls.contains("no display here"), "{calls}");
-        assert!(!calls.contains("Answer opened"), "{calls}");
+        let lines: Vec<&str> = calls.lines().collect();
+        assert_eq!(lines.len(), 3, "{calls}");
+        assert!(lines[0].contains("Answer opened"), "{calls}");
+        assert!(lines[1].contains("Cannot open the viewer"), "{calls}");
+        assert!(lines[1].contains("--replace-id=7"), "{calls}");
+        assert!(lines[1].contains("no display here"), "{calls}");
+        assert!(lines[2].ends_with(".md"), "{calls}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_viewer_reports_failure_without_answer_opened() {
+        let dir = std::env::temp_dir().join(format!("hc-viewer-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let config = recording_config(&calls, &["/nonexistent/hey-computer-viewer"]);
+        let desktop = Desktop::spawn(&config, dir.join("answers"));
+        desktop.present(Presentation::Progress {
+            id: 1,
+            request: "explain".to_string(),
+        });
+        desktop.present(Presentation::Answer {
+            id: 1,
+            text: "# Heading\n\nbody".to_string(),
+            denied: vec![],
+        });
+        desktop.finish().await;
+        let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(lines.len(), 3, "{recorded}");
+        assert!(lines[0].contains("Thinking…"), "{recorded}");
+        assert!(lines[1].contains("Cannot open the viewer"), "{recorded}");
+        assert!(lines[1].contains("--replace-id=7"), "{recorded}");
+        assert!(lines[2].ends_with(".md"), "{recorded}");
+        assert!(!recorded.contains("Answer opened"), "{recorded}");
     }
 
     #[tokio::test]
     async fn a_viewer_that_keeps_running_is_an_opened_answer() {
-        let started = std::time::Instant::now();
-        let calls = show_long_answer("runs", &["/bin/sh", "-c", "sleep 3", "sh"]).await;
-        assert!(calls.contains("Answer opened"), "{calls}");
+        let dir = std::env::temp_dir().join(format!("hc-viewer-runs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let config = recording_config(&calls, &["/bin/sh", "-c", "sleep 3", "sh"]);
+        let started = Instant::now();
+        let desktop = Desktop::spawn(&config, dir.join("answers"));
+        desktop.present(Presentation::Progress {
+            id: 1,
+            request: "first".to_string(),
+        });
+        desktop.present(Presentation::Answer {
+            id: 1,
+            text: "# Heading\n\nbody".to_string(),
+            denied: vec![],
+        });
+        desktop.present(Presentation::Progress {
+            id: 2,
+            request: "second".to_string(),
+        });
+
+        // "Answer opened" and the next popup must arrive without waiting for
+        // the 1.5 s viewer grace period.
+        let mut recorded = String::new();
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+            if recorded.lines().count() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "viewer grace blocked notifications: {recorded}"
+        );
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(lines.len(), 3, "{recorded}");
+        assert!(lines[0].contains("Thinking…"), "{recorded}");
+        assert!(lines[1].contains("Answer opened"), "{recorded}");
+        assert!(lines[1].contains("--replace-id=7"), "{recorded}");
+        assert!(lines[2].contains("Thinking…"), "{recorded}");
+        assert!(!lines[2].contains("--replace-id="), "{recorded}");
+
+        desktop.finish().await;
         assert!(started.elapsed() < Duration::from_secs(3));
+        let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!recorded.contains("Cannot open the viewer"), "{recorded}");
+
         let calls = show_long_answer("quick", &["/bin/sh", "-c", "exit 0", "sh"]).await;
         assert!(calls.contains("Answer opened"), "{calls}");
+        assert!(!calls.contains("Cannot open the viewer"), "{calls}");
+    }
+
+    #[tokio::test]
+    async fn a_viewer_that_fails_after_the_grace_window_is_not_reported() {
+        let dir = std::env::temp_dir().join(format!("hc-viewer-late-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let config = recording_config(
+            &calls,
+            &["/bin/sh", "-c", "sleep 0.35; echo late >&2; exit 2", "sh"],
+        );
+        let desktop =
+            Desktop::spawn_with_grace(&config, dir.join("answers"), Duration::from_millis(150));
+        desktop.present(Presentation::Answer {
+            id: 1,
+            text: "# Heading\n\nbody".to_string(),
+            denied: vec![],
+        });
+        desktop.finish().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(recorded.contains("Answer opened"), "{recorded}");
+        assert!(!recorded.contains("Cannot open the viewer"), "{recorded}");
     }
 
     #[test]

@@ -63,8 +63,9 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   `to_markup` cuts code spans out before pairing `**`, so the Pango markup always nests.
   `disarm_html` rewrites every `<` outside code (`&lt;` in text, `\lt` in math) and turns
   remote images into links (Marker fetched them at once) before the
-  answer file is written: Marker renders in a web view. A viewer that fails within 1.5 s is
-  reported instead of "Answer opened".
+  answer file is written: Marker renders in a web view. "Answer opened" is
+  sent once the viewer spawns; a viewer that fails within 1.5 s replaces it
+  with an error notification.
 - `mock`: a scripted ACP agent, run as the hidden `debug mock-agent SCRIPT`, so the package
   installs one binary. Script format and log lines are documented at the top of `mock.rs`.
 - `debug`: hidden commands that check one part at a time (`config`, `instructions`,

@@ -257,8 +257,8 @@ with BODY in Pango markup, and must print the notification's id (as
 
 The viewer is an argument vector; `{file}` is replaced by the answer file, or
 the file is appended when no argument mentions it. A viewer that exits with
-an error within 1.5 s is reported in a notification with the start of its
-stderr and the file's path, instead of "Answer opened".
+an error within 1.5 s replaces "Answer opened" with a notification showing
+the start of its stderr and the file's path.
 
 ## Home Manager module
 
