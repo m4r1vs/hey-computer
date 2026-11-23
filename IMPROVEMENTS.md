@@ -27,23 +27,9 @@ env-var filtering) have been removed. **No permission prompts at all** — trust
 the AI to do the right thing directly; permission prompts can be added later
 only if needed.
 
-## Phase 1: Zero-Rust quick wins (consuming configuration & npu-dictate)
+## Phase 1: Zero-Rust quick wins (consuming configuration & npu-dictate) — Implemented
 
-Items #1–#6 are implemented in `NixConfig` (`8329b59`) and listed under [Done](#done). Remaining to finish Phase 1:
-
-7. `[Important]` `[npu-dictate]` **Direct push-to-talk key.** A second
-   hold-to-talk key whose dictation goes straight to `hey-computer ask`, with no
-   "Hey Computer" prefix and no phrase matching.
-   - **Status:** Implemented and verified locally in `npu-dictate`
-     (`start --to RULE` / `toggle --to RULE`, `kind = "direct"`, bypassing
-     phrase matching and live preedit), and wired to `SUPER + ALT + v` in
-     `NixConfig` (`8329b59`, reusing `binddrint "v"`). Pending commit & push of
-     `npu-dictate` and `nix flake update npu-dictate` in `NixConfig`.
-   - **Raw audio (not supported by agy 1.5.13).** Probing `agy acp`'s
-     `initialize` response returns `promptCapabilities: { "image": true,
-     "audio": false, "embeddedContext": true }`, so ACP `audio` content blocks
-     are unavailable for now (revisit only if a future agy release enables
-     `promptCapabilities.audio`).
+All Phase 1 items (#1–#7) are implemented and listed under [Done](#done).
 
 ## Phase 2: Small upstream hardening & everyday latency/UX fixes
 
@@ -331,9 +317,13 @@ tooling are mature.
 
 ## Done
 
-- `[Important]` `[Config]` `[Done: NixConfig 8329b59]` **Interactive agy
-  sandbox disabled.** Set `enableTerminalSandbox = false` and
-  `toolPermission = "request-review"` in `antigravity-cli.nix`.
+- `[Important]` `[Config]` `[Done: NixConfig 8329b59, 4a0f1aa]` **Interactive
+  agy sandbox disabled & `toolPermission = "always-proceed"` (intended).** Set
+  `enableTerminalSandbox = false` (broken on NixOS with agy 1.5.13) and
+  intentionally set `toolPermission = "always-proceed"` in
+  `antigravity-cli.nix` so commands, web requests, and MCP tools run without
+  prompts unless matched by explicit `permissions.ask` or `permissions.deny`
+  rules.
 - `[Important]` `[Config]` `[Done: NixConfig 8329b59]` **`instructions.extra`
   and rebuild deny list.** Added metric/24h locale conventions,
   `Journal/YYYY-MM-DD.md` daily-note format, default browser guidance,
@@ -357,6 +347,13 @@ tooling are mature.
   `SIGRTMIN+12`), hidden at idle and showing thinking (`running_secs`),
   follow-up countdown, starting, and down states; click cancels when thinking
   or opens `rofi-ask` during follow-up.
+- `[Important]` `[npu-dictate + Config]` `[Done: NixConfig 8329b59, npu-dictate]`
+  **Direct push-to-talk key.** Added `start --to RULE` / `toggle --to RULE` and
+  `kind = "direct"` in `npu-dictate` (bypassing phrase matching and live
+  preedit, joining cut phrases on stdin, dropping silent holds quietly), wired
+  to `SUPER + ALT + v` in `NixConfig` (reusing `binddrint "v"`). *(Raw audio
+  ACP blocks remain unsupported by agy 1.5.13: `promptCapabilities.audio:
+  false`.)*
 - `[Important]` `[Done: 83e3fc9]` **1.5 s UI lag on long answers.**
   `open_viewer()` awaits `VIEWER_GRACE` (1.5 s) inline inside the sequential
   `Desktop` presenter worker (`src/present.rs:606-616`, `820-844`). Because
