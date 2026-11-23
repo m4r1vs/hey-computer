@@ -68,8 +68,26 @@ pub fn prepare(config: &Config) -> Result<Paths> {
     let skills_dir = paths.agent_dir.join("config").join("skills");
     link_skills(&skills_dir, &config.instructions.skills)?;
 
+    clear_keyring_unavailable(&paths.agent_dir);
+
     write_file(&paths.workspace.join("AGENTS.md"), &instructions(config))?;
     Ok(paths)
+}
+
+/// Written by agy 1.5 when a keyring lookup times out (5 s); while it is less
+/// than an hour old, agy skips the keyring and falls back to file storage.
+const KEYRING_UNAVAILABLE: &str = "antigravity-cli/cache/antigravity-keyring-unavailable";
+
+/// Remove agy's keyring-timeout marker before starting the agent so a transient
+/// timeout (for example while the keyring is still locked at login) does not
+/// keep agy from reading the keyring on the next start.
+fn clear_keyring_unavailable(agent_dir: &Path) {
+    let marker = agent_dir.join(KEYRING_UNAVAILABLE);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => tracing::info!("removed stale keyring-unavailable marker"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::debug!("cannot remove {}: {e}", marker.display()),
+    }
 }
 
 /// The agent's `settings.json`: the daemon's defaults, then whatever
@@ -463,6 +481,26 @@ mod tests {
         assert!(agy.join("brain/new/transcript.jsonl").exists());
         assert!(agy.join("conversation_summaries.db").exists());
         assert!(agy.join("settings.json").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn prepare_clears_stale_keyring_unavailable_marker() {
+        let root = scratch("keyring-marker");
+        let cache = root.join("state/agy/antigravity-cli/cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let marker = cache.join("antigravity-keyring-unavailable");
+        let sibling = cache.join("onboarding.json");
+        std::fs::write(&marker, "2026-11-23T08:58:53Z").unwrap();
+        std::fs::write(&sibling, "{}").unwrap();
+
+        let config = Config {
+            state_dir: root.join("state"),
+            ..Config::default()
+        };
+        prepare(&config).unwrap();
+        assert!(!marker.exists());
+        assert!(sibling.exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

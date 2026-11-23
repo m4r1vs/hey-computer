@@ -512,6 +512,49 @@ async fn a_missing_login_is_reported_with_what_to_do() {
     assert_eq!(reason, FailReason::AgentError);
     assert!(message.contains("(Authentication required)"), "{message}");
     assert!(message.contains("agy acp --login"), "{message}");
+    assert_eq!(h.status().await.agent, AgentState::Down);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_login_that_appears_later_is_picked_up_without_restarting_the_daemon() {
+    // agy latches a failed silent sign-in in memory and writes a 1-hour
+    // keyring-unavailable marker after a keyring timeout. After the keyring
+    // unlocks or the user signs in, the next request must start a fresh agent
+    // with the marker cleared.
+    let script = r#"{"session_error": "Authentication required", "default": ["echo"]}"#;
+    let h = Harness::start(script, |_| {}).await;
+    h.wait_log("new refused").await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if h.status().await.agent == AgentState::Down {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the agent never stopped");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Still not signed in: reports what to do and stops the agent again.
+    let reply = h.ask("anything", false).await;
+    let (reason, message) = failure(&reply);
+    assert_eq!(reason, FailReason::AgentError);
+    assert!(message.contains("agy acp --login"), "{message}");
+    assert_eq!(h.status().await.agent, AgentState::Down);
+
+    // Simulate a stale 1h keyring-timeout marker written by agy, then the
+    // login becoming available.
+    let marker = h
+        .dir
+        .join("state/agy/antigravity-cli/cache/antigravity-keyring-unavailable");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, "2026-11-23T08:58:53Z").unwrap();
+    std::fs::write(h.dir.join("script.json"), SCRIPT).unwrap();
+
+    let reply = h.ask("plain", false).await;
+    assert_eq!(answer(&reply), "Hello from the mock.");
+    assert!(!marker.exists(), "stale keyring marker should be cleared");
+    assert_eq!(h.status().await.agent, AgentState::Ready);
+    assert_eq!(h.log_count("start"), 3);
     h.stop().await;
 }
 

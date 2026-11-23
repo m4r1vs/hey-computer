@@ -113,10 +113,15 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
 - Hyprland 0.55 with a Lua config: `hyprctl dispatch X` evaluates `hl.dispatch(X)`; errors
   still exit 0; a stale `HYPRLAND_INSTANCE_SIGNATURE` gives exit 4, and
   `hyprctl instances -j` finds the live instance.
-- Without a login (seen with the keyring out of reach, `DBUS_SESSION_BUS_ADDRESS=disabled:`),
-  agy starts normally and fails `session/new` with `-32000 Authentication required` (ACP's
-  `auth_required`). The daemon turns that into a message naming `agy acp --login`. An
-  expired (rather than missing) login was not seen; it is assumed to look the same.
+- Without a login (seen with the keyring out of reach, `DBUS_SESSION_BUS_ADDRESS=disabled:`, or
+  with GNOME Keyring still locked at boot), agy starts normally and fails `session/new` with
+  `-32000 Authentication required` (ACP's `auth_required`). Once silent sign-in fails, that `agy
+  acp` process latches its unauthenticated state and never re-reads the keyring on later
+  `session/new` calls; after a 5 s keyring timeout it also writes
+  `antigravity-cli/cache/antigravity-keyring-unavailable` and skips the keyring for 1 h. The
+  daemon therefore clears that marker in `environment::prepare`, stops the agent on
+  `auth_required` without scheduling a background restart (so the next request spawns a fresh
+  agent), and turns the error into a message naming `agy acp --login`.
 - agy's conversations, transcripts and logs (`agy/antigravity-cli/{conversations,brain,log}`)
   are pruned to `agent.history_days` before each agent start, never while agy runs.
 
@@ -128,7 +133,8 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   with the daemon's own message, follow-ups inside and outside the window, cancellation by a
   newer request, `cancel`, a client that hangs up, crash and restart, inactivity timeout,
   malformed and oversized agent lines, malformed requests, a second client, a second daemon,
-  a missing login (mock, in agy's words), a missing agent, cold start, idle stop, a shutdown
+  a missing login (mock, in agy's words), a login that appears later without restarting the
+  daemon, a missing agent, cold start, idle stop, a shutdown
   during a turn and during a hanging start (both must end within 2 s), a correction while the
   agent starts (one start, not two), a config out of range, a file at the socket path. The
   mock's `init_delay_ms` makes a slow start. `tests/cli.rs` runs the binary as a voice front

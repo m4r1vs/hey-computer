@@ -314,6 +314,9 @@ struct TurnEnd {
     alive: bool,
     /// The session should not be continued (the agent refused the prompt).
     broken: bool,
+    /// The agent rejected the turn for lack of a login and must be restarted
+    /// on the next request to re-read the keyring.
+    auth_required: bool,
 }
 
 enum Step {
@@ -401,9 +404,14 @@ impl Conductor {
                     live.spare = Some(session);
                 }
             }
-            // An expired login shows up here; the next request reports it.
+            // An expired login shows up here; call_failed has stopped the
+            // unauthenticated agent so the next request starts fresh.
             Err(Outcome::Failed { message, .. }) => {
-                tracing::warn!("the agent is up but cannot open a session: {message}");
+                if self.live.is_some() {
+                    tracing::warn!("the agent is up but cannot open a session: {message}");
+                } else {
+                    tracing::warn!("warm start could not open a session: {message}");
+                }
             }
             Err(Outcome::Answer { .. }) => {}
         }
@@ -595,41 +603,65 @@ impl Conductor {
 
         self.drain_stale().await;
         let stop = Arc::clone(&self.stop);
-        if self.live.is_none() {
-            self.restart_at = None;
-            // Only a shutdown interrupts the start. A newer request (a quick
-            // "no, I meant…") needs the same agent, so killing this one half
-            // started would only make it pay for a second start.
-            let start = tokio::select! {
-                result = self.start_agent() => result,
-                reason = stop.cancelled() => {
-                    // The half-started agent was dropped, which killed it.
-                    self.set_agent(AgentState::Down);
-                    return cancelled(reason);
-                }
-            };
-            if let Err(e) = start {
-                self.schedule_restart_if_warm();
-                return Outcome::failed(
-                    FailReason::AgentDown,
-                    format!("Cannot start the assistant: {e:#}"),
-                );
-            }
-            if let Some(reason) = token.reason() {
-                return cancelled(reason);
-            }
-        }
-
         let interrupts = Interrupts {
             request: &token,
             stop: &stop,
         };
-        let session = tokio::select! {
-            result = self.session_for(ask.new) => match result {
-                Ok(session) => session,
-                Err(outcome) => return outcome,
-            },
-            reason = interrupts.wait() => return cancelled(reason),
+        let mut retried_auth = false;
+        let session = loop {
+            let was_live = self.live.is_some();
+            if !was_live {
+                self.restart_at = None;
+                // Only a shutdown interrupts the start. A newer request (a quick
+                // "no, I meant…") needs the same agent, so killing this one half
+                // started would only make it pay for a second start.
+                let start = tokio::select! {
+                    result = self.start_agent() => result,
+                    reason = stop.cancelled() => {
+                        // The half-started agent was dropped, which killed it.
+                        self.set_agent(AgentState::Down);
+                        return cancelled(reason);
+                    }
+                };
+                if let Err(e) = start {
+                    self.schedule_restart_if_warm();
+                    return Outcome::failed(
+                        FailReason::AgentDown,
+                        format!("Cannot start the assistant: {e:#}"),
+                    );
+                }
+                if let Some(reason) = token.reason() {
+                    return cancelled(reason);
+                }
+            }
+
+            let result = tokio::select! {
+                result = self.session_for(ask.new) => result,
+                reason = interrupts.wait() => return cancelled(reason),
+            };
+            match result {
+                Ok(session) => break session,
+                Err(outcome) => {
+                    // If a pre-existing agent lost its login and was stopped
+                    // for it, retry once on a fresh agent in case the user
+                    // already signed in again.
+                    if was_live
+                        && !retried_auth
+                        && self.live.is_none()
+                        && matches!(
+                            outcome,
+                            Outcome::Failed {
+                                reason: FailReason::AgentError,
+                                ..
+                            }
+                        )
+                    {
+                        retried_auth = true;
+                        continue;
+                    }
+                    return outcome;
+                }
+            }
         };
 
         let Some(mut live) = self.live.take() else {
@@ -650,7 +682,9 @@ impl Conductor {
 
         if end.alive {
             self.live = Some(live);
-            if end.broken {
+            if end.auth_required {
+                self.stop_agent().await;
+            } else if end.broken {
                 self.conversation = None;
                 self.set_follow_up(None);
             } else if let Some(conversation) = &mut self.conversation {
@@ -794,7 +828,17 @@ impl Conductor {
     async fn call_failed(&mut self, method: &str, error: CallError) -> Outcome {
         match error {
             CallError::Rpc(e) => {
-                tracing::warn!("{method} failed: {e}");
+                if is_auth_required(&e) {
+                    // agy latches a failed silent sign-in for the life of the
+                    // process; stop it without scheduling a restart so the next
+                    // request spawns a fresh agent that re-reads the keyring.
+                    tracing::warn!(
+                        "{method} failed: {e}; stopping the agent so the next request starts fresh"
+                    );
+                    self.stop_agent().await;
+                } else {
+                    tracing::warn!("{method} failed: {e}");
+                }
                 Outcome::failed(FailReason::AgentError, agent_error_message(&e))
             }
             CallError::Closed => {
@@ -850,11 +894,15 @@ fn deliver(presenter: Option<&Arc<dyn Presenter>>, ask: Ask, outcome: Outcome) {
     }
 }
 
+fn is_auth_required(error: &acp::RpcError) -> bool {
+    error.code == AUTH_REQUIRED || error.message.contains("Authentication required")
+}
+
 /// What to tell the user when the agent refused a call. agy 1.5 answers
 /// `session/new` with `-32000 Authentication required` when it has no login
 /// (seen with the keyring out of reach); that alone does not say what to do.
 fn agent_error_message(error: &acp::RpcError) -> String {
-    if error.code == AUTH_REQUIRED || error.message.contains("Authentication required") {
+    if is_auth_required(error) {
         format!(
             "The assistant is not signed in ({error}). Sign in once with an interactive `agy` \
              session, or run `agy acp --login`, then ask again."
@@ -984,6 +1032,7 @@ async fn turn(
                     ),
                     alive: false,
                     broken: true,
+                    auth_required: false,
                 };
             }
             Step::Event(Some(Incoming::Update {
@@ -1053,6 +1102,7 @@ async fn turn(
                 outcome: Outcome::failed(reason, message),
                 alive,
                 broken: false,
+                auth_required: false,
             };
         }
     };
@@ -1078,10 +1128,12 @@ async fn turn(
             .to_string(),
         Ok(Err(CallError::Rpc(e))) => {
             tracing::warn!("request {id}: the agent refused the prompt: {e}");
+            let auth_required = is_auth_required(&e);
             return TurnEnd {
-                outcome: Outcome::failed(FailReason::AgentError, e.to_string()),
+                outcome: Outcome::failed(FailReason::AgentError, agent_error_message(&e)),
                 alive: true,
                 broken: true,
+                auth_required,
             };
         }
         Ok(Err(_)) | Err(_) => {
@@ -1092,6 +1144,7 @@ async fn turn(
                 ),
                 alive: false,
                 broken: true,
+                auth_required: false,
             };
         }
     };
@@ -1122,6 +1175,7 @@ async fn turn(
         outcome,
         alive: true,
         broken: false,
+        auth_required: false,
     }
 }
 
