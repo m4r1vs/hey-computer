@@ -7,6 +7,7 @@
 //! D-Bus itself: an argument vector can be swapped for a script, which is how
 //! the daemon is tested by hand without popping anything up.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -277,22 +278,16 @@ fn spans<'a>(text: &'a str, marker: &str) -> Vec<(bool, &'a str)> {
     out
 }
 
-/// The answer with raw HTML made harmless for the viewer: no `<` is left
-/// outside code.
-///
-/// The model's answer can quote a web page or a note, and the viewer renders
-/// Markdown in a web view: a `<script>` would run there and an `<img>` would
-/// be fetched, outside the daemon and with nobody asking. So every `<` in
-/// text becomes `&lt;` (a Markdown renderer shows it as `<`), and every `<`
-/// in math becomes `\lt ` (KaTeX typesets it as `<`; Marker shows math
-/// verbatim, so `&lt;` would appear there as it is). Code spans, fenced
-/// blocks and autolinks such as `<https://example.org>` are left alone: they
-/// are shown literally anyway.
-pub fn disarm_html(markdown: &str) -> String {
-    let mut out = String::with_capacity(markdown.len());
-    let mut fence: Option<String> = None;
-    let mut in_math = false;
-    for line in markdown.split_inclusive('\n') {
+/// Tracks whether the current line sits inside a CommonMark fenced code block.
+#[derive(Default)]
+struct FenceState {
+    open: Option<String>,
+}
+
+impl FenceState {
+    /// Advance by one line. Returns `true` for a fence delimiter or a line
+    /// inside an open fence.
+    fn step(&mut self, line: &str, in_math: bool) -> bool {
         let trimmed = line.trim_start_matches(' ');
         let indent = line.len() - trimmed.len();
         let marker: String = trimmed
@@ -305,21 +300,46 @@ pub fn disarm_html(markdown: &str) -> String {
             && marker
                 .chars()
                 .all(|c| c == marker.chars().next().unwrap_or('`'));
-        match &fence {
+        match &self.open {
             Some(open) => {
                 if is_fence
                     && marker.starts_with(open.as_str())
                     && trimmed[marker.len()..].trim().is_empty()
                 {
-                    fence = None;
+                    self.open = None;
                 }
-                out.push_str(line);
+                true
             }
             None if is_fence => {
-                fence = Some(marker);
-                out.push_str(line);
+                self.open = Some(marker);
+                true
             }
-            None => out.push_str(&disarm_line(line, &mut in_math)),
+            None => false,
+        }
+    }
+}
+
+/// The answer with raw HTML made harmless for the viewer: no `<` is left
+/// outside code.
+///
+/// The model's answer can quote a web page or a note, and the viewer renders
+/// Markdown in a web view: a `<script>` would run there and an `<img>` would
+/// be fetched, outside the daemon and with nobody asking. So every `<` in
+/// text becomes `&lt;` (a Markdown renderer shows it as `<`), and every `<`
+/// in math becomes `\lt ` (KaTeX typesets it as `<`; Marker shows math
+/// verbatim, so `&lt;` would appear there as it is). Code spans, fenced
+/// blocks and autolinks such as `<https://example.org>` are left alone: they
+/// are shown literally anyway.
+pub fn disarm_html(markdown: &str) -> String {
+    let refs = collect_ref_defs(markdown);
+    let mut out = String::with_capacity(markdown.len());
+    let mut fence = FenceState::default();
+    let mut in_math = false;
+    for line in markdown.split_inclusive('\n') {
+        if fence.step(line, in_math) {
+            out.push_str(line);
+        } else {
+            out.push_str(&disarm_line(line, &mut in_math, &refs));
         }
     }
     out
@@ -327,7 +347,7 @@ pub fn disarm_html(markdown: &str) -> String {
 
 /// One line outside a fenced block. `in_math` carries a `$$` display block
 /// over to the next line.
-fn disarm_line(line: &str, in_math: &mut bool) -> String {
+fn disarm_line(line: &str, in_math: &mut bool, refs: &HashMap<String, bool>) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     if *in_math {
@@ -374,8 +394,8 @@ fn disarm_line(line: &str, in_math: &mut bool) -> String {
         {
             out.push_str(&math(&rest[..end]));
             rest = &rest[end..];
-        } else if rest.starts_with("![") && is_remote_image(rest) {
-            // Shown as a link: the web view would fetch it at once.
+        } else if rest.starts_with("![") && is_disarmed_image(rest, refs) {
+            // Shown as a link: the web view would fetch or render it at once.
             out.push_str("[image: ");
             rest = &rest[2..];
         } else if rest.starts_with("\\<") {
@@ -405,26 +425,320 @@ fn math(text: &str) -> String {
     text.replace('<', "\\lt ")
 }
 
-/// `![alt](http…)`, `![alt](//host/…)` or a reference image `![alt][ref]`
-/// (whose target may well be remote). A local image stays an image.
-fn is_remote_image(text: &str) -> bool {
-    let Some(close) = text.find(']') else {
+/// Whether `![…]` (at the start of `text`) is an image whose target is remote
+/// or carries a URI scheme such as `data:` (including CommonMark full,
+/// collapsed, and shortcut reference images). Local file paths stay images.
+fn is_disarmed_image(text: &str, refs: &HashMap<String, bool>) -> bool {
+    let Some(alt_end) = find_closing_bracket(&text[2..]) else {
         return false;
     };
-    let after = &text[close + 1..];
-    if after.starts_with('[') {
+    let alt = &text[2..2 + alt_end];
+    let after = &text[2 + alt_end + 1..];
+
+    if let Some(after_paren) = after.strip_prefix('(') {
+        let trimmed = after_paren.trim_start();
+        if trimmed.is_empty() {
+            // Multi-line destination (`![alt](\nhttps://…)`): fail closed.
+            return true;
+        }
+        if trimmed.starts_with(')') {
+            return false;
+        }
+        return is_disarmed_target(trimmed);
+    }
+
+    if let Some(after_bracket) = after.strip_prefix('[')
+        && let Some(ref_end) = find_ref_label_end(after_bracket)
+    {
+        let ref_inner = &after_bracket[..ref_end];
+        if ref_inner.is_empty() {
+            // Collapsed reference image `![ref][]`.
+            let key = normalize_ref_label(alt);
+            return refs.get(&key).copied().unwrap_or(true);
+        }
+        let key = normalize_ref_label(ref_inner);
+        if !key.is_empty() {
+            // Full reference image `![alt][ref]`; fail closed when undefined.
+            return refs.get(&key).copied().unwrap_or(true);
+        }
+    }
+
+    // Shortcut reference image `![ref]`, disarmed only when a matching
+    // definition exists in the document with a disarmed target.
+    let key = normalize_ref_label(alt);
+    !key.is_empty() && refs.get(&key).copied().unwrap_or(false)
+}
+
+/// Byte offset of the `]` matching an opening `[`, respecting backslash
+/// escapes, nested brackets, and inline code spans.
+fn find_closing_bracket(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 1;
+                if i < bytes.len() {
+                    i += s[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
+            b'`' => {
+                let run = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+                if let Some(end) = find_closing_backticks(&bytes[i + run..], run) {
+                    i += run + end;
+                } else {
+                    i += run;
+                }
+            }
+            b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += s[i..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    None
+}
+
+/// Byte offset of the closing `]` of a CommonMark link label (which cannot
+/// contain unescaped `[`).
+fn find_ref_label_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 1;
+                if i < bytes.len() {
+                    i += s[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
+            b'[' => return None,
+            b']' => return Some(i),
+            _ => i += s[i..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    None
+}
+
+fn normalize_ref_label(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Whether a Markdown image destination is protocol-relative (`//…`) or carries
+/// an RFC 3986 URI scheme (`http:`, `https:`, `ftp:`, `data:`, `javascript:`,
+/// `file:`, …), after CommonMark destination unescaping.
+fn is_disarmed_target(target: &str) -> bool {
+    let target = target.trim_start();
+    let target = target.strip_prefix('<').unwrap_or(target);
+    let prefix = unescape_destination_prefix(target);
+    let clean: String = prefix.chars().filter(|c| !c.is_ascii_control()).collect();
+    if clean.starts_with("//") {
         return true;
     }
-    let Some(target) = after.strip_prefix('(') else {
+    let mut chars = clean.chars();
+    let Some(first) = chars.next() else {
         return false;
     };
-    let target = target
-        .trim_start()
-        .trim_start_matches('<')
-        .to_ascii_lowercase();
-    ["http://", "https://", "//", "ftp://"]
-        .iter()
-        .any(|scheme| target.starts_with(scheme))
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    for c in chars {
+        if c == ':' {
+            return true;
+        }
+        if !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+            return false;
+        }
+    }
+    false
+}
+
+/// Decode CommonMark backslash-punctuation escapes and common HTML character
+/// references in the leading prefix of a destination (capped so large `data:`
+/// payloads do not allocate).
+fn unescape_destination_prefix(s: &str) -> String {
+    const MAX_PREFIX_CHARS: usize = 64;
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut count = 0;
+    while i < bytes.len() && count < MAX_PREFIX_CHARS {
+        if bytes[i] == b'\\'
+            && let Some(&next) = bytes.get(i + 1)
+            && next.is_ascii_punctuation()
+        {
+            out.push(next as char);
+            i += 2;
+            count += 1;
+            continue;
+        }
+        if bytes[i] == b'&'
+            && let Some((ch, len)) = decode_scheme_entity(&s[i..])
+        {
+            out.push(ch);
+            i += len;
+            count += 1;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        i += ch.len_utf8();
+        count += 1;
+    }
+    out
+}
+
+/// Decode a numeric HTML character reference (`&#58;`, `&#x3a;`) or `&colon;` /
+/// `&sol;` at the start of `s`.
+fn decode_scheme_entity(s: &str) -> Option<(char, usize)> {
+    let rest = s.strip_prefix('&')?;
+    let semi = rest.find(';')?;
+    let body = &rest[..semi];
+    let total = 1 + semi + 1;
+    if let Some(hex) = body.strip_prefix("#x").or_else(|| body.strip_prefix("#X")) {
+        if (1..=6).contains(&hex.len())
+            && hex.bytes().all(|b| b.is_ascii_hexdigit())
+            && let Ok(code) = u32::from_str_radix(hex, 16)
+            && code != 0
+            && let Some(ch) = char::from_u32(code)
+        {
+            return Some((ch, total));
+        }
+        return None;
+    }
+    if let Some(dec) = body.strip_prefix('#') {
+        if (1..=7).contains(&dec.len())
+            && dec.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(code) = dec.parse::<u32>()
+            && code != 0
+            && let Some(ch) = char::from_u32(code)
+        {
+            return Some((ch, total));
+        }
+        return None;
+    }
+    if body.eq_ignore_ascii_case("colon") {
+        return Some((':', total));
+    }
+    if body.eq_ignore_ascii_case("sol") {
+        return Some(('/', total));
+    }
+    None
+}
+
+/// Collect CommonMark link reference definitions (`[label]: destination`)
+/// outside fenced and indented code blocks, recording for each normalized label
+/// whether any definition for it has a disarmed target.
+fn collect_ref_defs(markdown: &str) -> HashMap<String, bool> {
+    let mut refs: HashMap<String, bool> = HashMap::new();
+    let mut fence = FenceState::default();
+    let mut pending_label: Option<String> = None;
+
+    for line in markdown.split_inclusive('\n') {
+        if fence.step(line, false) {
+            pending_label = None;
+            continue;
+        }
+        let Some(rest) = strip_container_prefixes(line) else {
+            pending_label = None;
+            continue;
+        };
+        let trimmed = rest.trim();
+        if let Some(label) = pending_label.take()
+            && !trimmed.is_empty()
+            && parse_ref_def_line(rest).is_none()
+        {
+            let disarmed = is_disarmed_target(trimmed);
+            refs.entry(label)
+                .and_modify(|d| *d |= disarmed)
+                .or_insert(disarmed);
+            continue;
+        }
+        if let Some((label, dest)) = parse_ref_def_line(rest) {
+            if let Some(dest) = dest {
+                let disarmed = is_disarmed_target(dest);
+                refs.entry(label)
+                    .and_modify(|d| *d |= disarmed)
+                    .or_insert(disarmed);
+            } else {
+                pending_label = Some(label);
+            }
+        }
+    }
+    refs
+}
+
+/// Strip repeatable blockquote markers (`>`) and an optional list marker,
+/// returning `None` for 4-space / tab indented code lines.
+fn strip_container_prefixes(mut line: &str) -> Option<&str> {
+    // Blockquote markers may nest (`> > [ref]: …`).
+    loop {
+        let spaces = line.bytes().take_while(|&b| b == b' ').count();
+        if spaces <= 3
+            && let Some(after) = line[spaces..].strip_prefix('>')
+        {
+            line = after.strip_prefix(' ').unwrap_or(after);
+            continue;
+        }
+        break;
+    }
+    // Optional unordered (`-`, `*`, `+`) or ordered (`1.`, `1)`) list marker.
+    let spaces = line.bytes().take_while(|&b| b == b' ').count();
+    if spaces <= 3 {
+        let after_spaces = &line[spaces..];
+        let bytes = after_spaces.as_bytes();
+        if matches!(bytes.first(), Some(b'-' | b'*' | b'+'))
+            && matches!(bytes.get(1), Some(b' ' | b'\t'))
+        {
+            line = &after_spaces[2..];
+        } else {
+            let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+            if (1..=9).contains(&digits)
+                && matches!(bytes.get(digits), Some(b'.' | b')'))
+                && matches!(bytes.get(digits + 1), Some(b' ' | b'\t'))
+            {
+                line = &after_spaces[digits + 2..];
+            }
+        }
+    }
+    let indent = line.bytes().take_while(|&b| b == b' ').count();
+    if indent > 3 || line[indent..].starts_with('\t') {
+        return None;
+    }
+    Some(&line[indent..])
+}
+
+/// Parse `[label]: [destination]` at the start of `line`. Returns
+/// `Some((normalized_label, Some(dest)))` when a destination is on the same
+/// line, or `Some((normalized_label, None))` when the destination may follow on
+/// the next line.
+fn parse_ref_def_line(line: &str) -> Option<(String, Option<&str>)> {
+    let after_open = line.strip_prefix('[')?;
+    let end = find_ref_label_end(after_open)?;
+    let after_colon = after_open[end + 1..].strip_prefix(':')?;
+    let label = normalize_ref_label(&after_open[..end]);
+    if label.is_empty() {
+        return None;
+    }
+    let dest = after_colon.trim();
+    if dest.is_empty() {
+        Some((label, None))
+    } else {
+        Some((label, Some(dest)))
+    }
 }
 
 /// `<https://…>`, `<http://…>` or `<mailto:…>`, closed before any space.
@@ -1475,5 +1789,148 @@ mod tests {
         assert_eq!(disarm_html("<https://x y>"), "&lt;https://x y>");
         // An unclosed backtick does not hide what follows.
         assert_eq!(disarm_html("a ` <b>"), "a ` &lt;b>");
+    }
+
+    #[test]
+    fn data_uri_and_scheme_images_are_disarmed_while_local_paths_stay() {
+        assert_eq!(
+            disarm_html("![svg](data:image/svg+xml,<svg onload=alert(1)>)"),
+            "[image: svg](data:image/svg+xml,&lt;svg onload=alert(1)>)"
+        );
+        for md in [
+            "![x](DATA:image/png;base64,AA==)",
+            "![x]( <data:image/svg+xml;base64,PHN2Zz4=>)",
+            "![x](javascript:alert(1))",
+            "![x](blob:https://x/1)",
+            "![x](file:///etc/passwd)",
+            "![x](//cdn.example/a.png)",
+            "![x](ftp://host/a.png)",
+            "![x](data&#58;image/svg+xml,a)",
+            "![x](data&#x3A;image/svg+xml,a)",
+            "![x](data&colon;image/svg+xml,a)",
+            "![x](da&#9;ta:image/svg+xml,a)",
+            "![x](https\\://evil.example/a.png)",
+            "![x](\nhttps://evil.example/a.png)",
+        ] {
+            let out = disarm_html(md);
+            assert!(out.starts_with("[image: "), "{md} -> {out}");
+        }
+
+        for local in [
+            "![plot](/tmp/plot.png)",
+            "![plot](./plot.png)",
+            "![plot](../img/a.png)",
+            "![plot](dir/a:b.png)",
+            "![plot](2026-01-01T12:00.png)",
+            "![plot](plot.png)",
+            "![empty]()",
+        ] {
+            assert_eq!(disarm_html(local), local, "{local}");
+        }
+    }
+
+    #[test]
+    fn reference_images_including_shortcuts_follow_their_definitions() {
+        // Shortcut reference images (definition after and before, normalized).
+        assert_eq!(
+            disarm_html("![pic]\n\n[pic]: https://evil.example/p.png\n"),
+            "[image: pic]\n\n[pic]: https://evil.example/p.png\n"
+        );
+        assert_eq!(
+            disarm_html("[pic]: data:image/svg+xml,x\n\n![pic]\n"),
+            "[pic]: data:image/svg+xml,x\n\n[image: pic]\n"
+        );
+        assert_eq!(
+            disarm_html("![  My\tPic ]\n\n[my pic]: https://evil.example/p.png\n"),
+            "[image:   My\tPic ]\n\n[my pic]: https://evil.example/p.png\n"
+        );
+        assert_eq!(
+            disarm_html("![pic]\n\n[pic]: /tmp/local.png\n"),
+            "![pic]\n\n[pic]: /tmp/local.png\n"
+        );
+
+        // Collapsed and full reference images.
+        assert_eq!(
+            disarm_html("![pic][]\n\n[pic]: https://evil.example/p.png\n"),
+            "[image: pic][]\n\n[pic]: https://evil.example/p.png\n"
+        );
+        assert_eq!(
+            disarm_html("![local][]\n\n[local]: /tmp/p.png\n"),
+            "![local][]\n\n[local]: /tmp/p.png\n"
+        );
+        assert_eq!(
+            disarm_html("![alt][local]\n\n[local]: /tmp/p.png\n"),
+            "![alt][local]\n\n[local]: /tmp/p.png\n"
+        );
+        assert_eq!(
+            disarm_html("![alt][remote]\n\n[remote]: data:image/png;base64,AA==\n"),
+            "[image: alt][remote]\n\n[remote]: data:image/png;base64,AA==\n"
+        );
+        assert_eq!(disarm_html("![alt][missing]"), "[image: alt][missing]");
+        assert_eq!(disarm_html("![missing][]"), "[image: missing][]");
+
+        // Undefined shortcut syntax stays untouched (e.g. Rust attributes).
+        assert_eq!(
+            disarm_html("![cfg(test)] and ![not-a-ref]"),
+            "![cfg(test)] and ![not-a-ref]"
+        );
+
+        // Definitions inside fenced or indented code blocks do not apply.
+        let fenced = "![ref]\n\n```\n[ref]: https://evil.example/p.png\n```\n";
+        assert_eq!(disarm_html(fenced), fenced);
+        let indented = "![ref]\n\n    [ref]: https://evil.example/p.png\n";
+        assert_eq!(disarm_html(indented), indented);
+
+        // Blockquoted, list-nested, and multi-line definitions do apply.
+        assert_eq!(
+            disarm_html("![ref]\n\n> [ref]: https://evil.example/p.png\n"),
+            "[image: ref]\n\n> [ref]: https://evil.example/p.png\n"
+        );
+        assert_eq!(
+            disarm_html("![ref]\n\n- [ref]: data:image/svg+xml,x\n"),
+            "[image: ref]\n\n- [ref]: data:image/svg+xml,x\n"
+        );
+        assert_eq!(
+            disarm_html("![ref]\n\n[ref]:\n  https://evil.example/p.png\n"),
+            "[image: ref]\n\n[ref]:\n  https://evil.example/p.png\n"
+        );
+
+        // Conflicting duplicate definitions fail closed.
+        assert_eq!(
+            disarm_html("![ref]\n\n[ref]: /tmp/a.png\n[ref]: https://evil.example/a.png\n"),
+            "[image: ref]\n\n[ref]: /tmp/a.png\n[ref]: https://evil.example/a.png\n"
+        );
+    }
+
+    #[test]
+    fn brackets_and_protected_spans_in_image_disarming() {
+        assert_eq!(
+            disarm_html(r"![a \[b\]](https://evil.example/a.png)"),
+            r"[image: a \[b\]](https://evil.example/a.png)"
+        );
+        assert_eq!(
+            disarm_html(r"![a \\](https://evil.example/a.png)"),
+            r"[image: a \\](https://evil.example/a.png)"
+        );
+        assert_eq!(
+            disarm_html("![a [b]](https://evil.example/a.png)"),
+            "[image: a [b]](https://evil.example/a.png)"
+        );
+        assert_eq!(
+            disarm_html("![`]` ](https://evil.example/a.png)"),
+            "[image: `]` ](https://evil.example/a.png)"
+        );
+        assert_eq!(
+            disarm_html("![outer ![inner](https://x/in.png)](/tmp/a.png)"),
+            "![outer [image: inner](https://x/in.png)](/tmp/a.png)"
+        );
+        assert_eq!(
+            disarm_html("![outer ![inner](/tmp/a.png)](https://x/out.png)"),
+            "[image: outer ![inner](/tmp/a.png)](https://x/out.png)"
+        );
+        assert_eq!(
+            disarm_html("`![x](data:image/svg+xml,x)` and `![ref]`\n\n[ref]: https://x/a.png\n"),
+            "`![x](data:image/svg+xml,x)` and `![ref]`\n\n[ref]: https://x/a.png\n"
+        );
     }
 }
