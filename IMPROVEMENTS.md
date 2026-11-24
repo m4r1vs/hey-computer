@@ -98,9 +98,10 @@ schema.
 16. `[Important]` `[Upstream]` **Attachments (`ask --file`, `ask --image`).**
     The prompt is text-only (`src/conductor.rs:1005`). Probing `agy acp` 1.5.13
     confirmed `promptCapabilities: { "image": true, "audio": false,
-    "embeddedContext": true }`, so both image input ("what is on my screen?"
-    from a screenshot) and embedded context blocks are supported. Unlocks
-    screenshot support for "Ask about this" (#5).
+    "embeddedContext": true }`, so both image input and embedded context blocks
+    are supported. Interactive screen capture already works via the
+    `desktop-context` skill + `read_file`, while `--file`/`--image` lets CLI
+    and scripted callers attach files or images directly to `ask`.
 17. `[Important]` `[Upstream]` **Background tasks and scheduled-check support**
     (the core delegation feature). An `ask --background` flag or a `task`
     request type that is not superseded by a newer ask, runs in its own ACP
@@ -335,13 +336,17 @@ tooling are mature.
   `caffeinate`, `toggle-zen`, `netbird-vpn`, `darkman`, `spotify-like`,
   `random-album-of-the-day`, `switch-kb-layout`, `open-linear-ticket`) via
   `extraPackages` and a generated `desktop-scripts/SKILL.md` in `skills.extra`.
-- `[Important]` `[Config]` `[Done: NixConfig 8329b59]` **Typed front end &
-  cancel keybind.** Added `rofi-ask` (`SUPER + a`, with follow-up indicator and
-  `! ` / `/new ` prefix for `--new`) and cancel bind (`SUPER + CTRL + a`).
-- `[Important]` `[Config]` `[Done: NixConfig 8329b59]` **"Ask about this."**
-  Added `rofi-ask-about` (`SUPER + SHIFT + a`) supporting primary selection,
-  clipboard switching, OCR screen-region capture (`hyprshot` + `tesseract`),
-  quick lead-ins, and custom typed questions.
+- `[Important]` `[Config]` `[Done: NixConfig 8329b59, f92c640]` **Typed front
+  end & cancel keybind.** Added minimalist `rofi-ask` `-modi` prompt
+  (`SUPER + a`, matching `rofi-calculator`'s single-bar layout with dynamic
+  follow-up placeholder and `! ` / `/new ` prefix for `--new`) and cancel bind
+  (`SUPER + CTRL + a`).
+- `[Important]` `[Config]` `[Done: NixConfig 8329b59, f92c640]` **Unified
+  desktop context (`desktop-context`).** Replaced the separate "Ask about"
+  shortcut/menu with a `desktop-context` CLI & skill (`selection`, `clipboard`
+  text/image, frozen region/window/screen `capture` piped into `agy` via
+  `read_file`, `copy`, and `paste`) usable directly from `SUPER + v`,
+  `SUPER + ALT + v`, and `SUPER + a`.
 - `[Important]` `[Config]` `[Done: NixConfig 8329b59]` **Waybar status
   indicator.** Added `custom/hey-computer` (`waybar-hey-computer`, 1 s poll +
   `SIGRTMIN+12`), hidden at idle and showing thinking (`running_secs`),
