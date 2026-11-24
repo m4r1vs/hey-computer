@@ -414,7 +414,6 @@ fn extract_workspace_name(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
@@ -425,9 +424,26 @@ mod tests {
     }
 
     fn write_script(dir: &std::path::Path, name: &str, body: &str) -> String {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        // Write and chmod the script inside a short-lived child process so the
+        // test binary itself never holds a write FD to the executable inode
+        // (avoids Linux ETXTBSY when sibling tests fork() concurrently).
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "sh"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
         path.to_string_lossy().into_owned()
     }
 
