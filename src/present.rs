@@ -10,20 +10,27 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinSet;
 
 use crate::config::Present as PresentConfig;
+use crate::ipc;
 use crate::protocol::FailReason;
+
+static LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const APP_NAME: &str = "hey-computer";
 
 /// The notifier gets this long before it is given up on.
 const NOTIFIER_TIMEOUT: Duration = Duration::from_secs(5);
+/// The clipboard program gets this long to accept stdin and exit (or fork).
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a failure stays up.
 const FAILURE_EXPIRE_MS: u32 = 8_000;
 /// "Thinking…" is replaced by the answer; this only bounds a popup whose
@@ -1184,13 +1191,7 @@ impl Worker {
             return;
         }
 
-        let mut document = text.trim().to_string();
-        if !refused.is_empty() {
-            document.push_str("\n\n---\n\n");
-            document.push_str(&refused);
-        }
-        document.push('\n');
-        let document = disarm_html(&document);
+        let document = format_document(text, denied);
         let file = match write_answer(&self.answers_dir, id, &document, self.config.keep_answers) {
             Ok(file) => file,
             Err(e) => {
@@ -1324,9 +1325,22 @@ pub async fn notify(
     }
 }
 
+/// Format an answer as Markdown for the viewer, disarming raw HTML and remote
+/// images so the web view never runs scripts or fetches network resources.
+fn format_document(text: &str, denied: &[String]) -> String {
+    let mut document = text.trim().to_string();
+    if !denied.is_empty() {
+        document.push_str("\n\n---\n\nRefused: ");
+        document.push_str(&denied.join(", "));
+    }
+    document.push('\n');
+    disarm_html(&document)
+}
+
 /// Write a long answer where the viewer can read it, and drop old ones.
 fn write_answer(dir: &Path, id: u64, document: &str, keep: usize) -> anyhow::Result<PathBuf> {
     use anyhow::Context;
+    use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
     std::fs::DirBuilder::new()
@@ -1338,23 +1352,31 @@ fn write_answer(dir: &Path, id: u64, document: &str, keep: usize) -> anyhow::Res
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("restricting {}", dir.display()))?;
 
-    let stamp = std::time::SystemTime::now()
+    let base_stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or_default();
-    let file = dir.join(format!("answer-{stamp}-{id}.md"));
-    {
-        use std::io::Write;
-        let mut handle = std::fs::OpenOptions::new()
+    let mut file = None;
+    for offset in 0..64u128 {
+        let candidate = dir.join(format!("answer-{}-{id}.md", base_stamp + offset));
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&file)
-            .with_context(|| format!("creating {}", file.display()))?;
-        handle
-            .write_all(document.as_bytes())
-            .with_context(|| format!("writing {}", file.display()))?;
+            .open(&candidate)
+        {
+            Ok(mut handle) => {
+                handle
+                    .write_all(document.as_bytes())
+                    .with_context(|| format!("writing {}", candidate.display()))?;
+                file = Some(candidate);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", candidate.display())),
+        }
     }
+    let file = file.ok_or_else(|| anyhow::anyhow!("cannot allocate a unique answer file"))?;
     prune(dir, keep.max(1));
     Ok(file)
 }
@@ -1397,17 +1419,14 @@ struct SpawnedViewer {
     started: Instant,
 }
 
-/// Start the viewer on `file` and return the running child with its unlinked
-/// stderr file so "Answer opened" can be shown at once while [`watch_viewer`]
-/// checks for an early exit.
-fn spawn_viewer(argv: &[String], file: &Path) -> anyhow::Result<SpawnedViewer> {
+/// Create an unlinked `0600` file for a detached child's stderr so writes after
+/// this process exits never kill the child with SIGPIPE and no temp file is left
+/// behind on disk.
+fn unlinked_log_file(dir: &Path, prefix: &str) -> anyhow::Result<(std::fs::File, Stdio)> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    // Its stderr goes to a file, not a pipe: with a pipe, the viewer's first
-    // write after the daemon exits (a restart, a config change) would kill
-    // it with SIGPIPE, and its window with it. The file is unlinked at once;
-    // the viewer keeps writing to it until it exits.
-    let log_path = file.with_extension("viewer-stderr");
+    let n = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let log_path = dir.join(format!(".{prefix}-{}-{n}.log", std::process::id()));
     let log = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1419,6 +1438,15 @@ fn spawn_viewer(argv: &[String], file: &Path) -> anyhow::Result<SpawnedViewer> {
     let stderr = log
         .try_clone()
         .map_err(|e| anyhow::anyhow!("sharing {}: {e}", log_path.display()))?;
+    Ok((log, Stdio::from(stderr)))
+}
+
+/// Start the viewer on `file` and return the running child with its unlinked
+/// stderr file so "Answer opened" can be shown at once while [`watch_viewer`]
+/// checks for an early exit.
+fn spawn_viewer(argv: &[String], file: &Path) -> anyhow::Result<SpawnedViewer> {
+    let dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let (log, stderr) = unlinked_log_file(dir, "viewer-stderr")?;
 
     let file = file.to_string_lossy().into_owned();
     let mut args: Vec<String> = argv[1..]
@@ -1433,7 +1461,7 @@ fn spawn_viewer(argv: &[String], file: &Path) -> anyhow::Result<SpawnedViewer> {
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr))
+        .stderr(stderr)
         // Its own process group: a viewer is a window of its own and must not
         // get the daemon's signals.
         .process_group(0)
@@ -1474,7 +1502,7 @@ async fn watch_viewer(
 
     match waited {
         Ok(Ok(status)) if !status.success() => {
-            let detail = viewer_failure_detail(&viewer.program, status, &mut viewer.log);
+            let detail = child_failure_detail(&viewer.program, status, &mut viewer.log);
             drop(viewer.log);
             report_viewer_failure(&config, &file, &detail, replaces).await;
         }
@@ -1497,7 +1525,218 @@ async fn watch_viewer(
     }
 }
 
-fn viewer_failure_detail(
+/// Always open an answer in the Markdown viewer (disarming raw HTML and remote
+/// images), regardless of whether it would normally fit in a notification.
+pub async fn open_answer(
+    config: &PresentConfig,
+    answers_dir: &Path,
+    id: u64,
+    text: &str,
+    denied: &[String],
+) -> anyhow::Result<()> {
+    open_answer_with_grace(config, answers_dir, id, text, denied, VIEWER_GRACE).await
+}
+
+async fn open_answer_with_grace(
+    config: &PresentConfig,
+    answers_dir: &Path,
+    id: u64,
+    text: &str,
+    denied: &[String],
+    grace: Duration,
+) -> anyhow::Result<()> {
+    if config.viewer.is_empty() {
+        notify(
+            config,
+            "Cannot open the viewer",
+            &escape_markup("No viewer is configured (set present.viewer)."),
+            Urgency::Normal,
+            FAILURE_EXPIRE_MS,
+            None,
+        )
+        .await;
+        anyhow::bail!("no viewer is configured; set present.viewer in config.toml");
+    }
+
+    let document = format_document(text, denied);
+    let file = match write_answer(answers_dir, id, &document, config.keep_answers) {
+        Ok(file) => file,
+        Err(e) => {
+            notify(
+                config,
+                "Cannot show the answer",
+                &escape_markup(&format!("{e:#}")),
+                Urgency::Normal,
+                FAILURE_EXPIRE_MS,
+                None,
+            )
+            .await;
+            return Err(e);
+        }
+    };
+
+    let mut viewer = match spawn_viewer(&config.viewer, &file) {
+        Ok(viewer) => viewer,
+        Err(e) => {
+            report_viewer_failure(config, &file, &format!("{e:#}"), None).await;
+            return Err(e);
+        }
+    };
+    let opened_id = notify(
+        config,
+        "Answer opened",
+        &escape_markup(&headline(text, 120)),
+        Urgency::Low,
+        0,
+        None,
+    )
+    .await;
+
+    let remaining = grace.saturating_sub(viewer.started.elapsed());
+    let waited = if remaining.is_zero() {
+        Err(())
+    } else {
+        tokio::time::timeout(remaining, viewer.child.wait())
+            .await
+            .map_err(|_| ())
+    };
+    match waited {
+        Ok(Ok(status)) if !status.success() => {
+            let detail = child_failure_detail(&viewer.program, status, &mut viewer.log);
+            drop(viewer.log);
+            report_viewer_failure(config, &file, &detail, opened_id).await;
+            anyhow::bail!("{detail}");
+        }
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => {
+            drop(viewer.log);
+            let detail = format!("waiting for {}: {e}", viewer.program);
+            report_viewer_failure(config, &file, &detail, opened_id).await;
+            anyhow::bail!("{detail}");
+        }
+        Err(()) => {
+            // Still running: leave the detached viewer alive after CLI exit.
+            drop(viewer.log);
+            Ok(())
+        }
+    }
+}
+
+/// Pipe `text` verbatim to `config.clipboard` without hanging on Wayland
+/// clipboard owners (`wl-copy` forks a background child that inherits open FDs).
+pub async fn copy_to_clipboard(config: &PresentConfig, text: &str) -> anyhow::Result<()> {
+    copy_to_clipboard_with_timeout(config, text, CLIPBOARD_TIMEOUT).await
+}
+
+async fn copy_to_clipboard_with_timeout(
+    config: &PresentConfig,
+    text: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    if config.clipboard.is_empty() {
+        notify(
+            config,
+            "Cannot copy the answer",
+            &escape_markup("No clipboard program is configured (set present.clipboard)."),
+            Urgency::Normal,
+            FAILURE_EXPIRE_MS,
+            None,
+        )
+        .await;
+        anyhow::bail!("no clipboard program is configured; set present.clipboard in config.toml");
+    }
+
+    let log_dir = ipc::runtime_dir().unwrap_or_else(|_| std::env::temp_dir());
+    let (mut log, stderr) = unlinked_log_file(&log_dir, "clipboard-stderr")?;
+    let program = &config.clipboard[0];
+    let mut child = match Command::new(program)
+        .args(&config.clipboard[1..])
+        .stdin(Stdio::piped())
+        // Never use piped stdout/stderr: wl-copy forks a background owner that
+        // keeps inherited FDs open until the clipboard is replaced, which would
+        // deadlock wait_with_output() or kill it with SIGPIPE on exit.
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .process_group(0)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            let detail = format!("starting {program}: {e}");
+            report_clipboard_failure(config, &detail).await;
+            anyhow::bail!("{detail}");
+        }
+    };
+
+    let mut stdin = child.stdin.take();
+    let run = async {
+        if let Some(mut input) = stdin.take() {
+            if let Err(e) = input.write_all(text.as_bytes()).await
+                && e.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                return Err(anyhow::anyhow!("writing to {program}: {e}"));
+            }
+            let _ = input.shutdown().await;
+            drop(input);
+        }
+        child
+            .wait()
+            .await
+            .map_err(|e| anyhow::anyhow!("waiting for {program}: {e}"))
+    };
+
+    match tokio::time::timeout(timeout, run).await {
+        Ok(Ok(status)) if status.success() => {
+            drop(log);
+            notify(
+                config,
+                "Copied last answer",
+                &escape_markup(&headline(text, 120)),
+                Urgency::Low,
+                CANCELLED_EXPIRE_MS,
+                None,
+            )
+            .await;
+            Ok(())
+        }
+        Ok(Ok(status)) => {
+            let detail = child_failure_detail(program, status, &mut log);
+            drop(log);
+            report_clipboard_failure(config, &detail).await;
+            anyhow::bail!("{detail}");
+        }
+        Ok(Err(e)) => {
+            drop(log);
+            let detail = format!("{e:#}");
+            report_clipboard_failure(config, &detail).await;
+            Err(e)
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            drop(log);
+            let detail = format!("{program} took longer than {timeout:?}");
+            report_clipboard_failure(config, &detail).await;
+            anyhow::bail!("{detail}");
+        }
+    }
+}
+
+async fn report_clipboard_failure(config: &PresentConfig, detail: &str) {
+    tracing::warn!("the clipboard program failed");
+    tracing::debug!("clipboard: {detail}");
+    notify(
+        config,
+        "Cannot copy the answer",
+        &escape_markup(detail),
+        Urgency::Normal,
+        FAILURE_EXPIRE_MS,
+        None,
+    )
+    .await;
+}
+
+fn child_failure_detail(
     program: &str,
     status: std::process::ExitStatus,
     log: &mut std::fs::File,
@@ -2424,5 +2663,130 @@ mod tests {
         let last = recorded2.lines().last().unwrap_or("");
         assert!(last.contains("Answer ok"), "{recorded2}");
         assert!(last.contains("--replace-id=7"), "{recorded2}");
+    }
+
+    #[tokio::test]
+    async fn open_answer_disarms_html_and_opens_short_answers() {
+        let dir = std::env::temp_dir().join(format!("hc-open-answer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let opened = dir.join("opened.md");
+        let viewer_cmd = format!("cp \"$1\" '{}'", opened.display());
+        let config = recording_config(&calls, &["/bin/sh", "-c", &viewer_cmd, "sh", "{file}"]);
+
+        // Short answer with raw HTML must still open the viewer and be disarmed.
+        open_answer_with_grace(
+            &config,
+            &dir.join("answers"),
+            5,
+            "hi <script>alert(1)</script>",
+            &["sudo id".to_string()],
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+
+        let rendered = std::fs::read_to_string(&opened).unwrap();
+        assert!(
+            rendered.contains("&lt;script>alert(1)&lt;/script>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Refused: sudo id"), "{rendered}");
+        let notified = std::fs::read_to_string(&calls).unwrap();
+        assert!(notified.contains("Answer opened"), "{notified}");
+
+        // Failing viewer reports failure and returns Err.
+        let bad_config =
+            recording_config(&calls, &["/bin/sh", "-c", "echo 'boom' >&2; exit 2", "sh"]);
+        assert!(
+            open_answer_with_grace(
+                &bad_config,
+                &dir.join("answers"),
+                6,
+                "hello",
+                &[],
+                Duration::from_millis(200),
+            )
+            .await
+            .is_err()
+        );
+        let notified = std::fs::read_to_string(&calls).unwrap();
+        assert!(notified.contains("Cannot open the viewer"), "{notified}");
+
+        // Empty viewer fails cleanly.
+        let empty_config = recording_config(&calls, &[]);
+        assert!(
+            open_answer_with_grace(
+                &empty_config,
+                &dir.join("answers"),
+                7,
+                "hello",
+                &[],
+                Duration::from_millis(200),
+            )
+            .await
+            .is_err()
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_to_clipboard_handles_forked_background_owner_and_errors() {
+        let dir = std::env::temp_dir().join(format!("hc-clipboard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let captured = dir.join("clip.txt");
+
+        // Simulates wl-copy: reads stdin, forks a background child holding
+        // inherited stdout/stderr FDs, and exits 0 immediately.
+        let mut config = recording_config(&calls, &[]);
+        config.clipboard = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("cat > '{}'; (sleep 3) & exit 0", captured.display()),
+            "sh".to_string(),
+        ];
+
+        let started = Instant::now();
+        copy_to_clipboard_with_timeout(&config, "echo <raw>", Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "blocked on forked background clipboard owner"
+        );
+        assert_eq!(std::fs::read_to_string(&captured).unwrap(), "echo <raw>");
+        let notified = std::fs::read_to_string(&calls).unwrap();
+        assert!(notified.contains("Copied last answer"), "{notified}");
+
+        // Non-zero exit captures stderr and notifies.
+        config.clipboard = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo 'no wayland' >&2; exit 1".to_string(),
+            "sh".to_string(),
+        ];
+        let err = copy_to_clipboard_with_timeout(&config, "hello", Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no wayland"), "{err}");
+
+        // Hanging clipboard program times out cleanly.
+        config.clipboard = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 5".to_string(),
+            "sh".to_string(),
+        ];
+        assert!(
+            copy_to_clipboard_with_timeout(&config, "hello", Duration::from_millis(120))
+                .await
+                .is_err()
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

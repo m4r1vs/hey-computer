@@ -26,6 +26,7 @@ use crate::environment::{self, Paths};
 use crate::policy::Policy;
 use crate::present::{Presentation, Presenter};
 use crate::protocol::{AgentState, FailReason, Reply, Status};
+use crate::store::{self, LastAnswer};
 
 /// initialize and session/new answer in about a second; this only catches an
 /// agent that hangs on start.
@@ -250,6 +251,15 @@ pub fn spawn_with_context(
     presenter: Arc<dyn Presenter>,
     context: Arc<dyn ContextProvider>,
 ) -> (Handle, JoinHandle<()>) {
+    spawn_inner(config, presenter, context, true)
+}
+
+fn spawn_inner(
+    config: Arc<Config>,
+    presenter: Arc<dyn Presenter>,
+    context: Arc<dyn ContextProvider>,
+    persist_last: bool,
+) -> (Handle, JoinHandle<()>) {
     let shared = Arc::new(Mutex::new(Shared {
         next_id: 0,
         latest: None,
@@ -265,6 +275,7 @@ pub fn spawn_with_context(
         config,
         presenter,
         context,
+        persist_last,
         shared: Arc::clone(&shared),
         inbox,
         stop: Arc::clone(&stop),
@@ -307,6 +318,7 @@ struct Conductor {
     config: Arc<Config>,
     presenter: Arc<dyn Presenter>,
     context: Arc<dyn ContextProvider>,
+    persist_last: bool,
     policy: Policy,
     shared: Arc<Mutex<Shared>>,
     inbox: mpsc::UnboundedReceiver<Message>,
@@ -664,6 +676,25 @@ impl Conductor {
         if let Ok(mut shared) = self.shared.lock() {
             shared.running = None;
             shared.handled += 1;
+        }
+        if self.persist_last
+            && let Outcome::Answer { text, denied } = &outcome
+        {
+            let record = LastAnswer {
+                version: store::SCHEMA_VERSION,
+                id: ask.id,
+                timestamp: store::unix_timestamp_secs(),
+                request: ask.text.clone(),
+                text: text.clone(),
+                denied: denied.clone(),
+            };
+            if let Err(e) = self
+                .config
+                .state_dir()
+                .and_then(|dir| store::save_last(&dir, &record))
+            {
+                tracing::warn!("cannot save the last answer: {e:#}");
+            }
         }
         deliver(Some(&self.presenter), ask, outcome);
     }
@@ -1423,7 +1454,7 @@ pub async fn ask_once(config: Config, text: String) -> Result<Outcome> {
     let mut config = config;
     config.agent.warm_start = false;
     let presenter: Arc<dyn Presenter> = crate::present::Recorder::new();
-    let (handle, task) = spawn(Arc::new(config), presenter);
+    let (handle, task) = spawn_inner(Arc::new(config), presenter, Arc::new(SystemContext), false);
     let (tx, rx) = oneshot::channel();
     let id = handle.ask(text, true, Sink::Client(tx));
     let reply = rx.await.context("the conductor stopped")?;

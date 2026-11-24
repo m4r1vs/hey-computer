@@ -14,7 +14,7 @@ use hey_computer::config::Config;
 use hey_computer::ipc::{self, NotRunning};
 use hey_computer::present::{self, Urgency};
 use hey_computer::protocol::{self, MAX_REQUEST_LINE, Reply, Request};
-use hey_computer::{daemon, debug, mock};
+use hey_computer::{daemon, debug, mock, store};
 
 #[derive(Debug, Parser)]
 #[command(name = "hey-computer", version, about, long_about = None)]
@@ -59,6 +59,15 @@ enum Command {
         /// Print the status as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Retrieve the last answer: print it, copy it to the clipboard, or open it in the viewer.
+    Last {
+        /// Copy the last answer to the clipboard instead of printing it.
+        #[arg(long, conflicts_with = "open")]
+        copy: bool,
+        /// Open the last answer in the Markdown viewer instead of printing it.
+        #[arg(long, conflicts_with = "copy")]
+        open: bool,
     },
     /// Check one part of the program on its own.
     #[command(hide = true)]
@@ -140,36 +149,46 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
     }
 
     let config = Config::load(cli.config.as_deref())?;
-    let socket = ipc::socket_path(cli.socket.as_deref())?;
 
     match cli.command {
         Command::Daemon => {
+            let socket = ipc::socket_path(cli.socket.as_deref())?;
             daemon::run(config, &socket).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Ask { print, new, text } => ask(&config, &socket, text, print, new).await,
-        Command::Cancel => match ipc::request(&socket, &Request::Cancel).await? {
-            Reply::Cancelled { id: Some(id) } => {
-                println!("cancelled request {id}");
-                Ok(ExitCode::SUCCESS)
-            }
-            Reply::Cancelled { id: None } => {
-                println!("nothing to cancel");
-                Ok(ExitCode::SUCCESS)
-            }
-            other => unexpected(other),
-        },
-        Command::Status { json } => match ipc::request(&socket, &Request::Status).await? {
-            Reply::Status(status) => {
-                if json {
-                    println!("{}", serde_json::to_string(&status)?);
-                } else {
-                    println!("{status}");
+        Command::Ask { print, new, text } => {
+            let socket = ipc::socket_path(cli.socket.as_deref())?;
+            ask(&config, &socket, text, print, new).await
+        }
+        Command::Cancel => {
+            let socket = ipc::socket_path(cli.socket.as_deref())?;
+            match ipc::request(&socket, &Request::Cancel).await? {
+                Reply::Cancelled { id: Some(id) } => {
+                    println!("cancelled request {id}");
+                    Ok(ExitCode::SUCCESS)
                 }
-                Ok(ExitCode::SUCCESS)
+                Reply::Cancelled { id: None } => {
+                    println!("nothing to cancel");
+                    Ok(ExitCode::SUCCESS)
+                }
+                other => unexpected(other),
             }
-            other => unexpected(other),
-        },
+        }
+        Command::Status { json } => {
+            let socket = ipc::socket_path(cli.socket.as_deref())?;
+            match ipc::request(&socket, &Request::Status).await? {
+                Reply::Status(status) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&status)?);
+                    } else {
+                        println!("{status}");
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                other => unexpected(other),
+            }
+        }
+        Command::Last { copy, open } => last(&config, copy, open).await,
         Command::Debug { what } => {
             let ok = match what {
                 DebugCommand::Config => {
@@ -216,6 +235,42 @@ fn unexpected(reply: Reply) -> Result<ExitCode> {
         other => eprintln!("hey-computer: unexpected reply {other:?}"),
     }
     Ok(ExitCode::FAILURE)
+}
+
+async fn last(config: &Config, copy: bool, open: bool) -> Result<ExitCode> {
+    let state_dir = config.state_dir()?;
+    let Some(answer) = store::load_last(&state_dir)? else {
+        eprintln!("hey-computer: no answer recorded yet");
+        if copy || open {
+            present::notify(
+                &config.present,
+                "No previous answer",
+                &present::escape_markup("Ask the assistant something first."),
+                Urgency::Normal,
+                5_000,
+                None,
+            )
+            .await;
+        }
+        return Ok(ExitCode::FAILURE);
+    };
+
+    if copy {
+        present::copy_to_clipboard(&config.present, &answer.text).await?;
+    } else if open {
+        let answers = ipc::runtime_dir()?.join("hey-computer");
+        present::open_answer(
+            &config.present,
+            &answers,
+            answer.id,
+            &answer.text,
+            &answer.denied,
+        )
+        .await?;
+    } else {
+        println!("{}", answer.text);
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn ask(
@@ -339,6 +394,9 @@ mod tests {
             vec!["hey-computer", "ask", "--print"],
             vec!["hey-computer", "--socket", "/tmp/s", "cancel"],
             vec!["hey-computer", "status", "--json"],
+            vec!["hey-computer", "last"],
+            vec!["hey-computer", "last", "--copy"],
+            vec!["hey-computer", "last", "--open"],
             vec!["hey-computer", "debug", "config"],
             vec!["hey-computer", "debug", "context"],
             vec!["hey-computer", "debug", "classify", "# heading"],
@@ -366,5 +424,10 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn last_rejects_copy_and_open_together() {
+        assert!(Cli::try_parse_from(["hey-computer", "last", "--copy", "--open"]).is_err());
     }
 }

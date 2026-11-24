@@ -57,6 +57,8 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   workspace with the generated `AGENTS.md`. Rewritten before every agent start.
 - `context`: opt-in per-turn ambient time (`localtime_r`) and Hyprland active window/workspace
   header prepended to user prompts inside `<untrusted_desktop_context>` delimiters.
+- `store`: atomic `0600` persistence of the last successful answer in `<state_dir>/last.json`
+  for `hey-computer last [--copy | --open]`.
 - `policy`: the deny list, matched as command words through wrappers, `sh -c`, pipes and
   `$(…)`, and behind `systemd-run`. A courtesy, not a boundary.
 - `present`: `Presenter` trait; `Desktop` runs the notifier (an argument vector,

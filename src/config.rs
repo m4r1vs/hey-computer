@@ -149,6 +149,9 @@ pub struct Present {
     /// file (appended when no argument mentions it). Empty shows the file's
     /// path in a notification instead.
     pub viewer: Vec<String>,
+    /// Copies an answer to the clipboard (`hey-computer last --copy`): program
+    /// and arguments, fed the raw answer on stdin.
+    pub clipboard: Vec<String>,
     /// How many answer files to keep.
     pub keep_answers: usize,
 }
@@ -200,6 +203,7 @@ impl Default for Present {
             max_lines: 4,
             notifier: vec!["notify-send".to_string()],
             viewer: Vec::new(),
+            clipboard: vec!["wl-copy".to_string()],
             keep_answers: 20,
         }
     }
@@ -287,6 +291,9 @@ impl Config {
         }
         if !self.present.notifier.is_empty() && self.present.notifier[0].is_empty() {
             bail!("present.notifier must name a program");
+        }
+        if !self.present.clipboard.is_empty() && self.present.clipboard[0].is_empty() {
+            bail!("present.clipboard must name a program");
         }
         if self.present.max_lines == 0 || self.present.max_chars == 0 {
             bail!("present.max_lines and present.max_chars must be positive");
@@ -526,5 +533,20 @@ mod tests {
         assert!(!parsed.context.desktop);
         assert!(parsed.context.is_enabled());
         parsed.validate().unwrap();
+    }
+
+    #[test]
+    fn clipboard_config_defaults_and_validates() {
+        let default = Config::default();
+        assert_eq!(default.present.clipboard, vec!["wl-copy"]);
+        default.validate().unwrap();
+
+        let mut empty = Config::default();
+        empty.present.clipboard.clear();
+        empty.validate().unwrap();
+
+        let mut blank = Config::default();
+        blank.present.clipboard = vec![String::new()];
+        assert!(blank.validate().is_err());
     }
 }

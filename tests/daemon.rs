@@ -1114,3 +1114,61 @@ async fn ambient_desktop_context_updates_across_follow_ups() {
     task.await.unwrap().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_last_successful_answer_is_persisted_and_failures_do_not_overwrite_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut h = Harness::warm().await;
+    let state_dir = h.dir.join("state");
+    assert_eq!(hey_computer::store::load_last(&state_dir).unwrap(), None);
+
+    // Desktop ask (wait: false) persists last.json with 0600 permissions.
+    ipc::ask(&h.socket, "plain", false, false).await.unwrap();
+    h.recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|item| matches!(item, Presentation::Answer { .. }))
+        })
+        .await
+        .expect("answer presented");
+    let first = hey_computer::store::load_last(&state_dir)
+        .unwrap()
+        .expect("last.json saved");
+    assert_eq!(first.request, "plain");
+    assert_eq!(first.text, "Hello from the mock.");
+    let mode = std::fs::metadata(state_dir.join(hey_computer::store::LAST_FILE))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+
+    // Denied, Empty, and Cancelled turns must leave the previous last answer intact.
+    let _ = h.ask("root", false).await;
+    let _ = h.ask("silent", false).await;
+    let (_, mut slow) = h.ask_waiting("slow").await;
+    h.wait_log("prompt mock-1 slow").await;
+    ipc::request(&h.socket, &Request::Cancel).await.unwrap();
+    let _ = slow.next(Some(Duration::from_secs(5))).await.unwrap();
+    assert_eq!(
+        hey_computer::store::load_last(&state_dir)
+            .unwrap()
+            .unwrap()
+            .text,
+        "Hello from the mock."
+    );
+
+    // Waiting ask (wait: true) updates last.json too, and it survives daemon shutdown.
+    let reply = h.ask("long", false).await;
+    assert!(answer(&reply).starts_with("# Title"));
+    let _ = h.shut_down().await;
+    let saved = hey_computer::store::load_last(&state_dir)
+        .unwrap()
+        .expect("last.json survives shutdown");
+    assert_eq!(saved.request, "long");
+    assert!(saved.text.starts_with("# Title"));
+
+    h.stop().await;
+}

@@ -131,3 +131,174 @@ fn a_viewer_outlives_the_daemon_even_when_it_writes_to_stderr() {
     assert!(left.len() == 1 && left[0].ends_with(".md"), "{left:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn last_reports_missing_answer_and_notifies_only_for_copy_and_open() {
+    let dir = scratch("last-missing");
+    let calls = dir.join("notify.log");
+    let state = dir.join("state");
+    let config = dir.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "state_dir = \"{}\"\n[present]\nnotifier = [\"/bin/sh\", \"-c\", \"echo \\\"$*\\\" >> '{}'; echo 7\", \"sh\"]\n",
+            state.display(),
+            calls.display()
+        ),
+    )
+    .unwrap();
+
+    // Plain `last` exits 1 without popping up a notification.
+    let out = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .arg("last")
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no answer recorded yet"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(&calls)
+            .unwrap_or_default()
+            .is_empty()
+    );
+
+    // `--copy` and `--open` exit 1 and notify the user.
+    for flag in ["--copy", "--open"] {
+        let _ = std::fs::remove_file(&calls);
+        let out = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+            .arg("--config")
+            .arg(&config)
+            .args(["last", flag])
+            .env("XDG_RUNTIME_DIR", &dir)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        let notified = std::fs::read_to_string(&calls).unwrap_or_default();
+        assert_eq!(notified.lines().count(), 1, "{flag}: {notified}");
+        assert!(
+            notified.contains("No previous answer"),
+            "{flag}: {notified}"
+        );
+    }
+
+    // `--copy` and `--open` together are refused by clap (exit 2).
+    let out = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .args(["last", "--copy", "--open"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn last_prints_copies_and_opens_the_saved_answer() {
+    let dir = scratch("last-retrieve");
+    let calls = dir.join("notify.log");
+    let state = dir.join("state");
+    let copied = dir.join("copied.txt");
+    let opened = dir.join("opened.md");
+    let config = dir.join("config.toml");
+
+    hey_computer::store::save_last(
+        &state,
+        &hey_computer::store::LastAnswer {
+            version: hey_computer::store::SCHEMA_VERSION,
+            id: 42,
+            timestamp: 1_700_000_000,
+            request: "show raw".to_string(),
+            text: "hi <script>alert(1)</script>".to_string(),
+            denied: vec![],
+        },
+    )
+    .unwrap();
+
+    std::fs::write(
+        &config,
+        format!(
+            "state_dir = \"{}\"\n\
+             [present]\n\
+             notifier = [\"/bin/sh\", \"-c\", \"echo \\\"$*\\\" >> '{}'; echo 7\", \"sh\"]\n\
+             clipboard = [\"/bin/sh\", \"-c\", \"cat > '{}'; (sleep 3) & exit 0\", \"sh\"]\n\
+             viewer = [\"/bin/sh\", \"-c\", \"cp \\\"$1\\\" '{}'\", \"sh\", \"{{file}}\"]\n",
+            state.display(),
+            calls.display(),
+            copied.display(),
+            opened.display()
+        ),
+    )
+    .unwrap();
+
+    // Stdout mode prints raw text and works without XDG_RUNTIME_DIR.
+    let out = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .arg("last")
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi <script>alert(1)</script>\n"
+    );
+
+    // `--copy` writes exact raw bytes without hanging on forked child.
+    let started = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .args(["last", "--copy"])
+        .env("XDG_RUNTIME_DIR", &dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(
+        std::fs::read_to_string(&copied).unwrap(),
+        "hi <script>alert(1)</script>"
+    );
+    assert!(
+        std::fs::read_to_string(&calls)
+            .unwrap()
+            .contains("Copied last answer")
+    );
+
+    // `--open` disarms HTML and opens the viewer even for a short answer.
+    let out = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .args(["last", "--open"])
+        .env("XDG_RUNTIME_DIR", &dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rendered = std::fs::read_to_string(&opened).unwrap();
+    assert!(
+        rendered.contains("&lt;script>alert(1)&lt;/script>"),
+        "{rendered}"
+    );
+    assert!(
+        std::fs::read_to_string(&calls)
+            .unwrap()
+            .contains("Answer opened")
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

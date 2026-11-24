@@ -57,7 +57,10 @@
   # A user's own viewer replaces the module's instead of being appended to
   # it, and without a vault there are no Obsidian skills and no shim.
   custom = evaluate {
-    settings.present.viewer = ["my-viewer" "{file}"];
+    settings.present = {
+      viewer = ["my-viewer" "{file}"];
+      clipboard = ["my-clip"];
+    };
   };
 
   bare = evaluate {
@@ -82,8 +85,12 @@
   "six skills with a vault and openhue: hyprland-desktop, four from obsidian-skills, and openhue";
   assert lib.assertMsg ((settingsOf full).instructions.memory_file == "/home/alice/.config/hey-computer/memory.md")
   "the module defaults instructions.memory_file to xdg.configHome";
+  assert lib.assertMsg (lib.hasSuffix "/bin/wl-copy" (lib.head (settingsOf full).present.clipboard))
+  "the module defaults present.clipboard to wl-copy";
   assert lib.assertMsg ((settingsOf custom).present.viewer == ["my-viewer" "{file}"])
   "a user's viewer replaces the default";
+  assert lib.assertMsg ((settingsOf custom).present.clipboard == ["my-clip"])
+  "a user's clipboard command replaces the default";
   assert lib.assertMsg (lib.length (settingsOf custom).instructions.skills == 1)
   "without a vault or openhue only the bundled hyprland-desktop skill";
   assert lib.assertMsg (!((settingsOf bare).instructions or {} ? skills))

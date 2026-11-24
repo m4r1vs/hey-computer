@@ -130,9 +130,10 @@ in {
       description = ''
         Contents of {file}`~/.config/hey-computer/config.toml`, see the
         README for every key. The module fills in `instructions.vault`,
-        `instructions.memory_file`, `instructions.skills` and `present.viewer`
-        from its own options. The file is checked with the package's own binary
-        when it is built, so an unknown key fails the build.
+        `instructions.memory_file`, `instructions.skills`, `present.viewer` and
+        `present.clipboard` from its own options. The file is checked with the
+        package's own binary when it is built, so an unknown key fails the
+        build.
       '';
     };
 
@@ -310,7 +311,10 @@ in {
         memory_file = mkIf (cfg.memory.file != null) (mkDefault cfg.memory.file);
         skills = mkIf (skillDirs != []) skillDirs;
       };
-      present.viewer = mkIf (cfg.viewer.command != []) (mkDefault (viewerLauncher ++ cfg.viewer.command));
+      present = {
+        viewer = mkIf (cfg.viewer.command != []) (mkDefault (viewerLauncher ++ cfg.viewer.command));
+        clipboard = mkDefault [(lib.getExe' pkgs.wl-clipboard "wl-copy")];
+      };
     };
 
     xdg.configFile."hey-computer/config.toml".source = configFile;
