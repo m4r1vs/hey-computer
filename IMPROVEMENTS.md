@@ -43,23 +43,117 @@ All Phase 2 items (#8–#14) are implemented and listed under [Done](#done).
 
 All Phase 3 items (#15–#19) are implemented and listed under [Done](#done).
 
-## Phase 4: Integrations & smart routing
+## Phase 4: Integrations, context, hardening & smart routing
 
-Built on background tasks (#17), profiles (#15), and the MCP probe (#19). Per
+Built on background tasks (#17), profiles (#15), and MCP passthrough (#19). Per
 the trust policy above, no daemon-level permission prompts are used — actions
 execute directly, and permission prompts can be added later if ever needed.
 
-20. `[Important]` **Google Calendar.** Reading ("what's on tomorrow", "when is
-    my next meeting") and creating, moving, or deleting events. Either through a
-    calendar MCP server (needs #19) or a small CLI wrapped in a `SKILL.md`
-    ("code before prompts"). The CLI should hold the OAuth token itself, so the
-    token never enters the model's context.
-21. `[Important]` **Gmail.** Search, summarise ("anything important since this
-    morning?"), draft, and send replies without permission prompts.
-22. `[Important]` **Automatic model, effort, and lane routing (profile +
-    background inference).** Builds on model and effort profiles (#15),
-    attachments (#16), and background tasks (#17) so the user rarely needs
-    explicit `/deep` or `/bg` prefixes. Options, cheapest first:
+**MCP vs. CLI rule of thumb:** Don't turn stateless one-liner CLIs into MCP
+servers. Keep small local CLIs (lights, media, desktop toggles, `yt-dlp`, `gh`)
+as `SKILL.md` scripts with zero turn-1 schema tokens; reserve MCP for stateful
+OAuth/remote APIs or structured schema introspection, and keep heavy MCPs off
+the default `fast` voice profile using per-profile `mcp_servers` (#15). For
+NixOS packaging, evaluate
+[`natsukium/mcp-servers-nix`](https://github.com/natsukium/mcp-servers-nix) for
+pinned `/nix/store` derivations wired straight into
+`programs.hey-computer.mcp.servers` instead of shelling out to `npx` at runtime.
+
+20. `[Important]` `[Config]` **Google Calendar.** Reading ("what's on tomorrow",
+    "when is my next meeting") and creating, moving, or deleting events. Target
+    **`taylorwilsdon/google_workspace_mcp`** (MIT, supports `stdio`/HTTP,
+    trimmed via `--tool-tier core` and/or `X-MCP-Toolsets` headers to cap schema
+    bloat), keeping OAuth tokens managed by the server outside the model's
+    context.
+21. `[Important]` `[Config]` **Gmail.** Search, summarise ("anything important
+    since this morning?"), draft, and send replies without permission prompts —
+    served through **`taylorwilsdon/google_workspace_mcp`** alongside #20
+    (unlike Google's hosted Developer Preview Gmail MCP, which focuses on
+    read/label/draft rather than full sending).
+22. `[Important]` `[Config]` **Context7 MCP (`deep`), `yt-dlp` / `gh` CLI
+    skills, & built-in `agy` `/browser`.**
+    - **Context7 MCP** mounted on the `deep` profile (2 tools, ~4.9k chars) to
+      pull up-to-date library/framework docs into context instead of relying on
+      stale model weights.
+    - **`yt-dlp` CLI + `SKILL.md`** (no YouTube MCP for now) writing
+      subtitles/transcripts to disk under `$HEY_COMPUTER_STATE_DIR/artifacts/`
+      (#24) so 60+ minute videos don't hit MCP response size limits and cost
+      zero turn-1 schema tokens.
+    - **`gh` CLI + `SKILL.md`** (no GitHub MCP for now) for GitHub repos,
+      issues, and PRs — GitHub is used frequently for private/personal projects
+      (pairs with Personal mode in #34).
+    - **Built-in `agy` `/browser` verification & fine-tuning:** Antigravity CLI
+      already ships a `/browser` command and isolated `browser` subagent that
+      attaches to local Chrome (v144+, `chrome://inspect/#remote-debugging`) via
+      Chrome DevTools MCP with zero turn-1 schema cost. Verify and fine-tune how
+      it works through `agy acp` (putting `nodejs`/`npx` on `extraPackages`
+      `PATH`, Chrome remote debugging, and browser actuation settings) instead
+      of adding a separate browser MCP.
+23. `[Important]` `[Upstream + Config]` **Focused-window CWD & Ghostty/`tmux`
+    ambient context + `tmux` skill.** Extend `[context] desktop` (#13) so that
+    when the focused window is a terminal or editor, ambient context resolves
+    its working directory, and when the focused window is **Ghostty** (where
+    `tmux` auto-starts), includes lightweight `tmux` context as well. Pair this
+    with a **`tmux` skill** so the agent can query pane content/metadata
+    directly — enabling hands-free prompts like *"Explain this function"* to get
+    context from `tmux` and read the entire open file instead of relying on OCR.
+24. `[Important]` `[Upstream + Config]` **Artifacts directory & CLI large-output
+    offloading (`$HEY_COMPUTER_STATE_DIR/artifacts/`).** Because `hey-computer`
+    is an ACP client that does not intercept `agy`'s internal tool execution, it
+    cannot rewrite MCP/shell tool outputs directly. Instead, have the daemon
+    create a private `0700` `$HEY_COMPUTER_STATE_DIR/artifacts/` directory with
+    automatic age pruning on agent start (alongside `history_days`), document it
+    in `BUILT_IN`, and follow the convention in bulky CLI skills (`yt-dlp`,
+    `tmux`, etc.) of writing outputs above ~16 KB to disk and returning a
+    truncated preview + path for `rg`/`read_file`.
+25. `[Important]` `[Upstream]` **Daemon hardening: consecutive tool-loop
+    detection, live `memory.md` capacity header, & SQLite/FTS5 maintenance.**
+    - **Consecutive tool-loop detection:** Add a lightweight repeat guard inside
+      `ToolTracker` (`src/conductor.rs`, e.g. `agent.max_repeat_tool_calls = 3`,
+      `0` disables) comparing each distinct `toolCallId`'s canonicalized tool
+      name/kind and normalized JSON arguments (ignoring key order), aborting
+      wedged retry loops via `limit_reached` in 3 steps instead of burning all
+      20 (#9).
+    - **Live `memory.md` capacity header:** When `environment::prepare()` builds
+      `AGENTS.md` on agent start (#8), include a capacity header (e.g.
+      `MEMORY: 2,840 / 4,000 chars (71%)`) so the model consolidates or prunes
+      stale entries instead of blindly hitting truncation, while preserving
+      frozen-snapshot prompt caching.
+    - **Automatic SQLite / FTS5 maintenance:** Periodically merge FTS5 segments
+      (`INSERT INTO turns_fts(turns_fts) VALUES('optimize')`) and run
+      `PRAGMA optimize` / safe `VACUUM` in `src/store.rs` on daemon start or
+      maintenance windows so `history.db` stays compact and `recall` stays fast.
+26. `[Important]` `[Config]` **Shell-gated proactive timers (wiring up `#17`'s
+    `--suppress-token` + split failure routing).** Systemd user timers / session
+    hooks that run cheap shell pre-checks first and only wake
+    `hey-computer ask -b --suppress-token HEARTBEAT_OK` when state warrants it:
+    - **Morning digest:** triggered a couple minutes after first wake in the
+      morning (once per day), writing a concise brief of today's calendar, mail,
+      and mentions to `Journal/YYYY-MM-DD.md` and/or firing a notification.
+    - **Location-aware work-schedule checks:** cheap IP check detecting whether
+      the machine is **at home**, **at work**, or **neither**, used to gate
+      proactive checks on the work schedule (and later tie into Work/Personal
+      modes in #34).
+    - **Pre-daily brief:** triggered a couple minutes before the **10:00 daily**
+      standup (gated to workdays / work schedule).
+    - **Split failure routing:** Clean no-ops stay silent via `HEARTBEAT_OK`,
+      while hard failures (expired OAuth token, network down, script crash)
+      route separately (dedicated alert/log or rate-limited failure notice)
+      instead of vanishing silently or spamming every interval.
+27. `[Important]` `[Upstream]` **Agent-authored hybrid scheduler.** Complement
+    declarative Nix timers (#26) with a SQLite-backed scheduler inside the
+    daemon so the agent itself can create, list, pause, edit, and test-run
+    ad-hoc recurring or temporary jobs (e.g. *"check this PR every 15 minutes
+    until CI passes"*, *"remind me every Friday at 16:00"*) without editing Nix
+    config. Support optional `--script` pre-collectors (wake the LLM only when
+    `stdout` is non-empty), zero-token `no_agent` jobs (run a script and notify
+    directly with no LLM call), and split failure routing (`--failure-deliver`).
+    Keeping jobs inside the daemon's SQLite store also keeps them cleanly
+    isolated per mode once Work/Personal modes land (#34).
+28. `[Important]` `[Upstream]` **Automatic model, effort, and lane routing
+    (profile + background inference).** Builds on model and effort profiles
+    (#15), attachments (#16), and background tasks (#17) so the user rarely
+    needs explicit `/deep` or `/bg` prefixes. Options, cheapest first:
     - **Heuristics:** length of the request, keywords ("explain", "debug",
       "research", "derive", "compare", "write a report"), attachments → `deep`;
       short desktop commands → `fast`; long multi-step or research requests →
@@ -68,65 +162,92 @@ execute directly, and permission prompts can be added later if ever needed.
     - **Escalation on failure:** start fast; if a tool fails, the answer is
       empty, or the follow-up starts with "no, …", retry the follow-up on the
       deeper profile.
-    - **A triage turn:** the fast model classifies the request with both a
-      profile (`fast` vs `deep`) and a lane (`interactive` vs `background`)
-      before the real turn. This costs one extra round-trip, so use it only
-      when the heuristics are unsure.
+    - **A triage turn (non-voice inputs only):** the fast model classifies the
+      request with both a profile (`fast` vs `deep`) and a lane (`interactive`
+      vs `background`) before the real turn when heuristics are unsure. **Never
+      run LLM triage on voice inputs** (`SUPER + ALT + v`, voice prefix, or
+      future hotword detection once implemented) so voice stays zero-overhead;
+      keep it only for typed/CLI/other front ends (`rofi-ask` `SUPER + a`, CLI,
+      future phone self-chat).
 
     Model and thought level are set per session (`session/set_config_option`),
     and mid-conversation switching is confirmed to work on `agy` 1.5.13, so
     routing both new sessions and follow-up escalations is cheap. Show which
     profile answered in the notification, so wrong routing is visible.
 
-## Phase 5: Better output UX (viewer & spoken answers)
+## Phase 5: Better output UX (viewer, distillation & spoken answers)
 
 Built after the `$XDG_STATE_HOME` history store (#17–#18) and the typed front
 end (#4) are in place.
 
-23. `[Important]` **A much better answer view, with actions.** Marker has known
-    limits (README: an editor at heart with Open/Save buttons, umlauts break
-    syntax highlighting, last release in 2023). A dedicated viewer (or a
-    different existing one) should offer:
+29. `[Important]` **A much better answer view, with actions & interactive
+    widgets (WebKitGTK).** Marker has known limits (README: an editor at heart
+    with Open/Save buttons, umlauts break syntax highlighting, last release in
+    2023). Build a dedicated **WebKitGTK** viewer that offers:
     - copy the whole answer or a single code block;
     - run a code block directly on click (no permission prompt);
     - open links (still disarmed until clicked);
     - a follow-up input field that continues the same conversation;
     - "save to vault" (append to today's note) and "open in editor";
     - a history of recent answers (ties in with `hey-computer last` #14 and the
-      local recall index #18).
+      local recall index #18);
+    - **interactive `show_widget` HTML widgets** baked directly into the viewer
+      (personal-use trust model — no strict sandboxed iframe required): a
+      `sendPrompt(text)` JS bridge so widget buttons/forms can trigger follow-up
+      turns in the same conversation, a theme bridge injecting live light/dark
+      CSS variables (pairs with `darkman`), and an uncaught-error reporter that
+      surfaces broken widget JS back to the session.
 
     Short answers should get notification actions too: Copy, Reply (opens the
-    typed front end #4 in follow-up mode) and Open in viewer. Keep the HTML and
-    remote-image disarming for whatever renders the answer.
-24. `[Important]` `[Upstream]` **Optional audio feedback hook (`present.speak` /
-    earcons).** For hands-free voice ergonomics, add an optional `present.speak`
-    argv hook (e.g. Piper or Kokoro for short answers) or subtle earcons, with
-    `cancel` stopping playback immediately.
-25. `[Important]` **Optional spoken answers (TTS).** Expands the `present.speak`
-    hook (#24). Use a local TTS engine (Piper or Kokoro) with a German and an
-    English voice, chosen by the answer's language. Speak short answers whole;
-    for long answers speak only the first sentence and open the viewer. `cancel`
-    or pressing the talk key stops speech at once. Lower media volume (or pause
-    via playerctl) while speaking. Make it a toggle that is easy to reach (voice
-    command, Waybar click), because it's wanted at the desk only sometimes.
+    typed front end #4 in follow-up mode) and Open in viewer. Keep HTML and
+    remote-image disarming for regular Markdown answers.
+30. `[Important]` `[Upstream]` **Periodic memory & skill distillation
+    (`hey-computer distill`).** Dedicated CLI subcommand (run manually or via a
+    weekly background task) that reviews recent `history.db` turns (#17–#18)
+    against `instructions.memory_file` (#8) and proposes a minimal diff to
+    `memory.md` (promoting durable preferences/facts while respecting the
+    4,000-char cap and pruning stale entries) and/or draft `SKILL.md` files for
+    workflows repeated 3+ times. Pairs with the improved viewer (#29) so you
+    review and apply diffs manually — never auto-applied, avoiding skill
+    poisoning.
+31. `[Important]` `[Upstream]` **Optional audio feedback hook (`present.speak` /
+    earcons, streaming-ready).** For hands-free voice ergonomics, add an
+    optional `present.speak` hook (e.g. Piper or Kokoro) or subtle earcons that
+    can accept streamed sentence chunks as `agent_message_chunk` updates arrive
+    from `conductor.rs`, with `cancel` stopping playback immediately.
+32. `[Important]` **Optional spoken answers (streaming TTS).** Expands the
+    `present.speak` hook (#31). Use a local TTS engine (Piper or Kokoro) with a
+    German and an English voice, streaming completed sentences as chunks arrive
+    over ACP to cut time-to-first-audio (detecting DE vs EN on sentence 1).
+    Speak short answers whole; if subsequent chunks push past the short
+    threshold (or hit code blocks/tables), stop queuing further sentences and
+    open the viewer instead (never stream TTS on background or
+    `--suppress-token` turns). `cancel` or pressing the talk key stops speech at
+    once (and barge-in stops it once hotword detection lands). Lower media
+    volume (or pause via playerctl) while speaking. Make it a toggle that is
+    easy to reach (voice command, Waybar click), because it's wanted at the desk
+    only sometimes.
 
 ## Phase 6: Multi-mode isolation & reactive messaging
 
 Highest operational surface; best built once the single-mode daemon and its
 tooling are mature.
 
-26. `[Lower priority]` `[Upstream + Config]` **Native keyring wait
+33. `[Lower priority]` `[Upstream + Config]` **Native keyring wait
     (`agent.wait_for_keyring`).** Move the consumer's GNOME Keyring wait into
     the daemon before warm start so downstream Home Manager configs do not need
     to `mkForce` `ExecStart` (which otherwise silently masks future module
-    changes and complicates the systemd template unit in #27). Wait for
+    changes and complicates the systemd template unit in #34). Wait for
     `org.freedesktop.secrets` to be unlocked before warm start (avoiding a
     hidden gcr-prompter behind the lock screen timing out).
-27. `[Important]` **Work and personal modes.** A mode is a named profile of
+34. `[Important]` **Work and personal modes.** A mode is a named profile of
     everything the agent can reach: MCP servers, skills, instructions, vault,
     accounts and model.
-    - **Work:** the employer's Linear, GitLab, Slack and Google Calendar.
-    - **Personal:** personal Gmail and Google Calendar, WhatsApp, Signal.
+    - **Work:** the employer's Linear (official MCP with read/write access,
+      already wired via `mcp_oauth_tokens_file`), GitLab, Slack and Google
+      Calendar.
+    - **Personal:** personal Gmail and Google Calendar, private GitHub projects
+      (`gh`), WhatsApp, Signal.
 
     The simplest clean design is one daemon instance per mode (a systemd
     template unit, `hey-computer@work` / `hey-computer@personal`), each with its
@@ -140,7 +261,7 @@ tooling are mature.
     - **Work data policy.** Settled: the employer allows sending work data
       (Linear, GitLab, Slack, calendar) to the model service.
     - **GitLab write access.** Allowed directly without permission prompts.
-28. `[Important]` **Acting on incoming notifications (v1: notification text
+35. `[Important]` **Acting on incoming notifications (v1: notification text
     only).** Watch notifications (a D-Bus monitor on
     `org.freedesktop.Notifications`, or a hook in the notification daemon) for
     an allowlist of apps (WhatsApp, Signal, mail). For each one, start a
@@ -149,6 +270,12 @@ tooling are mature.
     focused chat window. Show the draft as a notification with Send / Edit /
     Dismiss actions. Rules:
     - **Never send automatically.** Sending is always a click.
+    - **Stateless checkpoint + single-use resume token.** Instead of holding an
+      idle process or ACP session open waiting for a click, persist each draft
+      checkpoint (draft text, target app/chat, single-use resume token, TTL) in
+      SQLite and let the drafting turn exit immediately; clicking Send / Edit
+      resumes idempotently by token and survives daemon restarts (reused by the
+      messenger bridge in #36).
     - **A restricted lane (decided: light, no OS sandbox).** These tasks run in
       their own ACP session with their own permission profile: the daemon
       refuses every `execute` and `edit` permission request and passes no MCP
@@ -157,10 +284,10 @@ tooling are mature.
     - **Cost and noise.** A cheap filter decides first whether a message
       deserves a model at all (sender allowlist, group chats off, quiet hours),
       with `HEARTBEAT_OK`-style suppression (#17) and a rate limit.
-    - **Only for the active mode** (#27), so work messages never get drafts from
+    - **Only for the active mode** (#34), so work messages never get drafts from
       the personal profile and the other way round.
-29. `[Important]` **Separate messenger bridge (WhatsApp / Signal) & phone
-    self-chat.** Worth adding once v1 drafts (#28) prove useful and need the
+36. `[Important]` **Separate messenger bridge (WhatsApp / Signal) & phone
+    self-chat.** Worth adding once v1 drafts (#35) prove useful and need the
     previous messages of a chat, or when you want to talk to hey-computer from
     your phone.
 
@@ -207,7 +334,7 @@ tooling are mature.
 
     **What this means for hey-computer.** The goal here differs from theirs: not
     a bot people message, but an assistant that reads *your* incoming messages
-    and drafts *your* replies (#28). That rules out a dedicated number: the
+    and drafts *your* replies (#35). That rules out a dedicated number: the
     bridge has to be a linked device on the personal account, which sees every
     chat. Suggested design:
 
@@ -225,17 +352,20 @@ tooling are mature.
 
 ## Independent track (slot in anytime)
 
-- `[Important]` `[npu-dictate]` **Hotword detection.** Always-on, local
-  detection of "Hey Computer", then recording until silence (VAD) and
+- `[Important]` `[npu-dictate]` **Hotword detection & TTS barge-in.** Always-on,
+  local detection of "Hey Computer", then recording until silence (VAD) and
   transcribing with the existing npu-dictate backend. Candidates for the
   detector are small wake-word models like openWakeWord (custom phrase training)
   running on the CPU or NPU. This probably belongs in npu-dictate rather than
   hey-computer, has no daemon dependencies, and can be tackled anytime after
   direct push-to-talk (#7) covers everyday voice ergonomics. Requirements: the
   audio stays local until the hotword fires; a visible mic indicator (Waybar); a
-  mute toggle; and pausing while another app has the mic (calls) or while media
-  is playing, to avoid false triggers. Measure the false-accept rate on real
-  speech in both languages before trusting it.
+  mute toggle; pausing while another app has the mic (calls) or while media is
+  playing, to avoid false triggers; and **barge-in** interrupting active TTS
+  playback (#32) immediately once speaking/wake-word fires (gated via PipeWire
+  `module-echo-cancel` / headphones or wake-word-only detection while TTS plays
+  to avoid speaker self-triggers). Measure the false-accept rate on real speech
+  in both languages before trusting it.
 
 ## Done
 
@@ -267,7 +397,7 @@ tooling are mature.
   live on `agy` 1.5.13), added a bounded FIFO background lane (`[tasks]`,
   `ask -b/--background`, `--suppress-token`, `cancel --id`, `tasks
   [list|show|open|copy|cancel]`, `last --lane`), completion notifications with
-  non-blocking **Open** actions, and `LanePolicy` hooks for #28.
+  non-blocking **Open** actions, and `LanePolicy` hooks for #35.
 - `[Important]` `[Upstream]` `[Done: 4b718d0]` **Local recall index (SQLite
   FTS5) (#18).** Added `hey-computer recall` (safe FTS5 query sanitization,
   BM25 + recency ranking, `--since`/`--until` relative/calendar filters,
