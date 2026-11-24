@@ -1,8 +1,15 @@
-//! MCP server resolution for ACP `session/new` `mcpServers`.
+//! MCP server configuration for `<agent_dir>/config/mcp_config.json`.
+//!
+//! `agy acp` 1.5.13 enables lazy MCP tool loading (`call_mcp_tool`, keeping
+//! full schemas on disk instead of inline in the prompt) only for servers
+//! configured in `<agent_dir>/config/mcp_config.json`; servers passed in
+//! `session/new` `mcpServers` are declared eagerly and silently truncated when
+//! their combined schemas exceed the eager budget.
 //!
 //! Secret environment variables (`env_files`) and HTTP headers (`header_files`)
-//! are read from disk at session-creation time so credentials never appear in
-//! `config.toml` or `/nix/store`. Resolved values are never logged.
+//! are read from disk at prepare time and written only to the private `0600`
+//! `mcp_config.json`, so credentials never appear in `config.toml` or
+//! `/nix/store`. Resolved values are never logged.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -11,81 +18,88 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::config::{Config, McpServer};
 
 /// Maximum bytes read from a single secret file (`env_files` / `header_files`).
 const MAX_SECRET_BYTES: usize = 16 * 1024;
 
-/// Build the ACP `mcpServers` array for `session/new`.
+/// Build the `{ "mcpServers": { ... } }` document written to
+/// `<agent_dir>/config/mcp_config.json`.
 ///
-/// Servers whose secret files are missing or unreadable are skipped with a
-/// warning (never logging secret values) so a missing optional token does not
-/// break the daemon.
-pub fn resolve_acp_servers(config: &Config, names: &[String], allow_mcp: bool) -> Vec<Value> {
-    if !allow_mcp || names.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for name in names {
-        let Some(server) = config.mcp.get(name) else {
-            continue;
-        };
+/// Returns `None` when no enabled servers resolve cleanly. Servers whose secret
+/// files are missing or unreadable are skipped with a warning (never logging
+/// secret values) so a missing optional token does not break the daemon.
+pub fn build_mcp_config(config: &Config) -> Option<Value> {
+    let mut servers = Map::new();
+    for (name, server) in &config.mcp {
         if !server.enabled {
             continue;
         }
-        match build_server_value(name, server) {
-            Ok(val) => out.push(val),
+        match build_server_entry(name, server) {
+            Ok(val) => {
+                servers.insert(name.clone(), val);
+            }
             Err(e) => {
                 tracing::warn!("skipping MCP server `{name}`: {e:#}");
             }
         }
     }
-    out
+    if servers.is_empty() {
+        None
+    } else {
+        Some(json!({ "mcpServers": servers }))
+    }
 }
 
-fn build_server_value(name: &str, server: &McpServer) -> Result<Value> {
+fn build_server_entry(name: &str, server: &McpServer) -> Result<Value> {
+    let mut entry = Map::new();
     if !server.command.is_empty() {
-        let env = resolve_kv_entries(name, "env", &server.env, &server.env_files)?;
-        return Ok(json!({
-            "name": name,
-            "command": server.command,
-            "args": server.args,
-            "env": env,
-        }));
+        let env = resolve_kv_map(name, "env", &server.env, &server.env_files)?;
+        entry.insert("type".to_string(), json!("stdio"));
+        entry.insert("command".to_string(), json!(server.command));
+        if !server.args.is_empty() {
+            entry.insert("args".to_string(), json!(server.args));
+        }
+        if !env.is_empty() {
+            entry.insert("env".to_string(), Value::Object(env));
+        }
+        entry.insert("enabled".to_string(), json!(true));
+        return Ok(Value::Object(entry));
     }
     let transport = if server.transport == "sse" {
         "sse"
     } else {
         "http"
     };
-    let headers = resolve_kv_entries(name, "header", &server.headers, &server.header_files)?;
-    Ok(json!({
-        "type": transport,
-        "name": name,
-        "url": server.url,
-        "headers": headers,
-    }))
+    let headers = resolve_kv_map(name, "header", &server.headers, &server.header_files)?;
+    entry.insert("type".to_string(), json!(transport));
+    // agy's config/mcp_config.json expects `serverUrl` for remote MCP servers.
+    entry.insert("serverUrl".to_string(), json!(server.url));
+    if !headers.is_empty() {
+        entry.insert("headers".to_string(), Value::Object(headers));
+    }
+    Ok(Value::Object(entry))
 }
 
-fn resolve_kv_entries(
+fn resolve_kv_map(
     server_name: &str,
     kind: &str,
     inline: &BTreeMap<String, String>,
     files: &BTreeMap<String, PathBuf>,
-) -> Result<Vec<Value>> {
-    let mut entries = Vec::with_capacity(inline.len() + files.len());
+) -> Result<Map<String, Value>> {
+    let mut map = Map::new();
     for (k, v) in inline {
-        entries.push(json!({"name": k, "value": v}));
+        map.insert(k.clone(), json!(v));
     }
     for (k, path) in files {
         let secret = read_secret_file(path).with_context(|| {
             format!("reading {kind} file for `{k}` on MCP server `{server_name}`")
         })?;
-        entries.push(json!({"name": k, "value": secret}));
+        map.insert(k.clone(), json!(secret));
     }
-    Ok(entries)
+    Ok(map)
 }
 
 fn read_secret_file(path: &Path) -> Result<String> {
@@ -168,27 +182,27 @@ mod tests {
         );
         config.validate().unwrap();
 
-        let names = vec![
-            "nixos".to_string(),
-            "remote".to_string(),
-            "broken".to_string(),
-        ];
-        // Restricted lanes get nothing.
-        assert!(resolve_acp_servers(&config, &names, false).is_empty());
+        let empty = Config::default();
+        assert!(build_mcp_config(&empty).is_none());
 
-        let resolved = resolve_acp_servers(&config, &names, true);
-        assert_eq!(resolved.len(), 2, "{resolved:?}");
-        assert_eq!(resolved[0]["name"], "nixos");
-        assert_eq!(resolved[0]["command"], "/bin/mcp-nixos");
+        let doc = build_mcp_config(&config).expect("mcp config built");
+        let servers = doc["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 2, "{servers:?}");
+        assert_eq!(servers["nixos"]["type"], "stdio");
+        assert_eq!(servers["nixos"]["command"], "/bin/mcp-nixos");
+        assert_eq!(servers["nixos"]["args"], json!(["--stdio"]));
         assert_eq!(
-            resolved[0]["env"],
-            json!([{"name": "PLAIN", "value": "1"}, {"name": "TOKEN", "value": "secret-value"}])
+            servers["nixos"]["env"],
+            json!({"PLAIN": "1", "TOKEN": "secret-value"})
         );
-        assert_eq!(resolved[1]["type"], "http");
-        assert_eq!(resolved[1]["url"], "https://mcp.example.test/mcp");
+        assert_eq!(servers["remote"]["type"], "http");
         assert_eq!(
-            resolved[1]["headers"],
-            json!([{"name": "Authorization", "value": "secret-value"}])
+            servers["remote"]["serverUrl"],
+            "https://mcp.example.test/mcp"
+        );
+        assert_eq!(
+            servers["remote"]["headers"],
+            json!({"Authorization": "secret-value"})
         );
 
         std::fs::remove_dir_all(&dir).unwrap();

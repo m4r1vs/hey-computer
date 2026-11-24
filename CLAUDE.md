@@ -66,10 +66,12 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   with RFC 4648 base64 encoding), enforcing `O_NONBLOCK | O_NOCTTY` regular-file
   checks and size caps (`8` files, `512 KiB` text, `10 MiB` image, `16 MiB`
   total raw bytes).
-- `mcp`: resolves `[mcp.<name>]` stdio/HTTP/SSE definitions into ACP
-  `session/new` `mcpServers` payloads, loading `env_files` / `header_files` at
-  runtime (trimmed, `16 KiB` cap, skipping servers with missing secret files
-  without logging secret values).
+- `mcp`: builds `<agent_dir>/config/mcp_config.json` (mode `0600`) from
+  `[mcp.<name>]` stdio/HTTP/SSE definitions, loading `env_files` / `header_files`
+  at prepare time (trimmed, `16 KiB` cap, skipping servers with missing secret
+  files without logging secret values). Per-profile `mcp_servers` allowlists
+  and restricted-lane MCP blocking are enforced on `call_mcp_tool` / `mcp_*`
+  permission requests in `policy.rs`.
 - `environment`: the agent's private `--gemini-dir` (settings.json, linked skills) and the
   workspace with the generated `AGENTS.md`. Rewritten before every agent start.
 - `context`: opt-in per-turn ambient time (`localtime_r`) and Hyprland active window/workspace
@@ -165,14 +167,21 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
 - Attachments (measured): `type: "image"` (including 6 MiB raw / 8 MiB base64 PNG) and
   `type: "resource"` (`TextResourceContents`) work; PDF `BlobResourceContents` is ignored
   by agy 1.5.13.
-- MCP passthrough (measured): `session/new` `mcpServers` supports `stdio`, `http`, and `sse`
-  (including `env` and `headers`), while `settings.json` `mcpServers` is ignored in ACP mode.
-  OAuth-authenticated remote HTTP MCP servers read tokens from
-  `<agent_dir>/antigravity-cli/mcp_oauth_tokens.json` (without it, `session/new` succeeds
-  silently with 0 tools for that server); `agent.mcp_oauth_tokens_file` symlinks an existing
-  token store into the private agent dir. MCP tool calls arrive with `kind: "other"` and
-  `name: "mcp_<server>_<tool>"`. Stdio MCP children persist across `session/close` until
-  `agy` exits (cleaned up by `Connection`'s process-group kill).
+- MCP loading (measured on agy 1.5.13): servers passed in ACP `session/new` `mcpServers`
+  are declared **eagerly** with `call_mcp_tool` absent; when combined schemas exceed the
+  eager budget (~87 smallest tools / ~1 KB each across 197 tools), larger tools (e.g.
+  `slack` `conversations_history` and `nixos` `nix`) are silently dropped. Writing servers
+  to `<agent_dir>/config/mcp_config.json` (`serverUrl` for HTTP/SSE, `command`/`args`/`env`
+  for stdio) and sending `mcpServers: []` on `session/new` enables `call_mcp_tool` lazy
+  loading with all tools intact and schemas kept on disk. OAuth-authenticated remote HTTP
+  MCP servers read tokens from `<agent_dir>/antigravity-cli/mcp_oauth_tokens.json` (without
+  it, `session/new` succeeds silently with 0 tools for that server);
+  `agent.mcp_oauth_tokens_file` symlinks an existing token store into the private agent dir.
+  Lazy `call_mcp_tool` permission requests arrive with `name: "call_mcp_tool"`,
+  `kind: "execute"`, and `rawInput: {ServerName, ToolName, Arguments}` (so `acp::tool_command`
+  explicitly excludes `call_mcp_tool`, and `LanePolicy` gates `ServerName`). Stdio MCP
+  children persist across `session/close` until `agy` exits (cleaned up by `Connection`'s
+  process-group kill).
 
 ## Testing
 

@@ -109,7 +109,19 @@ pub fn prepare(config: &Config) -> Result<Paths> {
     write_file(&settings_dir.join("settings.json"), &settings)?;
     link_mcp_oauth_tokens(&settings_dir, &config.agent.mcp_oauth_tokens_file)?;
 
-    let skills_dir = paths.agent_dir.join("config").join("skills");
+    let config_dir = paths.agent_dir.join("config");
+    private_dir(&config_dir)?;
+    let mcp_config_path = config_dir.join("mcp_config.json");
+    if let Some(mcp_cfg) = crate::mcp::build_mcp_config(config) {
+        let json = serde_json::to_string_pretty(&mcp_cfg)?;
+        write_file(&mcp_config_path, &json)?;
+    } else if let Err(e) = std::fs::remove_file(&mcp_config_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(e).with_context(|| format!("removing stale {}", mcp_config_path.display()));
+    }
+
+    let skills_dir = config_dir.join("skills");
     link_skills(&skills_dir, &config.instructions.skills)?;
 
     clear_keyring_unavailable(&paths.agent_dir);

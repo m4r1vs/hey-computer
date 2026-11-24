@@ -636,14 +636,47 @@ fn redact_outbound_for_trace(line: &str) -> String {
     value.to_string()
 }
 
+/// Extract the target MCP server name from a lazy `call_mcp_tool` call, if any.
+pub fn mcp_server_name(call: &Value) -> Option<String> {
+    if call.get("name").and_then(Value::as_str) != Some("call_mcp_tool") {
+        return None;
+    }
+    ["rawInput", "args"].into_iter().find_map(|key| {
+        call.get(key)
+            .and_then(|input| input.get("ServerName").or_else(|| input.get("serverName")))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    })
+}
+
+/// Extract the target MCP tool name from a lazy `call_mcp_tool` call, if any.
+pub fn mcp_tool_name(call: &Value) -> Option<String> {
+    if call.get("name").and_then(Value::as_str) != Some("call_mcp_tool") {
+        return None;
+    }
+    ["rawInput", "args"].into_iter().find_map(|key| {
+        call.get(key)
+            .and_then(|input| input.get("ToolName").or_else(|| input.get("toolName")))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    })
+}
+
 /// The shell command on a `toolCall` object, if it is one.
 ///
 /// Scoped to shell-execution tool calls (`kind == "execute"` or
-/// `name == "run_command"`) so non-shell tools such as MCP tools that happen
-/// to take a `command` parameter are never misparsed as shell commands.
+/// `name == "run_command"`) and explicitly excludes `call_mcp_tool` (which
+/// `agy` labels `kind: "execute"`) so MCP tools are never misparsed as shell
+/// commands.
 pub fn tool_command(call: &Value) -> Option<String> {
-    let is_execute = call.get("kind").and_then(Value::as_str) == Some("execute")
-        || call.get("name").and_then(Value::as_str) == Some("run_command");
+    let name = call.get("name").and_then(Value::as_str);
+    if name == Some("call_mcp_tool") {
+        return None;
+    }
+    let is_execute =
+        call.get("kind").and_then(Value::as_str) == Some("execute") || name == Some("run_command");
     if !is_execute {
         return None;
     }
@@ -704,6 +737,16 @@ pub fn tool_progress(tool_call: &Value) -> Option<String> {
     let raw_title = tool_call.get("title").and_then(Value::as_str);
     if is_update && raw_title.is_none() {
         return None;
+    }
+
+    if tool_call.get("name").and_then(Value::as_str) == Some("call_mcp_tool") {
+        let label = match (mcp_server_name(tool_call), mcp_tool_name(tool_call)) {
+            (Some(server), Some(tool)) => format!("{server}: {tool}"),
+            (Some(server), None) => format!("MCP: {server}"),
+            (None, Some(tool)) => format!("MCP: {tool}"),
+            (None, None) => raw_title.unwrap_or("Calling MCP tool…").to_string(),
+        };
+        return sanitize_status(&label, PROGRESS_STATUS_CHARS);
     }
 
     let kind = tool_call
@@ -1128,5 +1171,30 @@ mod tests {
             SessionEvent::Update(u) => assert_eq!(u["sessionUpdate"], "usage_update"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn lazy_call_mcp_tool_is_not_parsed_as_shell_command_and_formats_clean_progress() {
+        let call = json!({
+            "sessionUpdate": "tool_call",
+            "name": "call_mcp_tool",
+            "kind": "execute",
+            "title": "MCP Tool conversations_history",
+            "rawInput": {
+                "ServerName": "slack",
+                "ToolName": "conversations_history",
+                "Arguments": {"channel_id": "C123", "command": "sudo rm -rf /"}
+            }
+        });
+        assert_eq!(tool_command(&call), None);
+        assert_eq!(mcp_server_name(&call).as_deref(), Some("slack"));
+        assert_eq!(
+            mcp_tool_name(&call).as_deref(),
+            Some("conversations_history")
+        );
+        assert_eq!(
+            tool_progress(&call).as_deref(),
+            Some("slack: conversations_history")
+        );
     }
 }

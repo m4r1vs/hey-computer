@@ -1004,7 +1004,10 @@ impl Conductor {
         };
         let config = Arc::clone(&self.config);
         let context_provider = Arc::clone(&self.context);
-        let policy = Arc::clone(&self.policy);
+        let policy = Arc::new(
+            self.policy
+                .with_mcp_servers(Some(resolved.mcp_servers.clone())),
+        );
         let presenter = (!ask.background && matches!(ask.sink, Sink::Present))
             .then(|| Arc::clone(&self.presenter));
         let done_tx = self.done_tx.clone();
@@ -1647,18 +1650,22 @@ impl Conductor {
     async fn new_session(
         &mut self,
         resolved: &ResolvedProfile,
-        allow_mcp: bool,
+        _allow_mcp: bool,
     ) -> Result<String, Outcome> {
         let started = Instant::now();
-        let mcp_servers =
-            crate::mcp::resolve_acp_servers(&self.config, &resolved.mcp_servers, allow_mcp);
         let (Some(live), Some(paths)) = (&self.live, &self.paths) else {
             return Err(Outcome::failed(
                 FailReason::AgentDown,
                 "the assistant is not running",
             ));
         };
-        let params = json!({"cwd": paths.workspace, "mcpServers": mcp_servers});
+        // MCP servers are written to `<agent_dir>/config/mcp_config.json` in
+        // `environment::prepare()` so `agy acp` 1.5.13 enables lazy
+        // `call_mcp_tool` loading instead of eagerly declaring and truncating
+        // large tool schemas. Per-profile `mcp_servers` allowlists and
+        // restricted-lane blocking are enforced by `LanePolicy` on every
+        // `call_mcp_tool` / `mcp_*` permission request.
+        let params = json!({"cwd": paths.workspace, "mcpServers": []});
         let result = live.conn.call("session/new", params, START_TIMEOUT).await;
         let result = match result {
             Ok(result) => result,

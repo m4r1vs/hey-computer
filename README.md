@@ -85,6 +85,7 @@ from any agy you use by hand. Nothing is written to `~/.gemini`.
 $XDG_STATE_HOME/hey-computer/          (default ~/.local/state/hey-computer)
   agy/                                 --gemini-dir
     antigravity-cli/settings.json      rewritten before every agent start
+    config/mcp_config.json             generated (mode 0600) when [mcp.*] is set
     config/skills/<name>/…             links to the configured skills
   workspace/                           every session's working directory
     AGENTS.md                          the instructions, generated
@@ -314,10 +315,12 @@ suppressed_days = 7                 # prune suppressed heartbeat turns older tha
 # thinking_label = "Pondering Hard…"  # optional custom progress notification summary
 # mcp_servers = ["nixos"]             # omit to inherit all enabled [mcp.*] servers; [] passes none
 
-# MCP servers passed to `agy acp` in `session/new` (`mcpServers`).
+# MCP servers written to `<agent_dir>/config/mcp_config.json` (mode 0600) so
+# `agy acp` loads their schemas lazily via `call_mcp_tool` without truncating
+# large tool sets.
 # Stdio servers set `command` (+ optional `args`, `env`, `env_files`);
 # remote servers set `url` (+ optional `transport` = "http"|"sse", `headers`, `header_files`).
-# Secret files in `env_files` / `header_files` are read at runtime (trimmed, max 16 KiB)
+# Secret files in `env_files` / `header_files` are read at prepare time (trimmed, max 16 KiB)
 # so tokens never enter config.toml or /nix/store.
 # [mcp.nixos]
 # enabled = true

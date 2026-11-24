@@ -137,6 +137,9 @@ pub struct LanePolicy {
     pub deny_commands: Policy,
     pub deny_tool_kinds: Vec<String>,
     pub allow_mcp: bool,
+    /// Optional per-turn allowlist of MCP server names (`None` allows all
+    /// configured servers when `allow_mcp` is true).
+    pub allowed_mcp_servers: Option<Vec<String>>,
 }
 
 impl LanePolicy {
@@ -145,6 +148,7 @@ impl LanePolicy {
             deny_commands: Policy::new(deny),
             deny_tool_kinds: Vec::new(),
             allow_mcp: true,
+            allowed_mcp_servers: None,
         }
     }
 
@@ -157,7 +161,15 @@ impl LanePolicy {
                 .map(String::from)
                 .to_vec(),
             allow_mcp: false,
+            allowed_mcp_servers: None,
         }
+    }
+
+    /// Return a copy of this policy scoped to a specific MCP server allowlist.
+    pub fn with_mcp_servers(&self, allowed: Option<Vec<String>>) -> Self {
+        let mut copy = self.clone();
+        copy.allowed_mcp_servers = allowed;
+        copy
     }
 
     pub fn evaluate_permission(&self, params: &serde_json::Value) -> PermissionDecision {
@@ -175,6 +187,56 @@ impl LanePolicy {
     }
 
     fn evaluate_tool_call(&self, tool_call: &serde_json::Value) -> PermissionDecision {
+        let name = tool_call.get("name").and_then(serde_json::Value::as_str);
+        // Handle MCP tool calls before `deny_tool_kinds` / shell deny-list
+        // checks because `agy` sends lazy `call_mcp_tool` calls with
+        // `kind: "execute"`.
+        if name == Some("call_mcp_tool") {
+            let server = crate::acp::mcp_server_name(tool_call);
+            let tool = crate::acp::mcp_tool_name(tool_call);
+            let detail = match (&server, &tool) {
+                (Some(s), Some(t)) => format!("mcp:{s}/{t}"),
+                (Some(s), None) => format!("mcp:{s}"),
+                _ => "call_mcp_tool".to_string(),
+            };
+            if !self.allow_mcp {
+                return PermissionDecision::Deny {
+                    tag: "mcp".to_string(),
+                    detail,
+                };
+            }
+            if let Some(allowed) = &self.allowed_mcp_servers
+                && !server
+                    .as_deref()
+                    .is_some_and(|s| allowed.iter().any(|a| a == s))
+            {
+                return PermissionDecision::Deny {
+                    tag: "mcp".to_string(),
+                    detail,
+                };
+            }
+            return PermissionDecision::Allow;
+        }
+        if let Some(mcp_name) = name.filter(|n| n.starts_with("mcp_")) {
+            if !self.allow_mcp {
+                return PermissionDecision::Deny {
+                    tag: "mcp".to_string(),
+                    detail: mcp_name.to_string(),
+                };
+            }
+            if let Some(allowed) = &self.allowed_mcp_servers
+                && !allowed
+                    .iter()
+                    .any(|s| mcp_name.starts_with(&format!("mcp_{s}_")))
+            {
+                return PermissionDecision::Deny {
+                    tag: "mcp".to_string(),
+                    detail: mcp_name.to_string(),
+                };
+            }
+            return PermissionDecision::Allow;
+        }
+
         let kind = tool_call
             .get("kind")
             .and_then(serde_json::Value::as_str)
@@ -192,15 +254,6 @@ impl LanePolicy {
             return PermissionDecision::Deny {
                 tag: kind.to_string(),
                 detail,
-            };
-        }
-        if !self.allow_mcp
-            && let Some(name) = tool_call.get("name").and_then(serde_json::Value::as_str)
-            && name.starts_with("mcp_")
-        {
-            return PermissionDecision::Deny {
-                tag: "mcp".to_string(),
-                detail: name.to_string(),
             };
         }
         if let Some(cmd) = command
@@ -1000,6 +1053,11 @@ mod tests {
             json!({"toolCall": {"kind": "delete", "title": "notes.md"}}),
             json!({"toolCall": {"kind": "move", "title": "notes.md"}}),
             json!({"toolCall": {"kind": "other", "name": "mcp_slack_post"}}),
+            json!({"toolCall": {
+                "kind": "execute",
+                "name": "call_mcp_tool",
+                "rawInput": {"ServerName": "slack", "ToolName": "conversations_history"}
+            }}),
         ] {
             assert!(
                 matches!(
@@ -1009,6 +1067,25 @@ mod tests {
                 "{blocked} should be denied in restricted lane"
             );
         }
+        // Per-profile MCP allowlists gate `call_mcp_tool` by ServerName.
+        let scoped = std_lane.with_mcp_servers(Some(vec!["nixos".to_string()]));
+        assert_eq!(
+            scoped.evaluate_permission(&json!({"toolCall": {
+                "kind": "execute",
+                "name": "call_mcp_tool",
+                "rawInput": {"ServerName": "nixos", "ToolName": "nix"}
+            }})),
+            PermissionDecision::Allow
+        );
+        assert!(matches!(
+            scoped.evaluate_permission(&json!({"toolCall": {
+                "kind": "execute",
+                "name": "call_mcp_tool",
+                "rawInput": {"ServerName": "slack", "ToolName": "conversations_history"}
+            }})),
+            PermissionDecision::Deny { ref tag, ref detail }
+                if tag == "mcp" && detail == "mcp:slack/conversations_history"
+        ));
         for allowed in [
             json!({"toolCall": {"kind": "read", "title": "notes.md"}}),
             json!({"toolCall": {"kind": "search", "title": "grep"}}),

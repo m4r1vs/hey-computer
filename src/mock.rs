@@ -79,6 +79,10 @@ pub enum Step {
         summary: Option<String>,
         #[serde(default = "default_execute_kind")]
         kind: String,
+        /// When set, emit an `agy`-style lazy `call_mcp_tool` permission for
+        /// this MCP server (`command` becomes `ToolName`).
+        #[serde(default)]
+        server: Option<String>,
     },
     /// A non-permission tool call (`tool_call` followed by completed `tool_call_update`).
     ToolCall {
@@ -527,21 +531,27 @@ impl Mock {
                     command,
                     summary,
                     kind,
+                    server,
                 } => {
                     let call = format!("call_{}", self.next_request.load(Ordering::Relaxed));
-                    let mut input = if kind == "execute" {
-                        json!({"CommandLine": command, "WaitMsBeforeAsync": 5000})
+                    let (tool_name, title, mut input) = if let Some(server) = server {
+                        (
+                            "call_mcp_tool",
+                            format!("MCP Tool {command}"),
+                            json!({"ServerName": server, "ToolName": command, "Arguments": {}}),
+                        )
+                    } else if kind == "execute" {
+                        (
+                            "run_command",
+                            command.clone(),
+                            json!({"CommandLine": command, "WaitMsBeforeAsync": 5000}),
+                        )
                     } else {
-                        json!({"target": command})
+                        ("tool_action", command.clone(), json!({"target": command}))
                     };
                     if let Some(summary) = &summary {
                         input["toolSummary"] = json!(summary);
                     }
-                    let tool_name = if kind == "execute" {
-                        "run_command"
-                    } else {
-                        "tool_action"
-                    };
                     let tool = json!({
                         "sessionUpdate": "tool_call",
                         "toolCallId": call,
@@ -549,7 +559,7 @@ impl Mock {
                         "args": input,
                         "status": "pending",
                         "kind": kind,
-                        "title": command,
+                        "title": title,
                         "rawInput": input,
                     });
                     self.update(&session, tool.clone());

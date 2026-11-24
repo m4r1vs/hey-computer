@@ -1858,15 +1858,37 @@ async fn suppress_token_silences_heartbeats_and_notifies_on_alerts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_servers_are_passed_per_profile_and_switch_session_when_mcp_set_changes() {
+async fn mcp_config_is_written_privately_and_profile_mcp_allowlist_is_enforced() {
     use hey_computer::config::{McpServer, Profile};
+    use std::os::unix::fs::PermissionsExt;
 
-    let h = Harness::start(SCRIPT, |c| {
+    let script = r#"{
+        "turns": [
+            {
+                "match": "call_nixos",
+                "steps": [
+                    {"permission": {"command": "nix", "server": "nixos"}},
+                    {"chunk": "nixos ok"}
+                ]
+            }
+        ],
+        "default": ["turn_info"]
+    }"#;
+
+    let h = Harness::start(script, |c| {
         c.mcp.insert(
             "nixos".to_string(),
             McpServer {
                 enabled: true,
                 command: "/bin/mcp-nixos".to_string(),
+                ..McpServer::default()
+            },
+        );
+        c.mcp.insert(
+            "linear".to_string(),
+            McpServer {
+                enabled: true,
+                url: "https://mcp.linear.app/mcp".to_string(),
                 ..McpServer::default()
             },
         );
@@ -1879,17 +1901,30 @@ async fn mcp_servers_are_passed_per_profile_and_switch_session_when_mcp_set_chan
         );
     })
     .await;
-    // Warm spare opens with all enabled MCP servers (`nixos`).
-    h.wait_log("new mock-1 mcp=[nixos]").await;
+    // Sessions pass empty `mcpServers` on `session/new` so agy enables lazy `call_mcp_tool`.
+    h.wait_log("new mock-1").await;
+    assert_eq!(h.log_count("new mock-1 mcp="), 0);
 
-    // Default ask consumes mock-1 with nixos attached.
-    assert_eq!(answer(&h.ask("turn", false).await), "turn 1 in mock-1");
+    // `<agent_dir>/config/mcp_config.json` carries all enabled servers with mode 0600.
+    let mcp_path = h.dir.join("state/agy/config/mcp_config.json");
+    let meta = std::fs::metadata(&mcp_path).expect("mcp_config.json created");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp_path).unwrap()).unwrap();
+    assert_eq!(doc["mcpServers"]["nixos"]["command"], "/bin/mcp-nixos");
+    assert_eq!(
+        doc["mcpServers"]["linear"]["serverUrl"],
+        "https://mcp.linear.app/mcp"
+    );
 
-    // Follow-up switching to `lean` (different MCP set) must open a fresh session with no MCP servers.
+    // Default profile allows `call_mcp_tool` for `nixos`.
+    assert_eq!(answer(&h.ask("call_nixos", false).await), "nixos ok");
+
+    // Switching to `lean` (`mcp_servers = []`) denies `call_mcp_tool` for `nixos`.
     let (_, mut client) = ipc::ask_request(
         &h.socket,
         &Request::Ask {
-            text: "turn".to_string(),
+            text: "call_nixos".to_string(),
             wait: true,
             new: false,
             profile: Some("lean".to_string()),
@@ -1901,9 +1936,8 @@ async fn mcp_servers_are_passed_per_profile_and_switch_session_when_mcp_set_chan
     .await
     .unwrap();
     let reply = client.next(Some(Duration::from_secs(10))).await.unwrap();
-    assert_eq!(answer(&reply), "turn 1 in mock-2");
-    h.wait_log("close mock-1").await;
-    assert_eq!(h.log_count("new mock-2 mcp="), 0);
-    assert_eq!(h.log_count("new mock-2"), 1);
+    let (reason, msg) = failure(&reply);
+    assert_eq!(reason, FailReason::Denied);
+    assert!(msg.contains("mcp:nixos/nix"), "{msg}");
     h.stop().await;
 }
