@@ -43,137 +43,9 @@ All Phase 2 items (#8–#14) are implemented and listed under [Done](#done).
 
 All Phase 3 items (#15–#19) are implemented and listed under [Done](#done).
 
-## Phase 4: Integrations, context, hardening & smart routing
+## Phase 4: Integrations, context, hardening & smart routing — Implemented
 
-Built on background tasks (#17), profiles (#15), and MCP passthrough (#19). Per
-the trust policy above, no daemon-level permission prompts are used — actions
-execute directly, and permission prompts can be added later if ever needed.
-
-**MCP vs. CLI rule of thumb:** Don't turn stateless one-liner CLIs into MCP
-servers. Keep small local CLIs (lights, media, desktop toggles, `yt-dlp`, `gh`)
-as `SKILL.md` scripts with zero turn-1 schema tokens; reserve MCP for stateful
-OAuth/remote APIs or structured schema introspection, and keep heavy MCPs off
-the default `fast` voice profile using per-profile `mcp_servers` (#15). For
-NixOS packaging, evaluate
-[`natsukium/mcp-servers-nix`](https://github.com/natsukium/mcp-servers-nix) for
-pinned `/nix/store` derivations wired straight into
-`programs.hey-computer.mcp.servers` instead of shelling out to `npx` at runtime.
-
-20. `[Important]` `[Config]` **Google Calendar.** Reading ("what's on tomorrow",
-    "when is my next meeting") and creating, moving, or deleting events. Target
-    **`taylorwilsdon/google_workspace_mcp`** (MIT, supports `stdio`/HTTP,
-    trimmed via `--tool-tier core` and/or `X-MCP-Toolsets` headers to cap schema
-    bloat), keeping OAuth tokens managed by the server outside the model's
-    context.
-21. `[Important]` `[Config]` **Gmail.** Search, summarise ("anything important
-    since this morning?"), draft, and send replies without permission prompts —
-    served through **`taylorwilsdon/google_workspace_mcp`** alongside #20
-    (unlike Google's hosted Developer Preview Gmail MCP, which focuses on
-    read/label/draft rather than full sending).
-22. `[Important]` `[Config]` **Context7 MCP (`deep`), `yt-dlp` / `gh` CLI
-    skills, & built-in `agy` `/browser`.**
-    - **Context7 MCP** mounted on the `deep` profile (2 tools, ~4.9k chars) to
-      pull up-to-date library/framework docs into context instead of relying on
-      stale model weights.
-    - **`yt-dlp` CLI + `SKILL.md`** (no YouTube MCP for now) writing
-      subtitles/transcripts to disk under `$HEY_COMPUTER_STATE_DIR/artifacts/`
-      (#24) so 60+ minute videos don't hit MCP response size limits and cost
-      zero turn-1 schema tokens.
-    - **`gh` CLI + `SKILL.md`** (no GitHub MCP for now) for GitHub repos,
-      issues, and PRs — GitHub is used frequently for private/personal projects
-      (pairs with Personal mode in #34).
-    - **Built-in `agy` `/browser` verification & fine-tuning:** Antigravity CLI
-      already ships a `/browser` command and isolated `browser` subagent that
-      attaches to local Chrome (v144+, `chrome://inspect/#remote-debugging`) via
-      Chrome DevTools MCP with zero turn-1 schema cost. Verify and fine-tune how
-      it works through `agy acp` (putting `nodejs`/`npx` on `extraPackages`
-      `PATH`, Chrome remote debugging, and browser actuation settings) instead
-      of adding a separate browser MCP.
-23. `[Important]` `[Upstream + Config]` **Focused-window CWD & Ghostty/`tmux`
-    ambient context + `tmux` skill.** Extend `[context] desktop` (#13) so that
-    when the focused window is a terminal or editor, ambient context resolves
-    its working directory, and when the focused window is **Ghostty** (where
-    `tmux` auto-starts), includes lightweight `tmux` context as well. Pair this
-    with a **`tmux` skill** so the agent can query pane content/metadata
-    directly — enabling hands-free prompts like *"Explain this function"* to get
-    context from `tmux` and read the entire open file instead of relying on OCR.
-24. `[Important]` `[Upstream + Config]` **Artifacts directory & CLI large-output
-    offloading (`$HEY_COMPUTER_STATE_DIR/artifacts/`).** Because `hey-computer`
-    is an ACP client that does not intercept `agy`'s internal tool execution, it
-    cannot rewrite MCP/shell tool outputs directly. Instead, have the daemon
-    create a private `0700` `$HEY_COMPUTER_STATE_DIR/artifacts/` directory with
-    automatic age pruning on agent start (alongside `history_days`), document it
-    in `BUILT_IN`, and follow the convention in bulky CLI skills (`yt-dlp`,
-    `tmux`, etc.) of writing outputs above ~16 KB to disk and returning a
-    truncated preview + path for `rg`/`read_file`.
-25. `[Important]` `[Upstream]` **Daemon hardening: consecutive tool-loop
-    detection, live `memory.md` capacity header, & SQLite/FTS5 maintenance.**
-    - **Consecutive tool-loop detection:** Add a lightweight repeat guard inside
-      `ToolTracker` (`src/conductor.rs`, e.g. `agent.max_repeat_tool_calls = 3`,
-      `0` disables) comparing each distinct `toolCallId`'s canonicalized tool
-      name/kind and normalized JSON arguments (ignoring key order), aborting
-      wedged retry loops via `limit_reached` in 3 steps instead of burning all
-      20 (#9).
-    - **Live `memory.md` capacity header:** When `environment::prepare()` builds
-      `AGENTS.md` on agent start (#8), include a capacity header (e.g.
-      `MEMORY: 2,840 / 4,000 chars (71%)`) so the model consolidates or prunes
-      stale entries instead of blindly hitting truncation, while preserving
-      frozen-snapshot prompt caching.
-    - **Automatic SQLite / FTS5 maintenance:** Periodically merge FTS5 segments
-      (`INSERT INTO turns_fts(turns_fts) VALUES('optimize')`) and run
-      `PRAGMA optimize` / safe `VACUUM` in `src/store.rs` on daemon start or
-      maintenance windows so `history.db` stays compact and `recall` stays fast.
-26. `[Important]` `[Config]` **Shell-gated proactive timers (wiring up `#17`'s
-    `--suppress-token` + split failure routing).** Systemd user timers / session
-    hooks that run cheap shell pre-checks first and only wake
-    `hey-computer ask -b --suppress-token HEARTBEAT_OK` when state warrants it:
-    - **Morning digest:** triggered a couple minutes after first wake in the
-      morning (once per day), writing a concise brief of today's calendar, mail,
-      and mentions to `Journal/YYYY-MM-DD.md` and/or firing a notification.
-    - **Location-aware work-schedule checks:** cheap IP check detecting whether
-      the machine is **at home**, **at work**, or **neither**, used to gate
-      proactive checks on the work schedule (and later tie into Work/Personal
-      modes in #34).
-    - **Pre-daily brief:** triggered a couple minutes before the **10:00 daily**
-      standup (gated to workdays / work schedule).
-    - **Split failure routing:** Clean no-ops stay silent via `HEARTBEAT_OK`,
-      while hard failures (expired OAuth token, network down, script crash)
-      route separately (dedicated alert/log or rate-limited failure notice)
-      instead of vanishing silently or spamming every interval.
-27. `[Important]` `[Upstream]` **Agent-authored hybrid scheduler.** Complement
-    declarative Nix timers (#26) with a SQLite-backed scheduler inside the
-    daemon so the agent itself can create, list, pause, edit, and test-run
-    ad-hoc recurring or temporary jobs (e.g. *"check this PR every 15 minutes
-    until CI passes"*, *"remind me every Friday at 16:00"*) without editing Nix
-    config. Support optional `--script` pre-collectors (wake the LLM only when
-    `stdout` is non-empty), zero-token `no_agent` jobs (run a script and notify
-    directly with no LLM call), and split failure routing (`--failure-deliver`).
-    Keeping jobs inside the daemon's SQLite store also keeps them cleanly
-    isolated per mode once Work/Personal modes land (#34).
-28. `[Important]` `[Upstream]` **Automatic model, effort, and lane routing
-    (profile + background inference).** Builds on model and effort profiles
-    (#15), attachments (#16), and background tasks (#17) so the user rarely
-    needs explicit `/deep` or `/bg` prefixes. Options, cheapest first:
-    - **Heuristics:** length of the request, keywords ("explain", "debug",
-      "research", "derive", "compare", "write a report"), attachments → `deep`;
-      short desktop commands → `fast`; long multi-step or research requests →
-      automatically route to the background lane (`--background`) so quick
-      follow-up voice commands stay unblocked.
-    - **Escalation on failure:** start fast; if a tool fails, the answer is
-      empty, or the follow-up starts with "no, …", retry the follow-up on the
-      deeper profile.
-    - **A triage turn (non-voice inputs only):** the fast model classifies the
-      request with both a profile (`fast` vs `deep`) and a lane (`interactive`
-      vs `background`) before the real turn when heuristics are unsure. **Never
-      run LLM triage on voice inputs** (`SUPER + ALT + v`, voice prefix, or
-      future hotword detection once implemented) so voice stays zero-overhead;
-      keep it only for typed/CLI/other front ends (`rofi-ask` `SUPER + a`, CLI,
-      future phone self-chat).
-
-    Model and thought level are set per session (`session/set_config_option`),
-    and mid-conversation switching is confirmed to work on `agy` 1.5.13, so
-    routing both new sessions and follow-up escalations is cheap. Show which
-    profile answered in the notification, so wrong routing is visible.
+All Phase 4 items (#20–#28) are implemented and listed under [Done](#done).
 
 ## Phase 5: Better output UX (viewer, distillation & spoken answers)
 
@@ -369,6 +241,63 @@ tooling are mature.
 
 ## Done
 
+- `[Important]` `[Config]` `[Done: NixConfig 89ccf19]` **Google Calendar & Gmail
+  MCP (#20, #21).** Packaged `taylorwilsdon/google_workspace_mcp` (`v1.30.1`,
+  MIT) in `nixpkgs.nix` and wired `programs.configured.mcp.googleWorkspace`
+  (`--transport stdio --single-user --tool-tier extended --tools gmail calendar`,
+  keeping OAuth credentials in a `0700` state dir outside `/nix/store` and model
+  context) plus `mcp(google-workspace/*)` in `antigravity-cli.nix`.
+- `[Important]` `[Config]` `[Done: NixConfig 89ccf19]` **Context7 MCP (`deep`),
+  `yt-dlp` / `gh` CLI skills, & built-in `agy` `/browser` (#22).** Wired
+  `pkgs.context7-mcp` (`programs.configured.mcp.context7`, excluded from
+  `profiles.fast.mcp_servers` alongside `nixos` while inherited by `deep`),
+  added `yt-dlp`, `gh`, and `nodejs` (`node`/`npx` for `agy` `/browser`) to
+  `extraPackages`, and added `yt-dlp/SKILL.md` and `gh/SKILL.md` offloading
+  bulky transcripts, diffs, and CI logs to `$HEY_COMPUTER_ARTIFACTS_DIR/`.
+- `[Important]` `[Upstream + Config]` `[Done: cfd2f5e, NixConfig 89ccf19]`
+  **Focused-window CWD & Ghostty/`tmux` ambient context + `tmux` skill (#23).**
+  Extended `src/context.rs` to parse active window PID, walk `/proc`
+  descendants (bounded, zero subprocesses), match Ghostty/terminal `tmux`
+  clients (`tmux list-clients` / `list-panes`), resolve `/proc/<pid>/cwd` for
+  terminals/editors, and emit sanitized `active_window_cwd` and `tmux_*`
+  fields; added bundled `skills/tmux/SKILL.md` and `programs.hey-computer.tmux`.
+- `[Important]` `[Upstream + Config]` `[Done: cfd2f5e, NixConfig 89ccf19]`
+  **Artifacts directory & large-output offloading (#24).** Created private
+  `0700` `<state_dir>/artifacts/` with `history_days` age pruning (via
+  `symlink_metadata`, without following symlinks), exported
+  `HEY_COMPUTER_ARTIFACTS_DIR`, displayed it in `debug prepare`, and documented
+  offloading bulky outputs (> ~16 KB) in `BUILT_IN`.
+- `[Important]` `[Upstream]` `[Done: cfd2f5e]` **Daemon hardening (#25).**
+  Added `ToolTracker` consecutive identical tool-call loop detection
+  (`agent.max_repeat_tool_calls = 3`, canonical sorted JSON arguments with
+  `tool_call` -> `request_permission` arg upgrade), live
+  `MEMORY: <used> / <max> chars (<pct>%)` capacity header in `AGENTS.md`, and
+  automatic SQLite/FTS5 maintenance (`turns_fts('optimize')`, `PRAGMA optimize`,
+  `PRAGMA incremental_vacuum(256)`) on start, every 100 turns, and shutdown.
+- `[Important]` `[Config]` `[Done: NixConfig 89ccf19]` **Shell-gated proactive
+  timers & split failure routing (#26).** Added `hey-computer-proactive`
+  (`location`, `morning-digest`, `pre-daily`) and gated systemd user timers
+  (`programs.configured.hey-computer.proactive.enable`), keeping clean no-ops
+  silent via `--suppress-token HEARTBEAT_OK` while routing hard errors to
+  `$XDG_STATE_HOME/hey-computer/proactive/failures.log` + a 4-hour rate-limited
+  alert notification.
+- `[Important]` `[Upstream]` `[Done: cfd2f5e]` **Agent-authored hybrid
+  scheduler (#27).** Bumped `history.db` to schema v2 (`schedules` table +
+  in-place `v1 -> v2` migration), added `[scheduler]` and `src/scheduler.rs`
+  (human specs + 5-field local-time cron, `--script` pre-collectors with
+  `Policy::denied_word` validation and 0-token empty skips, `--no-agent` timed
+  reminders, split `--failure-deliver` with exponential backoff), added
+  `hey-computer schedule [add|list|show|edit|pause|resume|remove|run]`, and
+  bundled `skills/schedule/SKILL.md` (`programs.hey-computer.schedule.enable`).
+- `[Important]` `[Upstream + Config]` `[Done: cfd2f5e, NixConfig 89ccf19]`
+  **Automatic model, effort, and lane routing (#28).** Added `InputSource`
+  (`--voice` / `--source`) and 3-tier `[routing]` in `src/routing.rs` +
+  `src/conductor.rs` (zero-latency heuristics with follow-up correction
+  escalation and non-waiting auto-background delegation, Tier 2 one-time retry
+  escalation to `deep_profile` on retryable fast failure, and Tier 3 bounded
+  tool-disabled LLM triage strictly for non-voice `Unsure` turns; never invoked
+  on voice), plus `--voice` in `npu-dictate.nix` and `--source typed` in
+  `rofi-ask.nix`.
 - `[Lower priority]` `[Upstream]` `[Done: 3c7390b]` **Timed-out turns & generic
   deny-list message (#10, #11).** Marked `TurnAbort::Quiet` as `broken: true`
   so timed-out sessions are closed instead of extending `follow_up_until`,
