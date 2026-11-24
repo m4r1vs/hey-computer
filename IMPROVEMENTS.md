@@ -27,6 +27,10 @@ env-var filtering) have been removed. **No permission prompts at all** — trust
 the AI to do the right thing directly; permission prompts can be added later
 only if needed.
 
+**UI naming:** In user-facing prompts, launchers, keybind descriptions, and
+future UI labels (viewer, notification actions, etc.), use **"Ask Computer"**
+(not "Ask Hey Computer").
+
 ## Phase 1: Zero-Rust quick wins (consuming configuration & npu-dictate) — Implemented
 
 All Phase 1 items (#1–#7) are implemented and listed under [Done](#done).
