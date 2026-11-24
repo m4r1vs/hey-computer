@@ -81,8 +81,8 @@
   "the viewer must start in a scope of its own";
   assert lib.assertMsg (lib.elem "--name=hey-computer.answer" (settingsOf full).present.viewer)
   "the default viewer sets the app id";
-  assert lib.assertMsg (lib.length (settingsOf full).instructions.skills == 6)
-  "six skills with a vault and openhue: hyprland-desktop, four from obsidian-skills, and openhue";
+  assert lib.assertMsg (lib.length (settingsOf full).instructions.skills == 7)
+  "seven skills with a vault and openhue: hyprland-desktop, recall, four from obsidian-skills, and openhue";
   assert lib.assertMsg ((settingsOf full).instructions.memory_file == "/home/alice/.config/hey-computer/memory.md")
   "the module defaults instructions.memory_file to xdg.configHome";
   assert lib.assertMsg (lib.hasSuffix "/bin/wl-copy" (lib.head (settingsOf full).present.clipboard))
@@ -91,8 +91,8 @@
   "a user's viewer replaces the default";
   assert lib.assertMsg ((settingsOf custom).present.clipboard == ["my-clip"])
   "a user's clipboard command replaces the default";
-  assert lib.assertMsg (lib.length (settingsOf custom).instructions.skills == 1)
-  "without a vault or openhue only the bundled hyprland-desktop skill";
+  assert lib.assertMsg (lib.length (settingsOf custom).instructions.skills == 2)
+  "without a vault or openhue only the bundled hyprland-desktop and recall skills";
   assert lib.assertMsg (!((settingsOf bare).instructions or {} ? skills))
   "skills.enable = false links no skills";
   assert lib.assertMsg (!((settingsOf bare).instructions or {} ? memory_file))
@@ -119,7 +119,7 @@ in
       export XDG_STATE_HOME=$TMPDIR/state
       $hc --config ${configFile} debug prepare
       skills=$XDG_STATE_HOME/hey-computer/agy/config/skills
-      for skill in hyprland-desktop obsidian-cli obsidian-markdown obsidian-bases json-canvas openhue; do
+      for skill in hyprland-desktop recall obsidian-cli obsidian-markdown obsidian-bases json-canvas openhue; do
         test -e "$skills/$skill/SKILL.md" || { echo "missing skill $skill" >&2; exit 1; }
       done
       grep -q "Alice's Notes" $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md
@@ -146,7 +146,7 @@ in
       test "$(obsidian help)" = "obsidian-cli stub: help"
       test "$(openhue version)" = "openhue stub: version"
       test "$(agy --version)" = "agy stub: --version"
-      for tool in hello jq notify-send playerctl wpctl bash rg curl; do
+      for tool in hey-computer hello jq notify-send playerctl wpctl bash rg curl; do
         command -v $tool > /dev/null || { echo "$tool is not on the agent's PATH" >&2; exit 1; }
       done
       touch $out

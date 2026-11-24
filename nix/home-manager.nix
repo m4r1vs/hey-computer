@@ -35,6 +35,7 @@
   skillDirs =
     lib.optionals cfg.skills.enable (
       ["${cfg.package}/share/hey-computer/skills/hyprland-desktop"]
+      ++ lib.optionals cfg.recall.enable ["${cfg.package}/share/hey-computer/skills/recall"]
       ++ lib.optionals cfg.obsidian.enable obsidianSkillDirs
       ++ lib.optionals cfg.openhue.enable ["${cfg.package}/share/hey-computer/skills/openhue"]
     )
@@ -65,6 +66,7 @@
         lib.optional cfg.obsidian.enable obsidianShim
         ++ lib.optional cfg.openhue.enable cfg.openhue.package
         ++ lib.optional (cfg.agent.package != null) cfg.agent.package
+        ++ [cfg.package]
         ++ cfg.extraPackages
         ++ basics
       ))
@@ -238,12 +240,22 @@ in {
       };
     };
 
+    recall.enable = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Link the bundled `recall` skill (when {option}`skills.enable` is set)
+        so the agent can search past turns via `hey-computer recall`.
+      '';
+    };
+
     skills = {
       enable = mkOption {
         type = types.bool;
         default = true;
         description = ''
-          Give the agent the bundled `hyprland-desktop` skill, the Obsidian
+          Give the agent the bundled `hyprland-desktop` skill, the bundled
+          `recall` skill when {option}`recall.enable` is set, the Obsidian
           skills when {option}`obsidian.enable` is set, and the bundled
           `openhue` skill when {option}`openhue.enable` is set.
         '';

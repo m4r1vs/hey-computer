@@ -82,6 +82,46 @@ enum Command {
         #[command(subcommand)]
         action: Option<TasksCommand>,
     },
+    /// Search past completed answers using the local SQLite FTS5 index.
+    Recall {
+        /// Only include turns created at or after this time (`24h`, `7d`, `2w`,
+        /// `today`, `yesterday`, or `YYYY-MM-DD`).
+        #[arg(long, value_name = "SPEC")]
+        since: Option<String>,
+        /// Only include turns created before this time.
+        #[arg(long, value_name = "SPEC")]
+        until: Option<String>,
+        /// Maximum number of matches to return (1..=50).
+        #[arg(short = 'n', long, default_value_t = 5)]
+        limit: usize,
+        /// Restrict search to one lane.
+        #[arg(long, value_enum, default_value_t = LaneFilter::All)]
+        lane: LaneFilter,
+        /// Sort order (`relevance` or `recent`).
+        #[arg(long, value_enum, default_value_t = RecallSortArg::Relevance)]
+        sort: RecallSortArg,
+        /// Match any search term (`OR`) instead of all terms (`AND`).
+        #[arg(long)]
+        any: bool,
+        /// Return full request/answer text (truncated to `--max-chars`) instead of snippets.
+        #[arg(long)]
+        full: bool,
+        /// Maximum characters per field when `--full` is set.
+        #[arg(long, default_value_t = 1200)]
+        max_chars: usize,
+        /// Pass the query directly to SQLite FTS5 `MATCH` without sanitization.
+        #[arg(long)]
+        raw_fts: bool,
+        /// Emit results as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Omit `<untrusted_recall>` framing (for direct human terminal piping).
+        #[arg(long)]
+        plain: bool,
+        /// Search terms; omit to list the most recent completed turns.
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        query: Vec<String>,
+    },
     /// Print what the daemon is doing.
     Status {
         /// Print the status as JSON.
@@ -124,6 +164,21 @@ impl LaneFilter {
             Self::Interactive => Some(store::Lane::Interactive),
             Self::Background => Some(store::Lane::Background),
             Self::All => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum RecallSortArg {
+    Relevance,
+    Recent,
+}
+
+impl RecallSortArg {
+    fn into_sort(self) -> store::RecallSort {
+        match self {
+            Self::Relevance => store::RecallSort::Relevance,
+            Self::Recent => store::RecallSort::Recent,
         }
     }
 }
@@ -286,6 +341,34 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
             tasks(&config, &socket, action).await
         }
+        Command::Recall {
+            since,
+            until,
+            limit,
+            lane,
+            sort,
+            any,
+            full,
+            max_chars,
+            raw_fts,
+            json,
+            plain,
+            query,
+        } => recall_cmd(
+            &config,
+            since,
+            until,
+            limit,
+            lane.into_lane(),
+            sort.into_sort(),
+            any,
+            full,
+            max_chars,
+            raw_fts,
+            json,
+            plain,
+            query,
+        ),
         Command::Status { json } => {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
             match ipc::request(&socket, &Request::Status).await? {
@@ -427,6 +510,61 @@ fn resolve_attachments(files: Vec<PathBuf>, images: Vec<PathBuf>) -> Result<Vec<
         });
     }
     Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recall_cmd(
+    config: &Config,
+    since: Option<String>,
+    until: Option<String>,
+    limit: usize,
+    lane: Option<store::Lane>,
+    sort: store::RecallSort,
+    match_any: bool,
+    full: bool,
+    max_chars: usize,
+    raw_fts: bool,
+    json: bool,
+    plain: bool,
+    words: Vec<String>,
+) -> Result<ExitCode> {
+    let now_ms = store::unix_timestamp_ms();
+    let since_ms = since
+        .as_deref()
+        .map(|s| store::parse_time_spec(s, now_ms))
+        .transpose()?;
+    let until_ms = until
+        .as_deref()
+        .map(|s| store::parse_time_spec(s, now_ms))
+        .transpose()?;
+    let query = if words.is_empty() {
+        None
+    } else {
+        Some(words.join(" "))
+    };
+    let state_dir = config.state_dir()?;
+    let hits = store::recall(
+        &state_dir,
+        &store::RecallOptions {
+            query,
+            lane,
+            since_ms,
+            until_ms,
+            limit,
+            sort,
+            match_any,
+            raw_fts,
+        },
+    )?;
+    if json {
+        println!("{}", serde_json::to_string(&hits)?);
+    } else {
+        println!(
+            "{}",
+            store::format_recall_output(&hits, full, max_chars, plain)
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn cancel_id(socket: &Path, id: Option<u64>) -> Result<ExitCode> {
@@ -760,6 +898,18 @@ mod tests {
             vec!["hey-computer", "tasks", "open", "3"],
             vec!["hey-computer", "tasks", "copy", "3"],
             vec!["hey-computer", "tasks", "cancel", "3"],
+            vec!["hey-computer", "recall"],
+            vec![
+                "hey-computer",
+                "recall",
+                "--since",
+                "7d",
+                "--limit",
+                "3",
+                "nixos",
+                "rebuild",
+            ],
+            vec!["hey-computer", "recall", "--json", "--any", "--full", "foo"],
             vec!["hey-computer", "status", "--json"],
             vec!["hey-computer", "last"],
             vec!["hey-computer", "last", "--lane", "all", "--json"],
