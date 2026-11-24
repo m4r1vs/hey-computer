@@ -27,6 +27,7 @@ pub fn prepare(config: &Config) -> Result<()> {
     let paths = environment::prepare(config)?;
     println!("agent directory: {}", paths.agent_dir.display());
     println!("workspace:       {}", paths.workspace.display());
+    println!("memory:          {}", paths.memory);
     println!("agent command:   {:?}", paths.agent_command(config));
     println!(
         "settings:        {}",

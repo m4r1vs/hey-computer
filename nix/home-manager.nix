@@ -122,9 +122,9 @@ in {
       description = ''
         Contents of {file}`~/.config/hey-computer/config.toml`, see the
         README for every key. The module fills in `instructions.vault`,
-        `instructions.skills` and `present.viewer` from its own options.
-        The file is checked with the package's own binary when it is built,
-        so an unknown key fails the build.
+        `instructions.memory_file`, `instructions.skills` and `present.viewer`
+        from its own options. The file is checked with the package's own binary
+        when it is built, so an unknown key fails the build.
       '';
     };
 
@@ -179,6 +179,18 @@ in {
         Sets `instructions.vault`. The vault is named in the agent's
         instructions but is not one of its workspace directories, so an
         AGENTS.md in the vault is not loaded as instructions.
+      '';
+    };
+
+    memory.file = mkOption {
+      type = types.nullOr types.str;
+      default = "${config.xdg.configHome}/hey-computer/memory.md";
+      defaultText = literalExpression ''"''${config.xdg.configHome}/hey-computer/memory.md"'';
+      description = ''
+        Optional user-owned Markdown memory file loaded into `AGENTS.md` when
+        the agent starts and kept frozen until the next agent start. Sets
+        `instructions.memory_file`. A missing or empty file is ignored; null
+        disables memory loading. Keep this file outside the vault.
       '';
     };
 
@@ -287,6 +299,7 @@ in {
     programs.hey-computer.settings = {
       instructions = {
         vault = mkIf (cfg.vault != null) (mkDefault cfg.vault);
+        memory_file = mkIf (cfg.memory.file != null) (mkDefault cfg.memory.file);
         skills = mkIf (skillDirs != []) skillDirs;
       };
       present.viewer = mkIf (cfg.viewer.command != []) (mkDefault (viewerLauncher ++ cfg.viewer.command));

@@ -71,7 +71,12 @@ pub struct Permissions {
     pub deny: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Default character cap for `instructions.memory_file` (~750–1,000 tokens).
+pub const DEFAULT_MEMORY_MAX_CHARS: usize = 4_000;
+/// Hard upper bound for `instructions.memory_max_chars`.
+pub const MAX_MEMORY_MAX_CHARS: usize = 32_768;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Instructions {
     /// Appended to the built-in instructions in the agent's `AGENTS.md`.
@@ -81,6 +86,24 @@ pub struct Instructions {
     /// Skill directories made available to the agent: either one skill (a
     /// directory with a `SKILL.md`) or a directory of such skills.
     pub skills: Vec<PathBuf>,
+    /// Optional user-owned Markdown memory file (absolute path), loaded into
+    /// `AGENTS.md` before each agent start and frozen until the next start.
+    /// Empty disables memory loading; a missing or empty file is ignored.
+    pub memory_file: PathBuf,
+    /// Maximum number of characters loaded from `memory_file`.
+    pub memory_max_chars: usize,
+}
+
+impl Default for Instructions {
+    fn default() -> Self {
+        Self {
+            extra: String::new(),
+            vault: PathBuf::new(),
+            skills: Vec::new(),
+            memory_file: PathBuf::new(),
+            memory_max_chars: DEFAULT_MEMORY_MAX_CHARS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +267,26 @@ impl Config {
         {
             bail!("instructions.vault must be an absolute path");
         }
+        if !self.instructions.memory_file.as_os_str().is_empty() {
+            if !self.instructions.memory_file.is_absolute() {
+                bail!("instructions.memory_file must be an absolute path");
+            }
+            if !self.instructions.vault.as_os_str().is_empty() {
+                let memory = normalize_lexical(&self.instructions.memory_file);
+                let vault = normalize_lexical(&self.instructions.vault);
+                if memory.starts_with(&vault) {
+                    bail!(
+                        "instructions.memory_file must not be inside instructions.vault (the vault is untrusted data)"
+                    );
+                }
+            }
+        }
+        if !(1..=MAX_MEMORY_MAX_CHARS).contains(&self.instructions.memory_max_chars) {
+            bail!(
+                "instructions.memory_max_chars must be between 1 and {MAX_MEMORY_MAX_CHARS}, not {}",
+                self.instructions.memory_max_chars
+            );
+        }
         Ok(())
     }
 
@@ -258,6 +301,21 @@ impl Config {
     }
 }
 
+/// Collapse `.` and `..` components without touching the filesystem.
+pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +326,11 @@ mod tests {
         let parsed: Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed.agent.model, "gemini-4-hydrogen");
         assert_eq!(parsed.present.max_chars, 230);
+        assert!(parsed.instructions.memory_file.as_os_str().is_empty());
+        assert_eq!(
+            parsed.instructions.memory_max_chars,
+            DEFAULT_MEMORY_MAX_CHARS
+        );
         parsed.validate().unwrap();
     }
 
@@ -281,6 +344,11 @@ mod tests {
         assert_eq!(parsed.present.max_lines, 6);
         assert_eq!(parsed.conversation.follow_up_secs, 90.0);
         assert_eq!(parsed.permissions.deny[0], "sudo");
+        assert!(parsed.instructions.memory_file.as_os_str().is_empty());
+        assert_eq!(
+            parsed.instructions.memory_max_chars,
+            DEFAULT_MEMORY_MAX_CHARS
+        );
     }
 
     #[test]
@@ -356,5 +424,38 @@ mod tests {
         config.conversation.follow_up_secs = MAX_SECS;
         config.agent.restart_delay_secs = 60.0;
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn memory_config_is_validated() {
+        let mut config = Config::default();
+        config.instructions.memory_file = PathBuf::from("memory.md");
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.instructions.memory_max_chars = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.instructions.memory_max_chars = MAX_MEMORY_MAX_CHARS + 1;
+        assert!(config.validate().is_err());
+
+        for bad in [
+            "/tmp/vault/memory.md",
+            "/tmp/vault/sub/memory.md",
+            "/tmp/other/../vault/memory.md",
+        ] {
+            let mut config = Config::default();
+            config.instructions.vault = PathBuf::from("/tmp/vault");
+            config.instructions.memory_file = PathBuf::from(bad);
+            assert!(config.validate().is_err(), "{bad} should be refused");
+        }
+
+        for good in ["/tmp/vault-memory.md", "/tmp/config/memory.md"] {
+            let mut config = Config::default();
+            config.instructions.vault = PathBuf::from("/tmp/vault");
+            config.instructions.memory_file = PathBuf::from(good);
+            config.validate().unwrap();
+        }
     }
 }

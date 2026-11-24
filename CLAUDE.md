@@ -155,7 +155,7 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
 
 ## Never logged above debug
 
-Request text, answer text, tool call arguments and the agent's stderr when it dies
+Request text, answer text, memory file contents, tool call arguments and the agent's stderr when it dies
 mid-request (it can quote the request). `info` carries ids, sizes, timings and tool kinds
 (`tool call (execute)`, `refused a sudo command`). Keep it that way: requests are spoken
 words and answers can quote the user's notes.

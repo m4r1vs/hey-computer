@@ -732,3 +732,40 @@ async fn a_file_at_the_socket_path_is_not_replaced() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_snapshot_is_frozen_until_next_agent_start() {
+    let dir = std::env::temp_dir().join(format!("hc-mem-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let memory = dir.join("memory.md");
+    std::fs::write(&memory, "fact one").unwrap();
+
+    let h = Harness::start(SCRIPT, |c| {
+        c.instructions.memory_file = memory.clone();
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    let agents_path = h.dir.join("state/workspace/AGENTS.md");
+    let first = std::fs::read_to_string(&agents_path).unwrap();
+    assert!(first.contains("fact one"), "{first}");
+
+    // Editing memory.md while the agent is alive must not change AGENTS.md.
+    std::fs::write(&memory, "fact two").unwrap();
+    assert_eq!(answer(&h.ask("plain", false).await), "Hello from the mock.");
+    let frozen = std::fs::read_to_string(&agents_path).unwrap();
+    assert!(frozen.contains("fact one"), "{frozen}");
+    assert!(!frozen.contains("fact two"), "{frozen}");
+
+    // Restarting the agent picks up the new snapshot.
+    let _ = h.ask("crash now", false).await;
+    h.eventually("second start", || h.log_count("new mock-1") == 2)
+        .await;
+    let refreshed = std::fs::read_to_string(&agents_path).unwrap();
+    assert!(refreshed.contains("fact two"), "{refreshed}");
+    assert!(!refreshed.contains("fact one"), "{refreshed}");
+
+    h.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}

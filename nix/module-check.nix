@@ -52,7 +52,15 @@
     settings.present.viewer = ["my-viewer" "{file}"];
   };
 
-  bare = evaluate {skills.enable = false;};
+  bare = evaluate {
+    skills.enable = false;
+    memory.file = null;
+  };
+
+  memorySample = pkgs.writeText "memory.md" "Prefer concise answers.\n";
+  withMemory = evaluate {
+    memory.file = toString memorySample;
+  };
 
   settingsOf = config: config.programs.hey-computer.settings;
   service = full.systemd.user.services.hey-computer.Service;
@@ -64,17 +72,22 @@
   "the default viewer sets the app id";
   assert lib.assertMsg (lib.length (settingsOf full).instructions.skills == 6)
   "six skills with a vault and openhue: hyprland-desktop, four from obsidian-skills, and openhue";
+  assert lib.assertMsg ((settingsOf full).instructions.memory_file == "/home/alice/.config/hey-computer/memory.md")
+  "the module defaults instructions.memory_file to xdg.configHome";
   assert lib.assertMsg ((settingsOf custom).present.viewer == ["my-viewer" "{file}"])
   "a user's viewer replaces the default";
   assert lib.assertMsg (lib.length (settingsOf custom).instructions.skills == 1)
   "without a vault or openhue only the bundled hyprland-desktop skill";
   assert lib.assertMsg (!((settingsOf bare).instructions or {} ? skills))
   "skills.enable = false links no skills";
+  assert lib.assertMsg (!((settingsOf bare).instructions or {} ? memory_file))
+  "memory.file = null omits instructions.memory_file";
   assert lib.assertMsg (!(builtins.tryEval (evaluate {vualt = "/tmp";}).programs.hey-computer.settings).success)
   "a misspelt option must fail"; true;
 
   configFile = full.xdg.configFile."hey-computer/config.toml".source;
   bareConfig = bare.xdg.configFile."hey-computer/config.toml".source;
+  memoryConfig = withMemory.xdg.configFile."hey-computer/config.toml".source;
   unit = full.xdg.configFile."systemd/user/hey-computer.service".source;
   package = full.programs.hey-computer.package;
 in
@@ -85,6 +98,7 @@ in
 
       $hc --config ${configFile} debug config > /dev/null
       $hc --config ${bareConfig} debug config > /dev/null
+      $hc --config ${memoryConfig} debug config > /dev/null
 
       # The agent's directory as the daemon prepares it.
       export XDG_STATE_HOME=$TMPDIR/state
@@ -95,6 +109,11 @@ in
       done
       grep -q "Alice's Notes" $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md
       grep -q "Prefer metric units." $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md
+      grep -q "report the failure plainly" $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md
+
+      # Frozen-snapshot memory loading.
+      $hc --config ${memoryConfig} debug instructions | grep -q "Prefer concise answers."
+      $hc --config ${bareConfig} debug instructions | grep -qv "## User memory"
 
       # The service.
       cat ${unit}
