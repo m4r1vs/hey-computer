@@ -62,8 +62,13 @@ pub fn classify(config: &Config, text: &str) {
 
 /// One request straight to the agent, without a daemon. With `-v` the log
 /// shows when each tool call and permission request arrived.
-pub async fn prompt(config: Config, text: String, profile: Option<String>) -> Result<bool> {
-    match conductor::ask_once(config, text, profile).await? {
+pub async fn prompt(
+    config: Config,
+    text: String,
+    profile: Option<String>,
+    attachments: Vec<crate::protocol::Attachment>,
+) -> Result<bool> {
+    match conductor::ask_once(config, text, profile, attachments).await? {
         Outcome::Answer { text, denied } => {
             println!("{text}");
             for command in denied {

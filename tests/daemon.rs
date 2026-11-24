@@ -1248,6 +1248,7 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             wait: true,
             new: false,
             profile: Some("deep".to_string()),
+            attachments: vec![],
         },
     )
     .await
@@ -1267,6 +1268,7 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             wait: true,
             new: false,
             profile: Some("default".to_string()),
+            attachments: vec![],
         },
     )
     .await
@@ -1292,6 +1294,7 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             wait: true,
             new: true,
             profile: Some("deep".to_string()),
+            attachments: vec![],
         },
     )
     .await
@@ -1308,6 +1311,7 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             wait: false,
             new: true,
             profile: Some("deep".to_string()),
+            attachments: vec![],
         },
     )
     .await
@@ -1371,6 +1375,7 @@ async fn mid_session_config_rejection_falls_back_to_a_fresh_session() {
             wait: true,
             new: false,
             profile: Some("deep".to_string()),
+            attachments: vec![],
         },
     )
     .await
@@ -1397,6 +1402,7 @@ async fn unknown_profile_returns_error_without_superseding_running_request() {
             wait: false,
             new: false,
             profile: Some("nonexistent".to_string()),
+            attachments: vec![],
         },
     )
     .await
@@ -1411,5 +1417,109 @@ async fn unknown_profile_returns_error_without_superseding_running_request() {
     ipc::request(&h.socket, &Request::Cancel).await.unwrap();
     let (reason, _) = failure(&slow.next(Some(Duration::from_secs(5))).await.unwrap());
     assert_eq!(reason, FailReason::Cancelled);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
+    use hey_computer::protocol::{Attachment, AttachmentKind};
+
+    let script = r#"{
+        "turns": [
+            {"match": "slow", "steps": ["hang"]}
+        ],
+        "default": ["attachment_info"]
+    }"#;
+    let h = Harness::start(script, |_| {}).await;
+    h.wait_log("new mock-1").await;
+
+    let note = h.dir.join("notes.md");
+    std::fs::write(&note, "hello world").unwrap();
+    let img = h.dir.join("shot.png");
+    std::fs::write(&img, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x00").unwrap();
+
+    // Send both file and image, then delete the image immediately after Accepted
+    // to prove the daemon loaded it before replying Accepted.
+    let (_, mut client) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "inspect".to_string(),
+            wait: true,
+            new: false,
+            profile: None,
+            attachments: vec![
+                Attachment {
+                    kind: AttachmentKind::File,
+                    path: note.clone(),
+                },
+                Attachment {
+                    kind: AttachmentKind::Image,
+                    path: img.clone(),
+                },
+            ],
+        },
+    )
+    .await
+    .unwrap();
+    std::fs::remove_file(&img).unwrap();
+    let reply = client.next(Some(Duration::from_secs(10))).await.unwrap();
+    let got = answer(&reply);
+    assert!(got.contains("inspect"), "{got}");
+    assert!(got.contains("resource:file://"), "{got}");
+    assert!(got.contains("text/markdown:len=11"), "{got}");
+    assert!(got.contains("image:image/png:b64=16"), "{got}");
+
+    // Metadata (never raw bytes) is persisted on last.json.
+    let saved = hey_computer::store::load_last(&h.dir.join("state"))
+        .unwrap()
+        .expect("saved");
+    assert_eq!(saved.attachments.len(), 2);
+    assert_eq!(saved.attachments[0].name, "notes.md");
+    assert_eq!(saved.attachments[1].mime_type, "image/png");
+
+    // Empty text with an attachment synthesizes a default prompt.
+    let (_, mut client) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: String::new(),
+            wait: true,
+            new: true,
+            profile: None,
+            attachments: vec![Attachment {
+                kind: AttachmentKind::File,
+                path: note,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    let reply = client.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert!(
+        answer(&reply).contains("Review or explain the attached file."),
+        "{reply:?}"
+    );
+
+    // Invalid attachment fails fast with Reply::Error without superseding a running turn.
+    let (running_id, mut slow) = h.ask_waiting("slow").await;
+    h.wait_log("prompt mock-2 slow").await;
+    let err = ipc::request(
+        &h.socket,
+        &Request::Ask {
+            text: "bad".to_string(),
+            wait: false,
+            new: false,
+            profile: None,
+            attachments: vec![Attachment {
+                kind: AttachmentKind::Image,
+                path: h.dir.join("missing.png"),
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(err, Reply::Error { .. }), "{err:?}");
+    assert_eq!(h.status().await.running, Some(running_id));
+    ipc::request(&h.socket, &Request::Cancel).await.unwrap();
+    let _ = slow.next(Some(Duration::from_secs(5))).await.unwrap();
     h.stop().await;
 }

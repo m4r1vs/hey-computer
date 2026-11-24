@@ -3,6 +3,7 @@
 //! One binary, two roles: `daemon` owns the agent and the socket, every other
 //! subcommand is a client that talks to it over the socket and exits.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -10,10 +11,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncReadExt;
 
+use hey_computer::attachments;
 use hey_computer::config::Config;
 use hey_computer::ipc::{self, NotRunning};
 use hey_computer::present::{self, Urgency};
-use hey_computer::protocol::{self, MAX_REQUEST_LINE, Reply, Request};
+use hey_computer::protocol::{self, Attachment, AttachmentKind, MAX_REQUEST_LINE, Reply, Request};
 use hey_computer::{daemon, debug, mock, store};
 
 #[derive(Debug, Parser)]
@@ -51,6 +53,12 @@ enum Command {
         /// Use a named profile from `[profiles.<name>]` (or `default`).
         #[arg(short = 'p', long, value_name = "NAME")]
         profile: Option<String>,
+        /// Attach a UTF-8 text file as embedded context (repeatable).
+        #[arg(short = 'f', long = "file", value_name = "PATH")]
+        files: Vec<PathBuf>,
+        /// Attach a raster image (PNG, JPEG, WebP, GIF) (repeatable).
+        #[arg(short = 'i', long = "image", value_name = "PATH")]
+        images: Vec<PathBuf>,
         /// The request; several words are joined with spaces.
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         text: Vec<String>,
@@ -97,6 +105,12 @@ enum DebugCommand {
         /// Use a named profile from `[profiles.<name>]` (or `default`).
         #[arg(short = 'p', long, value_name = "NAME")]
         profile: Option<String>,
+        /// Attach a UTF-8 text file as embedded context (repeatable).
+        #[arg(short = 'f', long = "file", value_name = "PATH")]
+        files: Vec<PathBuf>,
+        /// Attach a raster image (PNG, JPEG, WebP, GIF) (repeatable).
+        #[arg(short = 'i', long = "image", value_name = "PATH")]
+        images: Vec<PathBuf>,
         text: Vec<String>,
     },
     /// Show an answer the way the daemon would.
@@ -168,10 +182,12 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             print,
             new,
             profile,
+            files,
+            images,
             text,
         } => {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
-            ask(&config, &socket, text, print, new, profile).await
+            ask(&config, &socket, text, print, new, profile, files, images).await
         }
         Command::Cancel => {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
@@ -224,8 +240,22 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
                     debug::classify(&config, &text_or_stdin(text).await?);
                     true
                 }
-                DebugCommand::Prompt { profile, text } => {
-                    debug::prompt(config, text_or_stdin(text).await?, profile).await?
+                DebugCommand::Prompt {
+                    profile,
+                    files,
+                    images,
+                    text,
+                } => {
+                    let attach = resolve_attachments(files, images)?;
+                    let prompt_text = if text.is_empty()
+                        && !attach.is_empty()
+                        && std::io::stdin().is_terminal()
+                    {
+                        String::new()
+                    } else {
+                        text_or_stdin(text).await?
+                    };
+                    debug::prompt(config, prompt_text, profile, attach).await?
                 }
                 DebugCommand::Present { text } => {
                     debug::present(&config, text_or_stdin(text).await?).await?;
@@ -286,6 +316,24 @@ async fn last(config: &Config, copy: bool, open: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn resolve_attachments(files: Vec<PathBuf>, images: Vec<PathBuf>) -> Result<Vec<Attachment>> {
+    let mut out = Vec::with_capacity(files.len() + images.len());
+    for path in files {
+        out.push(Attachment {
+            kind: AttachmentKind::File,
+            path: attachments::resolve_client_path(&path)?,
+        });
+    }
+    for path in images {
+        out.push(Attachment {
+            kind: AttachmentKind::Image,
+            path: attachments::resolve_client_path(&path)?,
+        });
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn ask(
     config: &Config,
     socket: &Path,
@@ -293,30 +341,39 @@ async fn ask(
     print: bool,
     new: bool,
     profile: Option<String>,
+    files: Vec<PathBuf>,
+    images: Vec<PathBuf>,
 ) -> Result<ExitCode> {
     // Every refusal after this point is also a notification (see below).
-    let text = text_or_stdin(words).await;
+    let has_attachments = !files.is_empty() || !images.is_empty();
+    let text = if words.is_empty() && has_attachments && std::io::stdin().is_terminal() {
+        Ok(String::new())
+    } else {
+        text_or_stdin(words).await
+    };
     if let Ok(text) = &text
         && text.trim().is_empty()
+        && !has_attachments
     {
         eprintln!("hey-computer: the request is empty; nothing was asked");
         return Ok(ExitCode::from(2));
     }
 
-    let accepted = match text {
-        Ok(text) => {
+    let accepted = match (text, resolve_attachments(files, images)) {
+        (Ok(text), Ok(attachments)) => {
             let req = Request::Ask {
                 text,
                 wait: print,
                 new,
                 profile,
+                attachments,
             };
             match request_size(&req) {
                 Ok(()) => ipc::ask_request(socket, &req).await,
                 Err(e) => Err(e),
             }
         }
-        Err(e) => Err(e),
+        (Err(e), _) | (_, Err(e)) => Err(e),
     };
     let (id, mut client) = match accepted {
         Ok(accepted) => accepted,
@@ -410,6 +467,16 @@ mod tests {
             vec!["hey-computer", "ask", "what", "time", "is", "it"],
             vec!["hey-computer", "ask", "--print", "--new", "--", "-5 plus 3"],
             vec!["hey-computer", "ask", "-p", "deep", "derive", "this"],
+            vec![
+                "hey-computer",
+                "ask",
+                "-f",
+                "a.txt",
+                "-i",
+                "b.png",
+                "explain",
+            ],
+            vec!["hey-computer", "ask", "--image", "shot.png"],
             vec!["hey-computer", "ask", "--profile", "default", "hi"],
             vec!["hey-computer", "ask", "--print"],
             vec!["hey-computer", "--socket", "/tmp/s", "cancel"],

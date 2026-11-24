@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
 
+use crate::attachments;
 use crate::conductor::{self, Handle, Sink};
 use crate::config::Config;
 use crate::context::{ContextProvider, SystemContext};
@@ -225,7 +226,9 @@ async fn connection(handle: &Handle, stream: UnixStream) -> Result<()> {
             let id = handle.cancel(None, FailReason::Cancelled);
             send(&mut write, &Reply::Cancelled { id }).await
         }
-        Request::Ask { text, .. } if text.trim().is_empty() => {
+        Request::Ask {
+            text, attachments, ..
+        } if text.trim().is_empty() && attachments.is_empty() => {
             send(
                 &mut write,
                 &Reply::Error {
@@ -239,16 +242,43 @@ async fn connection(handle: &Handle, stream: UnixStream) -> Result<()> {
             wait,
             new,
             profile,
+            attachments,
         } => {
             if let Err(message) = handle.validate_profile(profile.as_deref()) {
                 return send(&mut write, &Reply::Error { message }).await;
             }
+            let loaded_attachments = if attachments.is_empty() {
+                Vec::new()
+            } else {
+                match tokio::task::spawn_blocking(move || attachments::load_all(&attachments)).await
+                {
+                    Ok(Ok(loaded)) => loaded,
+                    Ok(Err(e)) => {
+                        return send(
+                            &mut write,
+                            &Reply::Error {
+                                message: format!("{e:#}"),
+                            },
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        return send(
+                            &mut write,
+                            &Reply::Error {
+                                message: format!("failed to load attachments: {e}"),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            };
             if !wait {
-                let id = handle.ask(text, new, profile, Sink::Present);
+                let id = handle.ask(text, new, profile, loaded_attachments, Sink::Present);
                 return send(&mut write, &Reply::Accepted { id }).await;
             }
             let (tx, rx) = oneshot::channel();
-            let id = handle.ask(text, new, profile, Sink::Client(tx));
+            let id = handle.ask(text, new, profile, loaded_attachments, Sink::Client(tx));
             send(&mut write, &Reply::Accepted { id }).await?;
             // The client waits for the answer; if it hangs up first, the
             // request is cancelled, since nobody would see the answer.

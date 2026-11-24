@@ -17,11 +17,27 @@
 //!
 //! A line the daemon cannot use gets `{"type":"error","message":"…"}`.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// The longest request line the daemon reads. A spoken request is a few
 /// hundred bytes; this only bounds a broken or hostile client.
 pub const MAX_REQUEST_LINE: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    File,
+    Image,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attachment {
+    pub kind: AttachmentKind,
+    pub path: PathBuf,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -38,6 +54,9 @@ pub enum Request {
         /// Optional named profile from `[profiles.<name>]` (or `"default"`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile: Option<String>,
+        /// Optional file or image attachments (absolute paths read by the daemon).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
     },
     Cancel,
     Status,
@@ -192,6 +211,7 @@ mod tests {
                 wait: false,
                 new: false,
                 profile: None,
+                attachments: vec![],
             }
         );
     }
@@ -204,6 +224,10 @@ mod tests {
                 wait: true,
                 new: true,
                 profile: Some("deep".to_string()),
+                attachments: vec![Attachment {
+                    kind: AttachmentKind::Image,
+                    path: PathBuf::from("/tmp/shot.png"),
+                }],
             },
             Request::Cancel,
             Request::Status,

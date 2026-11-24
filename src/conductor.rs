@@ -20,6 +20,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::acp::{self, CallError, Connection, Incoming};
+use crate::attachments::{self, LoadedAttachment};
 use crate::config::{Config, MAX_RESTART_DELAY_SECS, ResolvedProfile, secs};
 use crate::context::{self, ContextProvider, SystemContext};
 use crate::environment::{self, Paths};
@@ -131,6 +132,7 @@ pub struct Ask {
     pub text: String,
     pub new: bool,
     pub profile: Option<String>,
+    pub attachments: Vec<LoadedAttachment>,
     pub sink: Sink,
     pub token: Arc<CancelToken>,
 }
@@ -169,7 +171,14 @@ impl Handle {
     }
 
     /// Queue a request, superseding the one before. Returns its number.
-    pub fn ask(&self, text: String, new: bool, profile: Option<String>, sink: Sink) -> u64 {
+    pub fn ask(
+        &self,
+        text: String,
+        new: bool,
+        profile: Option<String>,
+        attachments: Vec<LoadedAttachment>,
+        sink: Sink,
+    ) -> u64 {
         let token = Arc::new(CancelToken::default());
         let id = {
             let mut shared = self
@@ -188,6 +197,7 @@ impl Handle {
             text,
             new,
             profile,
+            attachments,
             sink,
             token,
         };
@@ -723,7 +733,7 @@ impl Conductor {
         if matches!(ask.sink, Sink::Present) {
             self.presenter.present(Presentation::Progress {
                 id: ask.id,
-                request: ask.text.clone(),
+                request: attachments::progress_label(&ask.text, &ask.attachments),
                 profile: display_profile.clone(),
             });
         }
@@ -748,6 +758,7 @@ impl Conductor {
                 request: ask.text.clone(),
                 text: text.clone(),
                 denied: denied.clone(),
+                attachments: ask.attachments.iter().map(LoadedAttachment::meta).collect(),
             };
             if let Err(e) = self
                 .config
@@ -764,14 +775,20 @@ impl Conductor {
         let started = Instant::now();
         let token = Arc::clone(&ask.token);
         let fallback_profile = self.effective_display_profile(ask);
+        let attach_summary = if ask.attachments.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", attachments::summary_for_log(&ask.attachments))
+        };
         tracing::info!(
-            "request {}: {} characters{}",
+            "request {}: {} characters{}{}",
             ask.id,
             ask.text.chars().count(),
             fallback_profile
                 .as_deref()
                 .map(|p| format!(", profile {p}"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            attach_summary,
         );
         tracing::debug!("request {}: {:?}", ask.id, ask.text);
 
@@ -853,7 +870,13 @@ impl Conductor {
         if let Some(header) = &header {
             tracing::debug!("request {}: ambient context: {:?}", ask.id, header);
         }
-        let prompt = context::prepend(header.as_deref(), &ask.text);
+        let effective_text = if ask.text.trim().is_empty() && !ask.attachments.is_empty() {
+            attachments::default_prompt(&ask.attachments)
+        } else {
+            &ask.text
+        };
+        let prompt = context::prepend(header.as_deref(), effective_text);
+        let blocks = attachments::build_prompt_blocks(&prompt, &ask.attachments);
 
         let Some(mut live) = self.live.take() else {
             return (
@@ -872,7 +895,7 @@ impl Conductor {
             progress: matches!(ask.sink, Sink::Present).then_some(&self.presenter),
             id: ask.id,
         };
-        let end = turn(&mut live, &session, &prompt, interrupts, &ctx).await;
+        let end = turn(&mut live, &session, blocks, interrupts, &ctx).await;
 
         if end.alive {
             self.live = Some(live);
@@ -1358,7 +1381,7 @@ async fn sleep_until(at: Option<Instant>) {
 async fn turn(
     live: &mut Live,
     session: &str,
-    text: &str,
+    prompt_blocks: Vec<Value>,
     interrupts: Interrupts<'_>,
     ctx: &TurnContext<'_>,
 ) -> TurnEnd {
@@ -1368,7 +1391,7 @@ async fn turn(
     let started = Instant::now();
     let mut response = live.conn.start_call(
         "session/prompt",
-        json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]}),
+        json!({"sessionId": session, "prompt": prompt_blocks}),
     );
     let mut answer = String::new();
     let mut denied: Vec<String> = Vec::new();
@@ -1688,16 +1711,22 @@ async fn cancel_turn(
 
 /// Run one request without a daemon: start the agent, ask, stop it. For
 /// `debug prompt`, which is how the agent's behaviour is measured.
-pub async fn ask_once(config: Config, text: String, profile: Option<String>) -> Result<Outcome> {
+pub async fn ask_once(
+    config: Config,
+    text: String,
+    profile: Option<String>,
+    attachment_specs: Vec<crate::protocol::Attachment>,
+) -> Result<Outcome> {
     if let Err(msg) = config.resolve_profile(profile.as_deref()) {
         anyhow::bail!("{msg}");
     }
+    let loaded = attachments::load_all(&attachment_specs)?;
     let mut config = config;
     config.agent.warm_start = false;
     let presenter: Arc<dyn Presenter> = crate::present::Recorder::new();
     let (handle, task) = spawn_inner(Arc::new(config), presenter, Arc::new(SystemContext), false);
     let (tx, rx) = oneshot::channel();
-    let id = handle.ask(text, true, profile, Sink::Client(tx));
+    let id = handle.ask(text, true, profile, loaded, Sink::Client(tx));
     let reply = rx.await.context("the conductor stopped")?;
     handle.shutdown();
     let _ = task.await;

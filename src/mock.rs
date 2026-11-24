@@ -86,6 +86,8 @@ pub enum Step {
     TurnInfo,
     /// "model=M thought=T turn=N in SESSION", for profile tests.
     ConfigInfo,
+    /// Echo a summary of non-text attachment blocks received on this prompt.
+    AttachmentInfo,
     /// "you said: TEXT".
     Echo,
     /// Exit at once with this status, mid-turn.
@@ -172,7 +174,7 @@ pub async fn run(script: &Path, log: Option<PathBuf>) -> Result<()> {
 
     let mut stdin = BufReader::new(tokio::io::stdin());
     loop {
-        let line = match lines::read(&mut stdin, 1 << 20).await? {
+        let line = match lines::read(&mut stdin, crate::acp::MAX_AGENT_LINE).await? {
             Line::Text(line) => line,
             Line::Eof => break,
             Line::TooLong(_) | Line::NotUtf8 => continue,
@@ -350,16 +352,46 @@ impl Mock {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let text: String = params
+        let blocks = params
             .get("prompt")
             .and_then(Value::as_array)
-            .map(|blocks| {
-                blocks
-                    .iter()
-                    .filter_map(|b| b.get("text").and_then(Value::as_str))
-                    .collect()
-            })
+            .cloned()
             .unwrap_or_default();
+        let text: String = blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect();
+        let attach_summary: Vec<String> = blocks
+            .iter()
+            .filter_map(|b| match b.get("type").and_then(Value::as_str) {
+                Some("image") => {
+                    let mime = b.get("mimeType").and_then(Value::as_str).unwrap_or("?");
+                    let len = b
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or(0);
+                    Some(format!("image:{mime}:b64={len}"))
+                }
+                Some("resource") => {
+                    let res = b.get("resource")?;
+                    let uri = res.get("uri").and_then(Value::as_str).unwrap_or("?");
+                    let mime = res.get("mimeType").and_then(Value::as_str).unwrap_or("?");
+                    let len = res
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or(0);
+                    Some(format!("resource:{uri}:{mime}:len={len}"))
+                }
+                _ => None,
+            })
+            .collect();
+        let attach_tag = if attach_summary.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", attach_summary.join(" "))
+        };
         let cancel = Arc::new(Notify::new());
         let turn = {
             let mut state = self.state.lock().unwrap();
@@ -376,7 +408,8 @@ impl Mock {
                 }
             }
         };
-        self.log.line(&format!("prompt {session} {text}"));
+        self.log
+            .line(&format!("prompt {session} {text}{attach_tag}"));
 
         let steps = self
             .script
@@ -416,6 +449,9 @@ impl Mock {
                         &session,
                         &format!("model={model} thought={thought} turn={turn} in {session}"),
                     );
+                }
+                Step::AttachmentInfo => {
+                    self.chunk(&session, &format!("{text}{attach_tag}"));
                 }
                 Step::Echo => self.chunk(&session, &format!("you said: {text}")),
                 Step::SleepMs(ms) => {

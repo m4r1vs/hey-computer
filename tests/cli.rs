@@ -217,6 +217,7 @@ fn last_prints_copies_and_opens_the_saved_answer() {
             request: "show raw".to_string(),
             text: "hi <script>alert(1)</script>".to_string(),
             denied: vec![],
+            attachments: vec![],
         },
     )
     .unwrap();

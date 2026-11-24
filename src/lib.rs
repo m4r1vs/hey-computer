@@ -9,6 +9,7 @@
 //! for the tests.
 
 pub mod acp;
+pub mod attachments;
 pub mod conductor;
 pub mod config;
 pub mod context;

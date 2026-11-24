@@ -150,6 +150,7 @@ pub async fn ask(path: &Path, text: &str, wait: bool, new: bool) -> Result<(u64,
             wait,
             new,
             profile: None,
+            attachments: Vec::new(),
         },
     )
     .await

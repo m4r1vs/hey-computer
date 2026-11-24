@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::attachments::AttachmentMeta;
+
 pub const LAST_FILE: &str = "last.json";
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -39,6 +41,9 @@ pub struct LastAnswer {
     /// Commands refused by the deny list during this turn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied: Vec<String>,
+    /// Metadata for files or images attached to the request (never raw bytes).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentMeta>,
 }
 
 /// Current Unix epoch time in seconds.
@@ -126,6 +131,7 @@ mod tests {
             request: "check <script>".to_string(),
             text: "Result: <script>alert(1)</script>".to_string(),
             denied: vec!["sudo id".to_string()],
+            attachments: vec![],
         };
         save_last(&dir, &record).unwrap();
 
@@ -153,6 +159,7 @@ mod tests {
             request: "second".to_string(),
             text: "Updated.".to_string(),
             denied: vec![],
+            attachments: vec![],
         };
         save_last(&dir, &updated).unwrap();
         assert_eq!(load_last(&dir).unwrap(), Some(updated));
