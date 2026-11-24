@@ -36,6 +36,7 @@
     lib.optionals cfg.skills.enable (
       ["${cfg.package}/share/hey-computer/skills/hyprland-desktop"]
       ++ lib.optionals cfg.obsidian.enable obsidianSkillDirs
+      ++ lib.optionals cfg.openhue.enable ["${cfg.package}/share/hey-computer/skills/openhue"]
     )
     ++ map toString cfg.skills.extra;
 
@@ -62,6 +63,7 @@
     [
       (lib.makeBinPath (
         lib.optional cfg.obsidian.enable obsidianShim
+        ++ lib.optional cfg.openhue.enable cfg.openhue.package
         ++ lib.optional (cfg.agent.package != null) cfg.agent.package
         ++ cfg.extraPackages
         ++ basics
@@ -201,13 +203,28 @@ in {
       };
     };
 
+    openhue = {
+      enable = mkEnableOption ''
+        Philips Hue control via openhue-cli: puts `openhue` on the agent's PATH
+        and links the bundled `openhue` skill when {option}`skills.enable` is set
+      '';
+
+      package = mkOption {
+        type = types.package;
+        default = pkgs.openhue-cli;
+        defaultText = literalExpression "pkgs.openhue-cli";
+        description = "The openhue-cli package placed on the agent's PATH.";
+      };
+    };
+
     skills = {
       enable = mkOption {
         type = types.bool;
         default = true;
         description = ''
-          Give the agent the bundled `hyprland-desktop` skill, and the
-          Obsidian skills when {option}`obsidian.enable` is set.
+          Give the agent the bundled `hyprland-desktop` skill, the Obsidian
+          skills when {option}`obsidian.enable` is set, and the bundled
+          `openhue` skill when {option}`openhue.enable` is set.
         '';
       };
 

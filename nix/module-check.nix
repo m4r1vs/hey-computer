@@ -8,9 +8,10 @@
 }: let
   inherit (pkgs) lib;
 
-  # Stand-ins for the unfree agent and Obsidian packages.
+  # Stand-ins for the unfree agent, Obsidian, and openhue packages.
   stubAgent = pkgs.writeShellScriptBin "agy" ''echo "agy stub: $*"'';
   stubObsidian = pkgs.writeShellScriptBin "obsidian-cli" ''echo "obsidian-cli stub: $*"'';
+  stubOpenhue = pkgs.writeShellScriptBin "openhue" ''echo "openhue stub: $*"'';
 
   evaluate = settings:
     (home-manager.lib.homeManagerConfiguration {
@@ -28,6 +29,7 @@
               enable = true;
               agent.package = stubAgent;
               obsidian.package = stubObsidian;
+              openhue.package = stubOpenhue;
             }
             settings;
         }
@@ -36,6 +38,7 @@
 
   full = evaluate {
     vault = "/home/alice/Alice's Notes";
+    openhue.enable = true;
     extraPackages = [pkgs.hello];
     settings = {
       conversation.follow_up_secs = 60;
@@ -59,12 +62,12 @@
   "the viewer must start in a scope of its own";
   assert lib.assertMsg (lib.elem "--name=hey-computer.answer" (settingsOf full).present.viewer)
   "the default viewer sets the app id";
-  assert lib.assertMsg (lib.length (settingsOf full).instructions.skills == 5)
-  "five skills with a vault: hyprland-desktop and four from obsidian-skills";
+  assert lib.assertMsg (lib.length (settingsOf full).instructions.skills == 6)
+  "six skills with a vault and openhue: hyprland-desktop, four from obsidian-skills, and openhue";
   assert lib.assertMsg ((settingsOf custom).present.viewer == ["my-viewer" "{file}"])
   "a user's viewer replaces the default";
   assert lib.assertMsg (lib.length (settingsOf custom).instructions.skills == 1)
-  "without a vault only the bundled skill";
+  "without a vault or openhue only the bundled hyprland-desktop skill";
   assert lib.assertMsg (!((settingsOf bare).instructions or {} ? skills))
   "skills.enable = false links no skills";
   assert lib.assertMsg (!(builtins.tryEval (evaluate {vualt = "/tmp";}).programs.hey-computer.settings).success)
@@ -87,7 +90,7 @@ in
       export XDG_STATE_HOME=$TMPDIR/state
       $hc --config ${configFile} debug prepare
       skills=$XDG_STATE_HOME/hey-computer/agy/config/skills
-      for skill in hyprland-desktop obsidian-cli obsidian-markdown obsidian-bases json-canvas; do
+      for skill in hyprland-desktop obsidian-cli obsidian-markdown obsidian-bases json-canvas openhue; do
         test -e "$skills/$skill/SKILL.md" || { echo "missing skill $skill" >&2; exit 1; }
       done
       grep -q "Alice's Notes" $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md
@@ -102,9 +105,10 @@ in
       agent_path=$(sed -n 's/^Environment=PATH=//p' ${unit})
       test -n "$agent_path"
 
-      # The agent's PATH: the shim first, then agy, the extras and the basics.
+      # The agent's PATH: the shim first, then openhue, agy, the extras and the basics.
       PATH=$agent_path
       test "$(obsidian help)" = "obsidian-cli stub: help"
+      test "$(openhue version)" = "openhue stub: version"
       test "$(agy --version)" = "agy stub: --version"
       for tool in hello jq notify-send playerctl wpctl bash rg curl; do
         command -v $tool > /dev/null || { echo "$tool is not on the agent's PATH" >&2; exit 1; }

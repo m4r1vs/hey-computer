@@ -312,7 +312,9 @@ told about Obsidian.
 | `vault` | null | sets `instructions.vault` |
 | `obsidian.enable` | `vault != null` | the Obsidian skills and the `obsidian` shim |
 | `obsidian.package` | `pkgs.obsidian` (unfree) | whose `bin/obsidian-cli` the shim runs |
-| `skills.enable` | true | the bundled `hyprland-desktop` skill, and the Obsidian skills when enabled |
+| `openhue.enable` | false | puts `openhue` on the agent's PATH and links the bundled `openhue` skill |
+| `openhue.package` | `pkgs.openhue-cli` | the openhue CLI package |
+| `skills.enable` | true | the bundled `hyprland-desktop` skill, plus the Obsidian and `openhue` skills when enabled |
 | `skills.extra` | `[]` | more skill directories |
 | `viewer.package` | `pkgs.marker` | installed |
 | `viewer.command` | `env DBUS_SESSION_BUS_ADDRESS=disabled: marker --name=hey-computer.answer --preview {file}` | |
@@ -320,13 +322,13 @@ told about Obsidian.
 
 **The service** is bound to `graphical-session.target` (`After`, `PartOf`,
 `WantedBy`), restarts on failure, and runs with `NoNewPrivileges=yes` and a
-`PATH` of: the `obsidian` shim (when enabled), the agent package,
-`extraPackages`, a set of basics (bash, coreutils, findutils, diffutils, grep,
-sed, awk, procps, curl, jq, ripgrep, notify-send, playerctl, wpctl), then
-`systemPath`. It takes `DBUS_SESSION_BUS_ADDRESS`, `WAYLAND_DISPLAY` and
-`HYPRLAND_INSTANCE_SIGNATURE` from the user manager's environment, as every
-graphical-session service does. agy needs the session bus for its login in the
-keyring.
+`PATH` of: the `obsidian` shim (when enabled), `openhue` (when enabled), the
+agent package, `extraPackages`, a set of basics (bash, coreutils, findutils,
+diffutils, grep, sed, awk, procps, curl, jq, ripgrep, notify-send, playerctl,
+wpctl), then `systemPath`. It takes `DBUS_SESSION_BUS_ADDRESS`,
+`WAYLAND_DISPLAY` and `HYPRLAND_INSTANCE_SIGNATURE` from the user manager's
+environment, as every graphical-session service does. agy needs the session bus
+for its login in the keyring.
 
 **The viewer** is started through `systemd-run --user --scope`, so its window
 does not belong to the service and survives a restart of the daemon.
@@ -339,7 +341,10 @@ expressions such as `hl.dsp.focus({ workspace = 3 })`; the old
 Hyprland, notifications, media players and volume. With a vault, four skills
 from [obsidian-skills](https://github.com/obsidianmd/obsidian-skills)
 (obsidian-cli, obsidian-markdown, obsidian-bases, json-canvas) are added; the
-other three need npm tools and are left out.
+other three need npm tools and are left out. With `openhue.enable = true`, the
+bundled `openhue` skill teaches the agent Philips Hue control through the
+`openhue` CLI (rooms, lights, scenes, Mirek color temperatures, and `--room`
+disambiguation).
 
 **The `obsidian` shim.** The upstream obsidian-cli skill runs `obsidian …`.
 nixpkgs' `obsidian` package ships the desktop application as `obsidian` and its
