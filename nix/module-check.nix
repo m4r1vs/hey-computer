@@ -41,6 +41,10 @@
     openhue.enable = true;
     extraPackages = [pkgs.hello];
     settings = {
+      agent = {
+        max_tool_calls = 15;
+        max_turn_secs = 180;
+      };
       conversation.follow_up_secs = 60;
       instructions.extra = "Prefer metric units.";
     };

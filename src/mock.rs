@@ -89,6 +89,8 @@ pub enum Step {
         code: i64,
         message: String,
     },
+    /// Send a raw `session/update` payload.
+    Update(Value),
 }
 
 struct Logger(Option<PathBuf>);
@@ -442,6 +444,7 @@ impl Mock {
                     self.error(&id, code, &message);
                     return;
                 }
+                Step::Update(update) => self.update(&session, update),
             }
         }
         self.update(

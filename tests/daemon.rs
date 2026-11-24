@@ -769,3 +769,131 @@ async fn memory_snapshot_is_frozen_until_next_agent_start() {
     h.stop().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_exceeding_max_tool_calls_is_stopped() {
+    let script = r##"{
+      "turns": [
+        {
+          "match": "within_limit",
+          "steps": [
+            {"update": {"sessionUpdate": "tool_call", "toolCallId": "read_1", "kind": "read", "title": "Read file"}},
+            {"update": {"sessionUpdate": "tool_call", "toolCallId": "read_1", "kind": "read", "title": "Read file"}},
+            {"update": {"sessionUpdate": "tool_call_update", "toolCallId": "read_1", "status": "in_progress"}},
+            {"update": {"sessionUpdate": "tool_call_update", "toolCallId": "read_1", "status": "completed"}},
+            {"permission": {"command": "hyprctl version"}},
+            {"chunk": "done"}
+          ]
+        },
+        {
+          "match": "too_many",
+          "steps": [
+            {"permission": {"command": "echo one"}},
+            {"permission": {"command": "echo two"}},
+            {"permission": {"command": "echo three"}},
+            {"chunk": "never reached"}
+          ]
+        },
+        {"match": "turn", "steps": ["turn_info"]}
+      ],
+      "default": ["echo"]
+    }"##;
+
+    let h = Harness::start(script, |c| c.agent.max_tool_calls = 2).await;
+    h.wait_log("new mock-1").await;
+
+    // Two distinct tool calls (with duplicate updates) stay within the limit.
+    assert_eq!(answer(&h.ask("within_limit", false).await), "done");
+
+    // Three distinct tool calls trip the limit before the 3rd is allowed.
+    let reply = h.ask("too_many", false).await;
+    let (reason, message) = failure(&reply);
+    assert_eq!(reason, FailReason::LimitReached);
+    assert!(message.contains("2 tool calls"), "{message}");
+    assert_eq!(h.log_count("permission allow_once echo "), 2);
+    assert_eq!(h.log_count("permission allow_once echo three"), 0);
+    assert_eq!(h.log_count("cancel mock-1"), 1);
+    assert_eq!(h.status().await.follow_up_secs, None);
+
+    // The broken session is closed and the next turn gets a fresh session on the same warm agent.
+    assert_eq!(answer(&h.ask("turn", false).await), "turn 1 in mock-2");
+    h.wait_log("close mock-1").await;
+    assert_eq!(h.log_count("start"), 1);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_exceeding_max_turn_secs_is_stopped_despite_updates() {
+    let script = r##"{
+      "turns": [
+        {
+          "match": "chatter",
+          "steps": [
+            {"chunk": "."}, {"sleep_ms": 150},
+            {"chunk": "."}, {"sleep_ms": 150},
+            {"chunk": "."}, {"sleep_ms": 150},
+            {"chunk": "."}, {"sleep_ms": 150},
+            {"chunk": "."}, {"sleep_ms": 150},
+            {"chunk": "."}, {"sleep_ms": 150},
+            {"chunk": "."}, {"sleep_ms": 150},
+            {"chunk": "."}, {"sleep_ms": 150},
+            {"chunk": "."}, {"sleep_ms": 150},
+            {"chunk": "."}, {"sleep_ms": 150}
+          ]
+        },
+        {"match": "turn", "steps": ["turn_info"]}
+      ],
+      "default": ["echo"]
+    }"##;
+
+    let h = Harness::start(script, |c| {
+        c.agent.inactivity_timeout_secs = 0.5;
+        c.agent.max_turn_secs = 0.9;
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    let started = Instant::now();
+    let reply = h.ask("chatter", false).await;
+    let elapsed = started.elapsed();
+    let (reason, message) = failure(&reply);
+    assert_eq!(reason, FailReason::Timeout);
+    assert!(message.contains("ran for more than"), "{message}");
+    assert!(elapsed >= Duration::from_millis(700), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    assert_eq!(h.log_count("cancel mock-1"), 1);
+    assert_eq!(h.status().await.follow_up_secs, None);
+
+    assert_eq!(answer(&h.ask("turn", false).await), "turn 1 in mock-2");
+    h.wait_log("close mock-1").await;
+    assert_eq!(h.log_count("start"), 1);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_budgets_disable_turn_and_tool_call_limits() {
+    let script = r##"{
+      "turns": [
+        {
+          "match": "three",
+          "steps": [
+            {"permission": {"command": "echo one"}},
+            {"permission": {"command": "echo two"}},
+            {"permission": {"command": "echo three"}},
+            {"chunk": "all ran"}
+          ]
+        }
+      ],
+      "default": ["echo"]
+    }"##;
+
+    let h = Harness::start(script, |c| {
+        c.agent.max_tool_calls = 0;
+        c.agent.max_turn_secs = 0.0;
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+    assert_eq!(answer(&h.ask("three", false).await), "all ran");
+    assert_eq!(h.log_count("permission allow_once echo "), 3);
+    h.stop().await;
+}

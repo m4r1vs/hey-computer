@@ -42,6 +42,12 @@ pub struct Agent {
     /// It is not a cap on the whole request: one shell command alone can
     /// take ten seconds.
     pub inactivity_timeout_secs: f64,
+    /// Hard wall-clock cap on a single turn, even while updates keep arriving.
+    /// Zero disables the cap.
+    pub max_turn_secs: f64,
+    /// Maximum distinct tool calls allowed in a single turn. Zero disables the
+    /// cap.
+    pub max_tool_calls: usize,
     /// First delay before restarting an agent that died; it doubles with
     /// every failure in a row, up to a minute.
     pub restart_delay_secs: f64,
@@ -139,6 +145,8 @@ impl Default for Agent {
             warm_start: true,
             idle_stop_secs: 0.0,
             inactivity_timeout_secs: 45.0,
+            max_turn_secs: 300.0,
+            max_tool_calls: 20,
             restart_delay_secs: 1.0,
             history_days: 7.0,
             settings: toml::Table::new(),
@@ -228,6 +236,7 @@ impl Config {
                 "agent.inactivity_timeout_secs",
                 self.agent.inactivity_timeout_secs,
             ),
+            ("agent.max_turn_secs", self.agent.max_turn_secs),
             ("agent.restart_delay_secs", self.agent.restart_delay_secs),
             (
                 "conversation.follow_up_secs",
@@ -325,6 +334,8 @@ mod tests {
         let text = toml::to_string(&Config::default()).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed.agent.model, "gemini-4-hydrogen");
+        assert_eq!(parsed.agent.max_turn_secs, 300.0);
+        assert_eq!(parsed.agent.max_tool_calls, 20);
         assert_eq!(parsed.present.max_chars, 230);
         assert!(parsed.instructions.memory_file.as_os_str().is_empty());
         assert_eq!(
@@ -457,5 +468,30 @@ mod tests {
             config.instructions.memory_file = PathBuf::from(good);
             config.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn turn_budget_config_is_validated() {
+        let parsed: Config =
+            toml::from_str("[agent]\nmax_turn_secs = 0\nmax_tool_calls = 0\n").unwrap();
+        assert_eq!(parsed.agent.max_turn_secs, 0.0);
+        assert_eq!(parsed.agent.max_tool_calls, 0);
+        parsed.validate().unwrap();
+
+        let parsed: Config =
+            toml::from_str("[agent]\nmax_turn_secs = 12.5\nmax_tool_calls = 15\n").unwrap();
+        assert_eq!(parsed.agent.max_turn_secs, 12.5);
+        assert_eq!(parsed.agent.max_tool_calls, 15);
+        parsed.validate().unwrap();
+
+        for bad in [-1.0, f64::NAN, f64::INFINITY, MAX_SECS + 1.0] {
+            let mut config = Config::default();
+            config.agent.max_turn_secs = bad;
+            assert!(config.validate().is_err(), "{bad} should be refused");
+        }
+
+        let mut config = Config::default();
+        config.agent.max_turn_secs = MAX_SECS;
+        config.validate().unwrap();
     }
 }

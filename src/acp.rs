@@ -445,6 +445,14 @@ pub fn chunk_text(update: &Value) -> Option<&str> {
     content.get("text")?.as_str()
 }
 
+/// The `toolCallId` on a `tool_call` update or `toolCall` object, if non-empty.
+pub fn tool_call_id(value: &Value) -> Option<&str> {
+    value
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
 /// The shell command a permission request is about, if it is one.
 pub fn permission_command(params: &Value) -> Option<String> {
     let call = params.get("toolCall")?;
@@ -537,6 +545,14 @@ mod tests {
         assert_eq!(chunk_text(&chunk), Some("ok"));
         let thought = json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "hm"}});
         assert_eq!(chunk_text(&thought), None);
+    }
+
+    #[test]
+    fn extracts_non_empty_tool_call_ids() {
+        let params = agy_permission();
+        assert_eq!(tool_call_id(&params["toolCall"]), Some("call_1"));
+        assert_eq!(tool_call_id(&json!({"toolCallId": ""})), None);
+        assert_eq!(tool_call_id(&json!({"kind": "read"})), None);
     }
 
     #[test]

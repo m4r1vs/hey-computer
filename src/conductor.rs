@@ -10,6 +10,7 @@
 //! ever starts the newest; it answers older ones as superseded without running
 //! them.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -323,7 +324,64 @@ enum Step {
     Responded(Result<Result<Value, CallError>, oneshot::error::RecvError>),
     Event(Option<Incoming>),
     Quiet,
+    TurnTimeout,
     Cancelled(FailReason),
+}
+
+#[derive(Clone, Copy)]
+struct Budgets {
+    inactivity: Duration,
+    max_turn: Option<Duration>,
+    max_tool_calls: Option<usize>,
+}
+
+enum TurnAbort {
+    Quiet,
+    TurnTimeout(Duration),
+    ToolLimit(usize),
+    Cancelled(FailReason),
+}
+
+/// Counts distinct tool calls in a single turn without double-counting
+/// repeated `tool_call` updates or the matching `session/request_permission`.
+#[derive(Default)]
+struct ToolTracker {
+    seen: HashSet<String>,
+    count: usize,
+}
+
+impl ToolTracker {
+    fn record_update(&mut self, id: Option<&str>) -> bool {
+        match id {
+            Some(id) => {
+                if self.seen.insert(id.to_string()) {
+                    self.count += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                self.count += 1;
+                true
+            }
+        }
+    }
+
+    fn record_permission(&mut self, id: Option<&str>) -> bool {
+        if let Some(id) = id
+            && self.seen.insert(id.to_string())
+        {
+            self.count += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
 }
 
 impl Conductor {
@@ -667,15 +725,20 @@ impl Conductor {
         let Some(mut live) = self.live.take() else {
             return Outcome::failed(FailReason::AgentDown, "the assistant exited");
         };
-        let inactivity =
-            secs(self.config.agent.inactivity_timeout_secs).unwrap_or(Duration::from_secs(45));
+        let budgets = Budgets {
+            inactivity: secs(self.config.agent.inactivity_timeout_secs)
+                .unwrap_or(Duration::from_secs(45)),
+            max_turn: secs(self.config.agent.max_turn_secs),
+            max_tool_calls: (self.config.agent.max_tool_calls > 0)
+                .then_some(self.config.agent.max_tool_calls),
+        };
         let end = turn(
             &mut live,
             &session,
             &ask.text,
             interrupts,
             &self.policy,
-            inactivity,
+            budgets,
             ask.id,
         )
         .await;
@@ -685,7 +748,14 @@ impl Conductor {
             if end.auth_required {
                 self.stop_agent().await;
             } else if end.broken {
-                self.conversation = None;
+                if let Some(old) = self.conversation.take()
+                    && let Some(live) = &self.live
+                {
+                    drop(
+                        live.conn
+                            .start_call("session/close", json!({"sessionId": old.session})),
+                    );
+                }
                 self.set_follow_up(None);
             } else if let Some(conversation) = &mut self.conversation {
                 conversation.last = Instant::now();
@@ -996,7 +1066,7 @@ async fn turn(
     text: &str,
     interrupts: Interrupts<'_>,
     policy: &Policy,
-    inactivity: Duration,
+    budgets: Budgets,
     id: u64,
 ) -> TurnEnd {
     let started = Instant::now();
@@ -1007,8 +1077,12 @@ async fn turn(
     let mut answer = String::new();
     let mut denied: Vec<String> = Vec::new();
     let mut tools: Vec<String> = Vec::new();
+    let mut tracker = ToolTracker::default();
     let mut first_text: Option<Duration> = None;
-    let mut deadline = Instant::now() + inactivity;
+    let mut deadline = Instant::now() + budgets.inactivity;
+    let turn_deadline = budgets.max_turn.and_then(|d| started.checked_add(d));
+    let turn_sleep = sleep_until(turn_deadline);
+    tokio::pin!(turn_sleep);
     let at = || started.elapsed().as_secs_f64();
 
     let ended = loop {
@@ -1020,6 +1094,7 @@ async fn turn(
             event = live.incoming.recv() => Step::Event(event),
             result = &mut response => Step::Responded(result),
             () = tokio::time::sleep_until(deadline.into()) => Step::Quiet,
+            () = &mut turn_sleep => Step::TurnTimeout,
             reason = interrupts.wait() => Step::Cancelled(reason),
         };
         match step {
@@ -1042,11 +1117,18 @@ async fn turn(
                 if from != session {
                     continue;
                 }
-                deadline = Instant::now() + inactivity;
+                if let Some(limit) = budgets.max_turn
+                    && turn_deadline.is_some_and(|d| Instant::now() >= d)
+                {
+                    break Err(TurnAbort::TurnTimeout(limit));
+                }
+                deadline = Instant::now() + budgets.inactivity;
                 if let Some(chunk) = acp::chunk_text(&update) {
                     first_text.get_or_insert_with(|| started.elapsed());
                     answer.push_str(chunk);
-                } else if update.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call") {
+                } else if update.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call")
+                    && tracker.record_update(acp::tool_call_id(&update))
+                {
                     let kind = update
                         .get("kind")
                         .and_then(Value::as_str)
@@ -1056,13 +1138,34 @@ async fn turn(
                     let title = update.get("title").and_then(Value::as_str).unwrap_or("");
                     tracing::debug!("request {id}: tool call {title}");
                     tools.push(kind);
+                    if let Some(limit) = budgets.max_tool_calls
+                        && tracker.count() > limit
+                    {
+                        break Err(TurnAbort::ToolLimit(limit));
+                    }
                 }
             }
             Step::Event(Some(Incoming::Permission {
                 id: request,
                 params,
             })) => {
-                deadline = Instant::now() + inactivity;
+                if let Some(limit) = budgets.max_turn
+                    && turn_deadline.is_some_and(|d| Instant::now() >= d)
+                {
+                    live.conn
+                        .respond(request, json!({"outcome": {"outcome": "cancelled"}}));
+                    break Err(TurnAbort::TurnTimeout(limit));
+                }
+                deadline = Instant::now() + budgets.inactivity;
+                let _ =
+                    tracker.record_permission(params.get("toolCall").and_then(acp::tool_call_id));
+                if let Some(limit) = budgets.max_tool_calls
+                    && tracker.count() > limit
+                {
+                    live.conn
+                        .respond(request, json!({"outcome": {"outcome": "cancelled"}}));
+                    break Err(TurnAbort::ToolLimit(limit));
+                }
                 let command = acp::permission_command(&params);
                 let refused = command.as_deref().and_then(|c| policy.denied_word(c));
                 let kind = params
@@ -1082,26 +1185,67 @@ async fn turn(
                 };
                 live.conn.respond(request, outcome);
             }
-            Step::Quiet => break Err(FailReason::Timeout),
-            Step::Cancelled(reason) => break Err(reason),
+            Step::Quiet => break Err(TurnAbort::Quiet),
+            Step::TurnTimeout => {
+                let limit = budgets.max_turn.unwrap_or(Duration::ZERO);
+                break Err(TurnAbort::TurnTimeout(limit));
+            }
+            Step::Cancelled(reason) => break Err(TurnAbort::Cancelled(reason)),
         }
     };
 
     let result = match ended {
         Ok(result) => result,
-        Err(reason) => {
+        Err(abort) => {
             let alive = cancel_turn(live, session, &mut response).await;
-            let message = match reason {
-                FailReason::Timeout => format!(
-                    "The assistant sent nothing for {} s and was stopped.",
-                    inactivity.as_secs_f64().round()
+            let (reason, message, broken) = match abort {
+                TurnAbort::Quiet => (
+                    FailReason::Timeout,
+                    format!(
+                        "The assistant sent nothing for {} s and was stopped.",
+                        budgets.inactivity.as_secs_f64().round()
+                    ),
+                    false,
                 ),
-                other => cancel_message(other).to_string(),
+                TurnAbort::TurnTimeout(limit) => {
+                    tracing::warn!(
+                        "request {id}: +{:.2} s exceeded max_turn_secs ({:.0} s)",
+                        at(),
+                        limit.as_secs_f64()
+                    );
+                    (
+                        FailReason::Timeout,
+                        format!(
+                            "The assistant ran for more than {} s and was stopped.",
+                            limit.as_secs_f64().round()
+                        ),
+                        true,
+                    )
+                }
+                TurnAbort::ToolLimit(limit) => {
+                    tracing::warn!(
+                        "request {id}: +{:.2} s exceeded max_tool_calls ({limit})",
+                        at()
+                    );
+                    let noun = if limit == 1 {
+                        "tool call"
+                    } else {
+                        "tool calls"
+                    };
+                    (
+                        FailReason::LimitReached,
+                        format!(
+                            "The assistant exceeded the limit of {limit} {noun} and was stopped."
+                        ),
+                        true,
+                    )
+                }
+                TurnAbort::Cancelled(reason) => (reason, cancel_message(reason).to_string(), false),
             };
             return TurnEnd {
                 outcome: Outcome::failed(reason, message),
                 alive,
-                broken: false,
+                broken,
                 auth_required: false,
             };
         }
@@ -1234,4 +1378,27 @@ pub async fn ask_once(config: Config, text: String) -> Result<Outcome> {
             format!("unexpected reply to request {id}: {other:?}"),
         ),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_tracker_counts_distinct_calls_without_double_counting() {
+        let mut tracker = ToolTracker::default();
+        assert!(tracker.record_update(Some("call_1")));
+        assert!(!tracker.record_update(Some("call_1")));
+        assert!(!tracker.record_permission(Some("call_1")));
+        assert_eq!(tracker.count(), 1);
+
+        assert!(tracker.record_permission(Some("call_2")));
+        assert!(!tracker.record_update(Some("call_2")));
+        assert_eq!(tracker.count(), 2);
+
+        // Updates without an id count once; a matching id-less permission does not double-count.
+        assert!(tracker.record_update(None));
+        assert!(!tracker.record_permission(None));
+        assert_eq!(tracker.count(), 3);
+    }
 }

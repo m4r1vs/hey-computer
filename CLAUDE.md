@@ -97,7 +97,7 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   the agent had read and edited the vault.
 - Timings: agent start 0.09–0.17 s; first session 0.8–1.2 s, later 0.02–0.06 s; a plain
   answer 1.5–2.8 s; one shell command 5–10 s (tool call to permission request alone was
-  0.8 s in one run and 5.7 s in another). Hence inactivity timeouts, not total caps.
+  0.8 s in one run and 5.7 s in another). Hence inactivity timeouts alongside generous hard turn caps (`max_turn_secs`, `max_tool_calls`).
 - agy's terminal sandbox fails on some NixOS hosts; with it on, a `hyprctl version` turn took
   16.6 s, off 6.4 s. `enableTerminalSandbox = false` and `toolPermission = "request-review"`
   are the generated defaults; both changed between the two runs.

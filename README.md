@@ -52,9 +52,11 @@ same conversation, so "and the day after?" works; a later one starts afresh.
 `ask --new` always starts afresh. A request that arrives while another is
 running cancels the running one, which is how "no, I meant…" works.
 
-**Timeouts** are about silence, not duration: a request is cancelled when the
-agent has sent nothing for 45 s. A single shell command can take ten seconds,
-so a cap on the whole request would cut off legitimate work.
+**Timeouts and budgets.** A request is cancelled if the agent sends nothing for
+45 s (`agent.inactivity_timeout_secs`). To stop runaway retry loops even while
+updates keep arriving, each turn also has generous hard caps of 300 s wall-clock
+time (`agent.max_turn_secs`) and 20 distinct tool calls (`agent.max_tool_calls`);
+set either to 0 to disable it.
 
 ### The agent's own directory
 
@@ -168,7 +170,8 @@ empty. `reason` is one of:
 |---|---|
 | `cancelled` | `cancel`, or the waiting client went away |
 | `superseded` | a newer request replaced it |
-| `timeout` | the agent sent nothing for `agent.inactivity_timeout_secs` |
+| `timeout` | the agent sent nothing for `agent.inactivity_timeout_secs`, or the turn exceeded `agent.max_turn_secs` |
+| `limit_reached` | the agent exceeded `agent.max_tool_calls` |
 | `agent_down` | the agent could not be started, or exited mid-request |
 | `agent_error` | the agent refused the request; `message` is what it said. Without a login agy says `Authentication required`, and the message adds how to sign in (`agy acp --login`) |
 | `denied` | the only thing the agent tried was refused by the deny list |
@@ -218,6 +221,8 @@ thought_level = "low"               # likewise
 warm_start = true                   # start with the daemon, and restart after a crash
 idle_stop_secs = 0                  # stop the agent after this long unused; 0 = never
 inactivity_timeout_secs = 45        # cancel a request after this long without an update
+max_turn_secs = 300                 # hard wall-clock cap per turn; 0 = unlimited
+max_tool_calls = 20                 # maximum distinct tool calls per turn; 0 = unlimited
 restart_delay_secs = 1              # doubles with every failure in a row, up to 60 s
 history_days = 7                    # delete agy's conversations older than this at agent start; 0 = keep
 

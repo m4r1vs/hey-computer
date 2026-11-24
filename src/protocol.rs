@@ -77,8 +77,11 @@ pub enum FailReason {
     Cancelled,
     /// A newer request replaced it.
     Superseded,
-    /// The agent went quiet for longer than the inactivity timeout.
+    /// The agent went quiet for longer than the inactivity timeout, or
+    /// exceeded the turn wall-clock limit.
     Timeout,
+    /// The agent exceeded a per-turn budget (such as `agent.max_tool_calls`).
+    LimitReached,
     /// The agent could not be started, or exited mid-request.
     AgentDown,
     /// The agent refused the request; the message is what it said.
@@ -95,7 +98,8 @@ impl FailReason {
         match self {
             Self::Cancelled => "Request cancelled",
             Self::Superseded => "Request replaced",
-            Self::Timeout => "The assistant stopped responding",
+            Self::Timeout => "Request timed out",
+            Self::LimitReached => "Limit reached",
             Self::AgentDown => "The assistant is not running",
             Self::AgentError => "The assistant refused the request",
             Self::Denied => "Command refused",
@@ -215,6 +219,11 @@ mod tests {
                 reason: FailReason::Timeout,
                 message: "no update for 45 s".to_string(),
             },
+            Reply::Failed {
+                id: 6,
+                reason: FailReason::LimitReached,
+                message: "too many tool calls".to_string(),
+            },
             Reply::Cancelled { id: None },
             Reply::Status(Status {
                 agent: AgentState::Ready,
@@ -246,6 +255,14 @@ mod tests {
         assert_eq!(
             encode(&Reply::Cancelled { id: Some(2) }),
             r#"{"type":"cancelled","id":2}"#
+        );
+        assert_eq!(
+            encode(&Reply::Failed {
+                id: 3,
+                reason: FailReason::LimitReached,
+                message: "limit".to_string(),
+            }),
+            r#"{"type":"failed","id":3,"reason":"limit_reached","message":"limit"}"#
         );
     }
 
