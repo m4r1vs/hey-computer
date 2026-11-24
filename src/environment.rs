@@ -107,6 +107,7 @@ pub fn prepare(config: &Config) -> Result<Paths> {
     private_dir(&settings_dir)?;
     let settings = serde_json::to_string_pretty(&settings(config)?)?;
     write_file(&settings_dir.join("settings.json"), &settings)?;
+    link_mcp_oauth_tokens(&settings_dir, &config.agent.mcp_oauth_tokens_file)?;
 
     let skills_dir = paths.agent_dir.join("config").join("skills");
     link_skills(&skills_dir, &config.instructions.skills)?;
@@ -143,6 +144,49 @@ fn clear_keyring_unavailable(agent_dir: &Path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => tracing::debug!("cannot remove {}: {e}", marker.display()),
     }
+}
+
+/// Share an existing `mcp_oauth_tokens.json` (for example from an interactive
+/// `agy` installation) into `<agent_dir>/antigravity-cli/mcp_oauth_tokens.json`
+/// via symlink so OAuth-authenticated remote MCP servers work without a second
+/// sign-in and do not drift on rotating refresh tokens.
+fn link_mcp_oauth_tokens(settings_dir: &Path, source: &Path) -> Result<()> {
+    if source.as_os_str().is_empty() {
+        return Ok(());
+    }
+    if !source.exists() {
+        tracing::debug!(
+            "agent.mcp_oauth_tokens_file does not exist yet: {}",
+            source.display()
+        );
+        return Ok(());
+    }
+    let dest = settings_dir.join("mcp_oauth_tokens.json");
+    match std::fs::symlink_metadata(&dest) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if std::fs::read_link(&dest).ok().as_deref() == Some(source) {
+                return Ok(());
+            }
+            std::fs::remove_file(&dest)
+                .with_context(|| format!("replacing stale symlink {}", dest.display()))?;
+        }
+        Ok(_) => {
+            tracing::warn!(
+                "leaving existing regular file {} in place instead of symlinking {}",
+                dest.display(),
+                source.display()
+            );
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("inspecting {}", dest.display()));
+        }
+    }
+    std::os::unix::fs::symlink(source, &dest)
+        .with_context(|| format!("linking {} -> {}", dest.display(), source.display()))?;
+    tracing::info!("linked mcp_oauth_tokens.json from {}", source.display());
+    Ok(())
 }
 
 /// The agent's `settings.json`: the daemon's defaults, then whatever
@@ -916,6 +960,56 @@ mod tests {
                 ..
             }
         ));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mcp_oauth_tokens_file_is_symlinked_and_never_clobbers_regular_files() {
+        let root = scratch("mcp-oauth");
+        let missing = root.join("missing.json");
+        let source_a = root.join("oauth-a.json");
+        let source_b = root.join("oauth-b.json");
+        std::fs::write(&source_a, r#"{"https://mcp.example/mcp":{}}"#).unwrap();
+        std::fs::write(&source_b, r#"{"https://mcp.other/mcp":{}}"#).unwrap();
+
+        // Missing source is a quiet no-op.
+        let mut config = Config {
+            state_dir: root.join("state"),
+            ..Config::default()
+        };
+        config.agent.mcp_oauth_tokens_file = missing;
+        let paths = prepare(&config).unwrap();
+        let dest = paths
+            .agent_dir
+            .join("antigravity-cli/mcp_oauth_tokens.json");
+        assert!(std::fs::symlink_metadata(&dest).is_err());
+
+        // Existing source is symlinked, and changing the config updates the symlink.
+        config.agent.mcp_oauth_tokens_file = source_a.clone();
+        prepare(&config).unwrap();
+        assert_eq!(std::fs::read_link(&dest).unwrap(), source_a);
+
+        config.agent.mcp_oauth_tokens_file = source_b.clone();
+        prepare(&config).unwrap();
+        assert_eq!(std::fs::read_link(&dest).unwrap(), source_b);
+
+        // If agy replaced the symlink with a regular file (e.g. atomic refresh),
+        // prepare() leaves that regular file untouched instead of clobbering it.
+        std::fs::remove_file(&dest).unwrap();
+        std::fs::write(&dest, r#"{"refreshed":true}"#).unwrap();
+        config.agent.mcp_oauth_tokens_file = source_a;
+        prepare(&config).unwrap();
+        assert!(
+            !std::fs::symlink_metadata(&dest)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            r#"{"refreshed":true}"#
+        );
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

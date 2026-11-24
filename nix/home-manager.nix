@@ -311,26 +311,42 @@ in {
       '';
     };
 
-    mcp.servers = mkOption {
-      type = types.attrsOf (types.attrsOf types.anything);
-      default = {};
-      example = literalExpression ''
-        {
-          nixos.command = lib.getExe pkgs.mcp-nixos;
-          slack = {
-            command = lib.getExe pkgs.slack-mcp-server;
-            args = ["--transport" "stdio"];
-            env.SLACK_MCP_XOXC_TOKEN.file = "/home/alice/.local/state/slack-mcp/xoxc";
-          };
-        }
-      '';
-      description = ''
-        MCP servers passed to ACP sessions via `session/new` `mcpServers`.
-        Accepts the same `env` / `headers` `{ file = "/abs/path"; }` form as
-        Home Manager's `programs.mcp.servers` and lowers secret file entries to
-        `settings.mcp.<name>.env_files` / `header_files` so credentials never
-        enter the Nix store.
-      '';
+    mcp = {
+      servers = mkOption {
+        type = types.attrsOf (types.attrsOf types.anything);
+        default = {};
+        example = literalExpression ''
+          {
+            nixos.command = lib.getExe pkgs.mcp-nixos;
+            slack = {
+              command = lib.getExe pkgs.slack-mcp-server;
+              args = ["--transport" "stdio"];
+              env.SLACK_MCP_XOXC_TOKEN.file = "/home/alice/.local/state/slack-mcp/xoxc";
+            };
+          }
+        '';
+        description = ''
+          MCP servers passed to ACP sessions via `session/new` `mcpServers`.
+          Accepts the same `env` / `headers` `{ file = "/abs/path"; }` form as
+          Home Manager's `programs.mcp.servers` and lowers secret file entries to
+          `settings.mcp.<name>.env_files` / `header_files` so credentials never
+          enter the Nix store.
+        '';
+      };
+
+      oauthTokensFile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = literalExpression ''"''${config.home.homeDirectory}/.gemini/antigravity-cli/mcp_oauth_tokens.json"'';
+        description = ''
+          Optional path to an existing `mcp_oauth_tokens.json` (for example from
+          an interactive `agy` installation) symlinked into the agent's private
+          directory before startup so OAuth-authenticated remote MCP servers
+          (such as Linear) share tokens without a second sign-in. Sets
+          `settings.agent.mcp_oauth_tokens_file`; a missing file is skipped
+          quietly.
+        '';
+      };
     };
 
     skills = {
@@ -402,6 +418,7 @@ in {
     home.packages = [cfg.package] ++ lib.optional (cfg.viewer.package != null) cfg.viewer.package;
 
     programs.hey-computer.settings = {
+      agent.mcp_oauth_tokens_file = mkIf (cfg.mcp.oauthTokensFile != null) (mkDefault cfg.mcp.oauthTokensFile);
       mcp = mkIf (translatedMcpServers != {}) (mkDefault translatedMcpServers);
       instructions = {
         vault = mkIf (cfg.vault != null) (mkDefault cfg.vault);

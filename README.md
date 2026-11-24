@@ -260,6 +260,7 @@ max_turn_secs = 300                 # hard wall-clock cap per turn; 0 = unlimite
 max_tool_calls = 20                 # maximum distinct tool calls per turn; 0 = unlimited
 restart_delay_secs = 1              # doubles with every failure in a row, up to 60 s
 history_days = 7                    # delete agy's conversations older than this at agent start; 0 = keep
+# mcp_oauth_tokens_file = "/home/alice/.gemini/antigravity-cli/mcp_oauth_tokens.json"
 
 [agent.settings]                    # merged over the generated agy settings.json
 # showTips = false
@@ -310,7 +311,8 @@ suppressed_days = 7                 # prune suppressed heartbeat turns older tha
 # thought_level = "high"
 # max_turn_secs = 600
 # max_tool_calls = 40
-# mcp_servers = ["nixos"]           # omit to inherit all enabled [mcp.*] servers; [] passes none
+# thinking_label = "Pondering Hard…"  # optional custom progress notification summary
+# mcp_servers = ["nixos"]             # omit to inherit all enabled [mcp.*] servers; [] passes none
 
 # MCP servers passed to `agy acp` in `session/new` (`mcpServers`).
 # Stdio servers set `command` (+ optional `args`, `env`, `env_files`);
@@ -410,6 +412,7 @@ told about Obsidian.
 | `openhue.package` | `pkgs.openhue-cli` | the openhue CLI package |
 | `recall.enable` | true | links the bundled `recall` skill (uses `hey-computer recall` from the agent's PATH) |
 | `mcp.servers` | `{}` | MCP server definitions passed into `settings.mcp.<name>`; `{ file = "/abs/path"; }` entries in `env` or `headers` are automatically lowered into `env_files` / `header_files` so secrets stay out of `/nix/store` |
+| `mcp.oauthTokensFile` | null | optional path to an existing `mcp_oauth_tokens.json` (e.g. from interactive `agy`) symlinked into the agent's private directory so OAuth-authenticated remote MCP servers share tokens |
 | `skills.enable` | true | the bundled `hyprland-desktop` skill, plus `recall`, Obsidian, and `openhue` skills when enabled |
 | `skills.extra` | `[]` | more skill directories |
 | `viewer.package` | `pkgs.marker` | installed |

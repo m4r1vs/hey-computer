@@ -50,6 +50,7 @@
         thought_level = "high";
         max_tool_calls = 40;
         mcp_servers = ["demo"];
+        thinking_label = "Pondering Hard…";
       };
       profiles.lean = {
         thought_level = "low";
@@ -72,25 +73,28 @@
         desktop = true;
       };
     };
-    mcp.servers = {
-      demo = {
-        command = "/bin/true";
-        args = ["--stdio"];
-        env = {
-          PLAIN = "ok";
-          SECRET.file = "/run/secrets/nonexistent-in-sandbox";
+    mcp = {
+      oauthTokensFile = "/home/alice/.gemini/antigravity-cli/mcp_oauth_tokens.json";
+      servers = {
+        demo = {
+          command = "/bin/true";
+          args = ["--stdio"];
+          env = {
+            PLAIN = "ok";
+            SECRET.file = "/run/secrets/nonexistent-in-sandbox";
+          };
         };
-      };
-      # Mirrors Home Manager's `programs.mcp.servers.*` submodule shape with explicit nulls.
-      hm_like = {
-        command = "/bin/true";
-        args = null;
-        env = null;
-        url = null;
-        headers = null;
-        transport = null;
-        disabled = null;
-        enabled = true;
+        # Mirrors Home Manager's `programs.mcp.servers.*` submodule shape with explicit nulls.
+        hm_like = {
+          command = "/bin/true";
+          args = null;
+          env = null;
+          url = null;
+          headers = null;
+          transport = null;
+          disabled = null;
+          enabled = true;
+        };
       };
     };
   };

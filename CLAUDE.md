@@ -167,9 +167,12 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   by agy 1.5.13.
 - MCP passthrough (measured): `session/new` `mcpServers` supports `stdio`, `http`, and `sse`
   (including `env` and `headers`), while `settings.json` `mcpServers` is ignored in ACP mode.
-  MCP tool calls arrive with `kind: "other"` and `name: "mcp_<server>_<tool>"`. Stdio MCP
-  children persist across `session/close` until `agy` exits (cleaned up by `Connection`'s
-  process-group kill).
+  OAuth-authenticated remote HTTP MCP servers read tokens from
+  `<agent_dir>/antigravity-cli/mcp_oauth_tokens.json` (without it, `session/new` succeeds
+  silently with 0 tools for that server); `agent.mcp_oauth_tokens_file` symlinks an existing
+  token store into the private agent dir. MCP tool calls arrive with `kind: "other"` and
+  `name: "mcp_<server>_<tool>"`. Stdio MCP children persist across `session/close` until
+  `agy` exits (cleaned up by `Connection`'s process-group kill).
 
 ## Testing
 

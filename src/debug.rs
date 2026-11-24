@@ -92,6 +92,7 @@ pub async fn present(config: &Config, text: String) -> Result<()> {
         id: 0,
         request: "debug present".to_string(),
         profile: None,
+        thinking_label: None,
     });
     presenter.present(Presentation::Answer {
         id: 0,

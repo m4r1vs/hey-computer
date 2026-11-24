@@ -253,6 +253,7 @@ async fn without_wait_the_daemon_presents_progress_then_the_answer() {
                 id,
                 request: "plain".to_string(),
                 profile: None,
+                thinking_label: None,
             },
             Presentation::Answer {
                 id,
@@ -979,6 +980,7 @@ async fn without_wait_tool_calls_emit_progress_updates() {
                 id,
                 request: "check desktop".to_string(),
                 profile: None,
+                thinking_label: None,
             },
             Presentation::ProgressUpdate {
                 id,
@@ -1051,6 +1053,7 @@ async fn ambient_time_context_is_prepended_without_altering_progress_text() {
             id,
             request: "what day is it".to_string(),
             profile: None,
+            thinking_label: None,
         }
     );
     match &items[1] {
@@ -1247,6 +1250,7 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
                 model: Some("mock-deep".to_string()),
                 thought_level: Some("high".to_string()),
                 max_tool_calls: Some(1),
+                thinking_label: Some("Pondering Hard…".to_string()),
                 ..Profile::default()
             },
         );
@@ -1351,7 +1355,12 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
     assert!(
         items.iter().any(|i| matches!(
             i,
-            Presentation::Progress { id: got, profile: Some(p), .. } if *got == id && p == "deep"
+            Presentation::Progress {
+                id: got,
+                profile: Some(p),
+                thinking_label: Some(label),
+                ..
+            } if *got == id && p == "deep" && label == "Pondering Hard…"
         )),
         "{items:?}"
     );

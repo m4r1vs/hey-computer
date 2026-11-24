@@ -78,6 +78,10 @@ pub struct Profile {
     /// on `session/new`. `None` attaches all enabled servers; `Some([])` attaches none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<Vec<String>>,
+    /// Custom progress notification summary while this profile is running
+    /// (for example `"Pondering Hard…"`). Omit for `"Thinking… (<name>)"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_label: Option<String>,
 }
 
 /// Configuration for one MCP server passed to `session/new` `mcpServers`.
@@ -140,10 +144,14 @@ pub struct ResolvedProfile {
     pub max_tool_calls: Option<usize>,
     /// Sorted list of enabled `[mcp.<name>]` servers to attach on `session/new`.
     pub mcp_servers: Vec<String>,
+    /// Optional custom progress notification summary for this profile.
+    pub thinking_label: Option<String>,
 }
 
 /// Maximum length of a profile name in `[profiles.<name>]`.
 pub const MAX_PROFILE_NAME_LEN: usize = 32;
+/// Maximum character length of `profiles.<name>.thinking_label`.
+pub const MAX_THINKING_LABEL_CHARS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -178,6 +186,10 @@ pub struct Agent {
     /// directory. Before each agent start, conversations and logs older than
     /// this many days are deleted. Zero keeps them all.
     pub history_days: f64,
+    /// Optional path to an existing `mcp_oauth_tokens.json` (for example from
+    /// an interactive `agy` install) symlinked into `<agent_dir>/antigravity-cli/`
+    /// before agent start so OAuth-authenticated remote MCP servers share tokens.
+    pub mcp_oauth_tokens_file: PathBuf,
     /// Merged over the agent's `settings.json` that the daemon writes.
     pub settings: toml::Table,
 }
@@ -317,6 +329,7 @@ impl Default for Agent {
             max_tool_calls: 20,
             restart_delay_secs: 1.0,
             history_days: 7.0,
+            mcp_oauth_tokens_file: PathBuf::new(),
             settings: toml::Table::new(),
         }
     }
@@ -452,6 +465,11 @@ impl Config {
         if self.present.max_lines == 0 || self.present.max_chars == 0 {
             bail!("present.max_lines and present.max_chars must be positive");
         }
+        if !self.agent.mcp_oauth_tokens_file.as_os_str().is_empty()
+            && !self.agent.mcp_oauth_tokens_file.is_absolute()
+        {
+            bail!("agent.mcp_oauth_tokens_file must be an absolute path");
+        }
         if !self.instructions.vault.as_os_str().is_empty() && !self.instructions.vault.is_absolute()
         {
             bail!("instructions.vault must be an absolute path");
@@ -511,6 +529,17 @@ impl Config {
                             "profiles.{name}.mcp_servers references unknown MCP server `{server}`"
                         );
                     }
+                }
+            }
+            if let Some(label) = &profile.thinking_label {
+                let trimmed = label.trim();
+                if trimmed.is_empty()
+                    || trimmed.chars().count() > MAX_THINKING_LABEL_CHARS
+                    || trimmed.chars().any(char::is_control)
+                {
+                    bail!(
+                        "profiles.{name}.thinking_label must be 1..={MAX_THINKING_LABEL_CHARS} printable characters"
+                    );
                 }
             }
         }
@@ -622,6 +651,7 @@ impl Config {
                 max_tool_calls: (self.agent.max_tool_calls > 0)
                     .then_some(self.agent.max_tool_calls),
                 mcp_servers: all_enabled_mcp,
+                thinking_label: None,
             });
         };
         if name == "default" {
@@ -666,6 +696,10 @@ impl Config {
             max_turn: secs(profile.max_turn_secs.unwrap_or(self.agent.max_turn_secs)),
             max_tool_calls: (max_tool_calls > 0).then_some(max_tool_calls),
             mcp_servers,
+            thinking_label: profile
+                .thinking_label
+                .as_deref()
+                .map(|s| s.trim().to_string()),
         })
     }
 
@@ -912,6 +946,7 @@ mod tests {
             thought_level = "high"
             max_tool_calls = 40
             max_turn_secs = 600
+            thinking_label = "Pondering Hard…"
 
             [profiles.quick]
             thought_level = "low"
@@ -935,21 +970,26 @@ mod tests {
         assert_eq!(deep.thought_level, "high");
         assert_eq!(deep.max_tool_calls, Some(40));
         assert_eq!(deep.max_turn, Some(Duration::from_secs(600)));
+        assert_eq!(deep.thinking_label.as_deref(), Some("Pondering Hard…"));
 
         let quick = parsed.resolve_profile(Some("quick")).unwrap();
         assert_eq!(quick.model, "fast-model");
         assert_eq!(quick.max_tool_calls, None);
+        assert_eq!(quick.thinking_label, None);
 
         let err = parsed.resolve_profile(Some("missing")).unwrap_err();
         assert!(err.contains("unknown profile `missing`"), "{err}");
         assert!(err.contains("deep"), "{err}");
 
-        // Reserved "default", bad characters, and bad durations are rejected.
+        // Reserved "default", bad characters, bad durations, bad labels, and relative OAuth paths are rejected.
         for bad in [
             "[profiles.default]\nthought_level = \"high\"\n",
             "[profiles.\"bad name\"]\nthought_level = \"high\"\n",
             "[profiles.deep]\ninactivity_timeout_secs = 0\n",
             "[profiles.deep]\nmax_turn_secs = -5\n",
+            "[profiles.deep]\nthinking_label = \"   \"\n",
+            "[profiles.deep]\nthinking_label = \"line1\\nline2\"\n",
+            "[agent]\nmcp_oauth_tokens_file = \"relative/tokens.json\"\n",
         ] {
             let cfg: Config = toml::from_str(bad).unwrap();
             assert!(cfg.validate().is_err(), "{bad} should fail validation");

@@ -58,6 +58,8 @@ pub enum Presentation {
         id: u64,
         request: String,
         profile: Option<String>,
+        /// Optional custom progress summary overriding `"Thinking…"` / `"Thinking… (<profile>)"`.
+        thinking_label: Option<String>,
     },
     /// Mid-turn status update for an in-flight interactive request.
     ProgressUpdate { id: u64, status: String },
@@ -1079,11 +1081,14 @@ impl Worker {
                 id,
                 request,
                 profile,
+                thinking_label,
             } => {
                 if !self.config.progress {
                     return;
                 }
-                let summary = with_profile("Thinking…", profile.as_deref());
+                let summary = thinking_label
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| with_profile("Thinking…", profile.as_deref()));
                 let request_body = escape_markup(&truncate(request.trim(), REQUEST_PREVIEW_CHARS));
                 // A superseded request's popup is reused for the next one.
                 let replaces = self.take_progress_id();
@@ -2355,6 +2360,7 @@ mod tests {
             id: 1,
             request: "explain".to_string(),
             profile: None,
+            thinking_label: None,
         });
         desktop.present(Presentation::Answer {
             id: 1,
@@ -2388,6 +2394,7 @@ mod tests {
             id: 1,
             request: "first".to_string(),
             profile: None,
+            thinking_label: None,
         });
         desktop.present(Presentation::Answer {
             id: 1,
@@ -2399,6 +2406,7 @@ mod tests {
             id: 2,
             request: "second".to_string(),
             profile: None,
+            thinking_label: None,
         });
 
         // "Answer opened" and the next popup must arrive without waiting for
@@ -2675,6 +2683,7 @@ mod tests {
             id: 1,
             request: "check <lights>".to_string(),
             profile: Some("deep".to_string()),
+            thinking_label: Some("Pondering Hard…".to_string()),
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
@@ -2703,7 +2712,8 @@ mod tests {
 
         assert!(recorded.contains("--urgency=low"), "{recorded}");
         assert!(recorded.contains("--replace-id=7"), "{recorded}");
-        assert!(recorded.contains("Thinking… (deep)"), "{recorded}");
+        assert!(recorded.contains("Pondering Hard…"), "{recorded}");
+        assert!(!recorded.contains("Thinking… (deep)"), "{recorded}");
         assert!(
             recorded.contains("check &lt;lights&gt;\n<b>Check &lt;a&amp;b&gt;</b>"),
             "{recorded}"
@@ -2728,6 +2738,7 @@ mod tests {
             id: 1,
             request: "work".to_string(),
             profile: None,
+            thinking_label: None,
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
@@ -2794,6 +2805,7 @@ mod tests {
             id: 1,
             request: "first".to_string(),
             profile: None,
+            thinking_label: None,
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
@@ -2829,6 +2841,7 @@ mod tests {
             id: 2,
             request: "second".to_string(),
             profile: None,
+            thinking_label: None,
         });
         desktop.present(Presentation::Failure {
             id: 2,
@@ -2878,6 +2891,7 @@ mod tests {
             id: 1,
             request: "hi".to_string(),
             profile: None,
+            thinking_label: None,
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
@@ -2922,6 +2936,7 @@ mod tests {
             id: 1,
             request: "hi".to_string(),
             profile: None,
+            thinking_label: None,
         });
         desktop2.present(Presentation::ProgressUpdate {
             id: 1,
@@ -3117,6 +3132,7 @@ mod tests {
             id: 1,
             request: "foreground".to_string(),
             profile: None,
+            thinking_label: None,
         });
         desktop.present(Presentation::TaskComplete {
             id: 2,

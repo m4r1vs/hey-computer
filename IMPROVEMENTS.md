@@ -56,23 +56,27 @@ execute directly, and permission prompts can be added later if ever needed.
     token never enters the model's context.
 21. `[Important]` **Gmail.** Search, summarise ("anything important since this
     morning?"), draft, and send replies without permission prompts.
-22. `[Important]` **Automatic model selection by difficulty.** Builds on model
-    and effort profiles (#15), attachments (#16), and background tasks (#17).
-    Options, cheapest first:
+22. `[Important]` **Automatic model, effort, and lane routing (profile +
+    background inference).** Builds on model and effort profiles (#15),
+    attachments (#16), and background tasks (#17) so the user rarely needs
+    explicit `/deep` or `/bg` prefixes. Options, cheapest first:
     - **Heuristics:** length of the request, keywords ("explain", "debug",
-      "research", "derive"), attachments, background tasks → deep; short desktop
-      commands → fast.
+      "research", "derive", "compare", "write a report"), attachments → `deep`;
+      short desktop commands → `fast`; long multi-step or research requests →
+      automatically route to the background lane (`--background`) so quick
+      follow-up voice commands stay unblocked.
     - **Escalation on failure:** start fast; if a tool fails, the answer is
       empty, or the follow-up starts with "no, …", retry the follow-up on the
       deeper profile.
-    - **A triage turn:** the fast model labels the request with a profile before
-      the real turn. This costs one extra round-trip, so use it only when the
-      heuristics are unsure.
+    - **A triage turn:** the fast model classifies the request with both a
+      profile (`fast` vs `deep`) and a lane (`interactive` vs `background`)
+      before the real turn. This costs one extra round-trip, so use it only
+      when the heuristics are unsure.
 
     Model and thought level are set per session (`session/set_config_option`),
-    so routing a new session is cheap. Rely on mid-conversation escalation only
-    if the probe in #15 confirms agy accepts it. Show which profile answered in
-    the notification, so wrong routing is visible.
+    and mid-conversation switching is confirmed to work on `agy` 1.5.13, so
+    routing both new sessions and follow-up escalations is cheap. Show which
+    profile answered in the notification, so wrong routing is visible.
 
 ## Phase 5: Better output UX (viewer & spoken answers)
 

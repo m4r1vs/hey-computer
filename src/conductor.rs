@@ -839,10 +839,16 @@ impl Conductor {
                 shared.running = Some((ask.id, Instant::now(), display_profile.clone()));
             }
             if matches!(ask.sink, Sink::Present) {
+                let thinking_label = display_profile
+                    .as_deref()
+                    .and_then(|name| self.config.profiles.get(name))
+                    .and_then(|p| p.thinking_label.as_deref())
+                    .map(|s| s.trim().to_string());
                 self.presenter.present(Presentation::Progress {
                     id: ask.id,
                     request: attachments::progress_label(&ask.text, &ask.attachments),
                     profile: display_profile.clone(),
+                    thinking_label,
                 });
             }
         }
