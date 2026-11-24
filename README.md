@@ -132,7 +132,8 @@ hey-computer [--config FILE] [--socket PATH] [-v|-vv] COMMAND
 Hidden commands for checking one part at a time:
 `hey-computer debug config` (check the configuration and print it with every
 default filled in), `debug instructions` (the generated `AGENTS.md`),
-`debug prepare` (prepare the agent's directory and print where everything
+`debug context` (the ambient `<untrusted_desktop_context>` header that would be
+prepended to a turn), `debug prepare` (prepare the agent's directory and print where everything
 is), `debug classify TEXT` (notification or viewer), `debug present TEXT`
 (show TEXT the way the daemon would), `debug prompt TEXT` (one request
 straight to the agent, no daemon; `-v` prints the timings), and
@@ -244,6 +245,10 @@ skills = []                         # skill directories: one skill, or a directo
 memory_file = ""                    # optional user-owned Markdown file (outside the vault), loaded at agent start
 memory_max_chars = 4000             # character cap for memory_file (1..=32768)
 
+[context]
+time = false                        # prepend local date, time, offset and weekday to each user turn
+desktop = false                     # prepend active Hyprland workspace/window (requires hyprctl on PATH)
+
 [present]
 notifications = true                # every notification, errors included
 progress = true                     # "Thinking…" while a request runs (with live tool progress)
@@ -259,6 +264,12 @@ The deny list matches command words, also behind `env`, `timeout`, `nice`,
 and inside `$(…)`.
 A refused command is reported in the answer, or, when nothing else happened,
 as a failure that names it.
+
+When `[context]` has `time` or `desktop` enabled, an ephemeral
+`<untrusted_desktop_context>` header is prepended to each user turn (never
+written into `AGENTS.md`, keeping the system prompt cacheable). Desktop
+metadata is sanitized and degrades silently when `hyprctl` is unavailable or
+times out.
 
 The notifier is called as
 `notifier… --app-name=hey-computer --urgency=low|normal --print-id [--expire-time=MS] [--replace-id=N] -- SUMMARY BODY`,
@@ -494,6 +505,10 @@ application for you also lets it start a command outside the service.
   older than `agent.history_days` (7 by default; 0 keeps them). The summary
   index (`conversation_summaries.db`) is agy's own and is not touched.
 - Requests and answers go to Google's model service, as with any agy use.
+  When `context.desktop = true`, active workspace names and focused window
+  classes/titles are included with each request (and therefore appear in agy's
+  local transcripts), while the daemon's own log never records them above `-v`
+  (debug level).
 
 ## Measured
 

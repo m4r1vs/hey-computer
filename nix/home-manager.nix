@@ -120,6 +120,10 @@ in {
           conversation.follow_up_secs = 120;
           permissions.deny = ["sudo" "su" "doas" "pkexec" "run0" "shutdown"];
           instructions.extra = "Prefer metric units. Answer in kilometres and degrees Celsius.";
+          context = {
+            time = true;
+            desktop = true;
+          };
           present.max_chars = 300;
         }
       '';
@@ -165,12 +169,12 @@ in {
         "/bin"
       ];
       description = ''
-        Directories searched after the packages, so the agent finds the
-        user's own programs (on NixOS, `hyprctl` lives here). Directories that
-        do not exist are harmless. `/run/wrappers/bin` holds `sudo` on NixOS:
-        it is on the PATH so that a privileged command the agent runs itself
-        fails with a clear message because of NoNewPrivileges, rather than for
-        want of a program.
+        Directories searched after the packages, so both the daemon (for
+        `context.desktop`) and the agent find the user's own programs (on
+        NixOS, `hyprctl` lives here). Directories that do not exist are
+        harmless. `/run/wrappers/bin` holds `sudo` on NixOS: it is on the PATH
+        so that a privileged command the agent runs itself fails with a clear
+        message because of NoNewPrivileges, rather than for want of a program.
       '';
     };
 

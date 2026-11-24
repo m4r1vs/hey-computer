@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 
 use crate::conductor::{self, Handle, Sink};
 use crate::config::Config;
+use crate::context::{ContextProvider, SystemContext};
 use crate::lines::{self, Line};
 use crate::present::{Desktop, Presenter};
 use crate::protocol::{self, FailReason, MAX_REQUEST_LINE, Reply, Request};
@@ -49,6 +50,17 @@ pub async fn serve(
     presenter: Arc<dyn Presenter>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    serve_with_context(config, socket, presenter, Arc::new(SystemContext), shutdown).await
+}
+
+/// Serve on `socket` with a custom ambient context provider (for tests).
+pub async fn serve_with_context(
+    config: Config,
+    socket: &Path,
+    presenter: Arc<dyn Presenter>,
+    context: Arc<dyn ContextProvider>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
     // `Config::load` validates too, but a config built in code (the tests,
     // another front end) comes here directly.
     config.validate()?;
@@ -68,7 +80,8 @@ pub async fn serve(
     tracing::info!("agent directory {}", paths.agent_dir.display());
     tracing::info!("listening on {}", socket.display());
 
-    let (handle, mut conductor) = conductor::spawn(Arc::new(config), presenter);
+    let (handle, mut conductor) =
+        conductor::spawn_with_context(Arc::new(config), presenter, context);
     tokio::pin!(shutdown);
     let mut connections = tokio::task::JoinSet::new();
     loop {

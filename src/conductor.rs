@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 
 use crate::acp::{self, CallError, Connection, Incoming};
 use crate::config::{Config, MAX_RESTART_DELAY_SECS, secs};
+use crate::context::{self, ContextProvider, SystemContext};
 use crate::environment::{self, Paths};
 use crate::policy::Policy;
 use crate::present::{Presentation, Presenter};
@@ -240,6 +241,15 @@ impl Handle {
 
 /// Start the conductor task.
 pub fn spawn(config: Arc<Config>, presenter: Arc<dyn Presenter>) -> (Handle, JoinHandle<()>) {
+    spawn_with_context(config, presenter, Arc::new(SystemContext))
+}
+
+/// Start the conductor task with a custom ambient context provider (for tests).
+pub fn spawn_with_context(
+    config: Arc<Config>,
+    presenter: Arc<dyn Presenter>,
+    context: Arc<dyn ContextProvider>,
+) -> (Handle, JoinHandle<()>) {
     let shared = Arc::new(Mutex::new(Shared {
         next_id: 0,
         latest: None,
@@ -254,6 +264,7 @@ pub fn spawn(config: Arc<Config>, presenter: Arc<dyn Presenter>) -> (Handle, Joi
         policy: Policy::new(&config.permissions.deny),
         config,
         presenter,
+        context,
         shared: Arc::clone(&shared),
         inbox,
         stop: Arc::clone(&stop),
@@ -295,6 +306,7 @@ struct Conversation {
 struct Conductor {
     config: Arc<Config>,
     presenter: Arc<dyn Presenter>,
+    context: Arc<dyn ContextProvider>,
     policy: Policy,
     shared: Arc<Mutex<Shared>>,
     inbox: mpsc::UnboundedReceiver<Message>,
@@ -729,6 +741,19 @@ impl Conductor {
             }
         };
 
+        let header = if self.config.context.is_enabled() {
+            tokio::select! {
+                header = self.context.gather(&self.config.context) => header,
+                reason = interrupts.wait() => return cancelled(reason),
+            }
+        } else {
+            None
+        };
+        if let Some(header) = &header {
+            tracing::debug!("request {}: ambient context: {:?}", ask.id, header);
+        }
+        let prompt = context::prepend(header.as_deref(), &ask.text);
+
         let Some(mut live) = self.live.take() else {
             return Outcome::failed(FailReason::AgentDown, "the assistant exited");
         };
@@ -745,7 +770,7 @@ impl Conductor {
             progress: matches!(ask.sink, Sink::Present).then_some(&self.presenter),
             id: ask.id,
         };
-        let end = turn(&mut live, &session, &ask.text, interrupts, &ctx).await;
+        let end = turn(&mut live, &session, &prompt, interrupts, &ctx).await;
 
         if end.alive {
             self.live = Some(live);

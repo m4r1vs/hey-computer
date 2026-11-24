@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -19,6 +19,7 @@ pub struct Config {
     pub conversation: Conversation,
     pub permissions: Permissions,
     pub instructions: Instructions,
+    pub context: Context,
     pub present: Present,
 }
 
@@ -109,6 +110,24 @@ impl Default for Instructions {
             memory_file: PathBuf::new(),
             memory_max_chars: DEFAULT_MEMORY_MAX_CHARS,
         }
+    }
+}
+
+/// Ephemeral per-turn ambient context prepended to the user prompt inside
+/// `<untrusted_desktop_context>` delimiters (opt-in).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Context {
+    /// Prepend local date, time, timezone offset and weekday to each user turn.
+    pub time: bool,
+    /// Prepend active Hyprland workspace and focused window class/title to each
+    /// user turn (requires `hyprctl` on PATH; degrades silently when unavailable).
+    pub desktop: bool,
+}
+
+impl Context {
+    pub fn is_enabled(&self) -> bool {
+        self.time || self.desktop
     }
 }
 
@@ -493,5 +512,19 @@ mod tests {
         let mut config = Config::default();
         config.agent.max_turn_secs = MAX_SECS;
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn context_config_parses_partially() {
+        let default = Config::default();
+        assert!(!default.context.time);
+        assert!(!default.context.desktop);
+        assert!(!default.context.is_enabled());
+
+        let parsed: Config = toml::from_str("[context]\ntime = true\n").unwrap();
+        assert!(parsed.context.time);
+        assert!(!parsed.context.desktop);
+        assert!(parsed.context.is_enabled());
+        parsed.validate().unwrap();
     }
 }

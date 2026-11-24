@@ -5,12 +5,15 @@
 //! mock-agent`. The mock logs what it saw, which is how a test checks what the
 //! daemon sent it.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use hey_computer::config::Config;
+use hey_computer::config::{Config, Context as ContextConfig};
+use hey_computer::context::ContextProvider;
 use hey_computer::daemon;
 use hey_computer::ipc::{self, Client};
 use hey_computer::present::{Presentation, Presenter, Recorder};
@@ -975,4 +978,139 @@ async fn with_wait_tool_calls_do_not_present_progress_updates() {
     assert_eq!(answer(&h.ask("check desktop", false).await), "All good.");
     assert!(h.recorder.items().is_empty());
     h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ambient_time_context_is_prepended_without_altering_progress_text() {
+    let h = Harness::start(SCRIPT, |c| {
+        c.context.time = true;
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    let agents = std::fs::read_to_string(h.dir.join("state/workspace/AGENTS.md")).unwrap();
+    assert!(agents.contains("<untrusted_desktop_context>"), "{agents}");
+
+    let (id, _client) = ipc::ask(&h.socket, "what day is it", false, false)
+        .await
+        .unwrap();
+    let items = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|item| matches!(item, Presentation::Answer { .. }))
+        })
+        .await
+        .expect("answer presented");
+    assert_eq!(
+        items[0],
+        Presentation::Progress {
+            id,
+            request: "what day is it".to_string(),
+        }
+    );
+    match &items[1] {
+        Presentation::Answer { text, .. } => {
+            assert!(text.contains("<untrusted_desktop_context>"), "{text}");
+            assert!(text.contains("local_time:"), "{text}");
+            assert!(text.ends_with("what day is it"), "{text}");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Follow-up in the same session also gets a fresh header.
+    let reply = h.ask("and tomorrow", false).await;
+    let echoed = answer(&reply);
+    assert!(echoed.contains("<untrusted_desktop_context>"), "{echoed}");
+    assert!(echoed.contains("local_time:"), "{echoed}");
+    assert!(echoed.ends_with("and tomorrow"), "{echoed}");
+    assert_eq!(h.log_count("new mock-1"), 1);
+    h.stop().await;
+}
+
+struct ScriptedContext {
+    calls: AtomicUsize,
+}
+
+impl ContextProvider for ScriptedContext {
+    fn gather<'a>(
+        &'a self,
+        _config: &'a ContextConfig,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
+        let n = self.calls.fetch_add(1, Ordering::Relaxed);
+        let header = if n == 0 {
+            "<untrusted_desktop_context>\nactive_workspace: 1\nactive_window_class: firefox\n</untrusted_desktop_context>"
+        } else {
+            "<untrusted_desktop_context>\nactive_workspace: 2\nactive_window_class: ghostty\n</untrusted_desktop_context>"
+        };
+        Box::pin(async move { Some(header.to_string()) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ambient_desktop_context_updates_across_follow_ups() {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("hc-ctx-int-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let script_path = dir.join("script.json");
+    std::fs::write(&script_path, SCRIPT).unwrap();
+    let log = dir.join("mock.log");
+    let socket = dir.join("s.sock");
+
+    let mut config = Config {
+        state_dir: dir.join("state"),
+        ..Config::default()
+    };
+    config.agent.command = vec![
+        env!("CARGO_BIN_EXE_hey-computer").to_string(),
+        "debug".to_string(),
+        "mock-agent".to_string(),
+        script_path.to_string_lossy().into_owned(),
+        "--log".to_string(),
+        log.to_string_lossy().into_owned(),
+    ];
+    config.context.desktop = true;
+    config.conversation.follow_up_secs = 30.0;
+
+    let recorder = Recorder::new();
+    let presenter: Arc<dyn Presenter> = recorder.clone();
+    let provider: Arc<dyn ContextProvider> = Arc::new(ScriptedContext {
+        calls: AtomicUsize::new(0),
+    });
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            daemon::serve_with_context(config, &socket, presenter, provider, async {
+                let _ = stopped.await;
+            })
+            .await
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "socket never appeared");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (_, mut c1) = ipc::ask(&socket, "move this", true, false).await.unwrap();
+    let r1 = c1.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert!(
+        answer(&r1).contains("active_window_class: firefox"),
+        "{r1:?}"
+    );
+
+    let (_, mut c2) = ipc::ask(&socket, "and now", true, false).await.unwrap();
+    let r2 = c2.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert!(
+        answer(&r2).contains("active_window_class: ghostty"),
+        "{r2:?}"
+    );
+
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
 }

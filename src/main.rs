@@ -74,6 +74,8 @@ enum DebugCommand {
     Config,
     /// Print the instructions the agent gets in its AGENTS.md.
     Instructions,
+    /// Print the ambient context block that would be prepended to a turn.
+    Context,
     /// Prepare the agent's directory and print where everything is.
     Prepare,
     /// Say whether an answer would go to a notification or the viewer.
@@ -176,6 +178,10 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
                 }
                 DebugCommand::Instructions => {
                     debug::instructions(&config);
+                    true
+                }
+                DebugCommand::Context => {
+                    debug::context(&config).await;
                     true
                 }
                 DebugCommand::Prepare => {
@@ -334,6 +340,7 @@ mod tests {
             vec!["hey-computer", "--socket", "/tmp/s", "cancel"],
             vec!["hey-computer", "status", "--json"],
             vec!["hey-computer", "debug", "config"],
+            vec!["hey-computer", "debug", "context"],
             vec!["hey-computer", "debug", "classify", "# heading"],
             vec!["hey-computer", "debug", "prompt", "hi"],
             vec![

@@ -6,6 +6,7 @@ use anyhow::Result;
 
 use crate::conductor::{self, Outcome};
 use crate::config::Config;
+use crate::context;
 use crate::environment;
 use crate::ipc;
 use crate::present::{self, Desktop, Limits, Presentation, Presenter};
@@ -20,6 +21,18 @@ pub fn config(config: &Config) -> Result<()> {
 /// Print the instructions the agent gets.
 pub fn instructions(config: &Config) {
     print!("{}", environment::instructions(config));
+}
+
+/// Print the ambient context block that would be prepended to a turn.
+pub async fn context(config: &Config) {
+    if !config.context.is_enabled() {
+        eprintln!("ambient context is disabled in config");
+        return;
+    }
+    match context::gather(&config.context).await {
+        Some(header) => println!("{header}"),
+        None => eprintln!("no ambient context available"),
+    }
 }
 
 /// Prepare the agent's directory, as the daemon does before starting it.

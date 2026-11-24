@@ -47,6 +47,10 @@
       };
       conversation.follow_up_secs = 60;
       instructions.extra = "Prefer metric units.";
+      context = {
+        time = true;
+        desktop = true;
+      };
     };
   };
 
@@ -114,10 +118,12 @@ in
       grep -q "Alice's Notes" $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md
       grep -q "Prefer metric units." $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md
       grep -q "report the failure plainly" $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md
+      grep -q "untrusted_desktop_context" $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md
 
-      # Frozen-snapshot memory loading.
+      # Frozen-snapshot memory loading and opt-in ambient context.
       $hc --config ${memoryConfig} debug instructions | grep -q "Prefer concise answers."
       $hc --config ${bareConfig} debug instructions | grep -qv "## User memory"
+      $hc --config ${bareConfig} debug instructions | grep -qv "untrusted_desktop_context"
 
       # The service.
       cat ${unit}

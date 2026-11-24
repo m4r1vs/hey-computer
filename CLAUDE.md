@@ -55,6 +55,8 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   official crate's interoperability with it was unproven.
 - `environment`: the agent's private `--gemini-dir` (settings.json, linked skills) and the
   workspace with the generated `AGENTS.md`. Rewritten before every agent start.
+- `context`: opt-in per-turn ambient time (`localtime_r`) and Hyprland active window/workspace
+  header prepended to user prompts inside `<untrusted_desktop_context>` delimiters.
 - `policy`: the deny list, matched as command words through wrappers, `sh -c`, pipes and
   `$(…)`, and behind `systemd-run`. A courtesy, not a boundary.
 - `present`: `Presenter` trait; `Desktop` runs the notifier (an argument vector,
@@ -68,7 +70,7 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   with an error notification.
 - `mock`: a scripted ACP agent, run as the hidden `debug mock-agent SCRIPT`, so the package
   installs one binary. Script format and log lines are documented at the top of `mock.rs`.
-- `debug`: hidden commands that check one part at a time (`config`, `instructions`,
+- `debug`: hidden commands that check one part at a time (`config`, `instructions`, `context`,
   `prepare`, `classify`, `present`, `prompt`, `mock-agent`).
 - `nix/home-manager.nix`: the module (agent PATH, obsidian shim, skills, viewer launched via
   `systemd-run --user --scope`, service with `NoNewPrivileges`). `nix/module-check.nix`
@@ -155,7 +157,7 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
 
 ## Never logged above debug
 
-Request text, answer text, memory file contents, tool call arguments and the agent's stderr when it dies
+Request text, answer text, memory file contents, ambient desktop context (window titles), tool call arguments and the agent's stderr when it dies
 mid-request (it can quote the request). `info` carries ids, sizes, timings and tool kinds
 (`tool call (execute)`, `refused a sudo command`). Keep it that way: requests are spoken
 words and answers can quote the user's notes.
