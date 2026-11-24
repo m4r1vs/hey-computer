@@ -48,6 +48,9 @@ enum Command {
         /// Start a new conversation, even right after the last answer.
         #[arg(long)]
         new: bool,
+        /// Use a named profile from `[profiles.<name>]` (or `default`).
+        #[arg(short = 'p', long, value_name = "NAME")]
+        profile: Option<String>,
         /// The request; several words are joined with spaces.
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         text: Vec<String>,
@@ -90,7 +93,12 @@ enum DebugCommand {
     /// Say whether an answer would go to a notification or the viewer.
     Classify { text: Vec<String> },
     /// Ask the agent directly, without a daemon, and print the answer.
-    Prompt { text: Vec<String> },
+    Prompt {
+        /// Use a named profile from `[profiles.<name>]` (or `default`).
+        #[arg(short = 'p', long, value_name = "NAME")]
+        profile: Option<String>,
+        text: Vec<String>,
+    },
     /// Show an answer the way the daemon would.
     Present { text: Vec<String> },
     /// Act as a scripted ACP agent, for tests.
@@ -156,9 +164,14 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             daemon::run(config, &socket).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Ask { print, new, text } => {
+        Command::Ask {
+            print,
+            new,
+            profile,
+            text,
+        } => {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
-            ask(&config, &socket, text, print, new).await
+            ask(&config, &socket, text, print, new, profile).await
         }
         Command::Cancel => {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
@@ -211,8 +224,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
                     debug::classify(&config, &text_or_stdin(text).await?);
                     true
                 }
-                DebugCommand::Prompt { text } => {
-                    debug::prompt(config, text_or_stdin(text).await?).await?
+                DebugCommand::Prompt { profile, text } => {
+                    debug::prompt(config, text_or_stdin(text).await?, profile).await?
                 }
                 DebugCommand::Present { text } => {
                     debug::present(&config, text_or_stdin(text).await?).await?;
@@ -279,6 +292,7 @@ async fn ask(
     words: Vec<String>,
     print: bool,
     new: bool,
+    profile: Option<String>,
 ) -> Result<ExitCode> {
     // Every refusal after this point is also a notification (see below).
     let text = text_or_stdin(words).await;
@@ -290,10 +304,18 @@ async fn ask(
     }
 
     let accepted = match text {
-        Ok(text) => match request_size(&text, print, new) {
-            Ok(()) => ipc::ask(socket, &text, print, new).await,
-            Err(e) => Err(e),
-        },
+        Ok(text) => {
+            let req = Request::Ask {
+                text,
+                wait: print,
+                new,
+                profile,
+            };
+            match request_size(&req) {
+                Ok(()) => ipc::ask_request(socket, &req).await,
+                Err(e) => Err(e),
+            }
+        }
         Err(e) => Err(e),
     };
     let (id, mut client) = match accepted {
@@ -346,16 +368,12 @@ async fn ask(
 
 /// Refuse a request the daemon would refuse, before connecting: its line,
 /// once encoded (escaping makes it longer than the text), must fit.
-fn request_size(text: &str, wait: bool, new: bool) -> Result<()> {
-    let line = protocol::encode(&Request::Ask {
-        text: text.to_string(),
-        wait,
-        new,
-    });
+fn request_size(request: &Request) -> Result<()> {
+    let line = protocol::encode(request);
     if line.len() + 1 > MAX_REQUEST_LINE {
         anyhow::bail!(
             "the request is {} bytes, more than the {MAX_REQUEST_LINE} the daemon takes",
-            text.len()
+            line.len()
         );
     }
     Ok(())
@@ -391,6 +409,8 @@ mod tests {
             vec!["hey-computer", "daemon"],
             vec!["hey-computer", "ask", "what", "time", "is", "it"],
             vec!["hey-computer", "ask", "--print", "--new", "--", "-5 plus 3"],
+            vec!["hey-computer", "ask", "-p", "deep", "derive", "this"],
+            vec!["hey-computer", "ask", "--profile", "default", "hi"],
             vec!["hey-computer", "ask", "--print"],
             vec!["hey-computer", "--socket", "/tmp/s", "cancel"],
             vec!["hey-computer", "status", "--json"],

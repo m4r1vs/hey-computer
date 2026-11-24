@@ -35,6 +35,9 @@ pub enum Request {
         /// Start a new conversation even inside the follow-up window.
         #[serde(default)]
         new: bool,
+        /// Optional named profile from `[profiles.<name>]` (or `"default"`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
     },
     Cancel,
     Status,
@@ -116,6 +119,9 @@ pub struct Status {
     pub running: Option<u64>,
     /// Seconds it has been running.
     pub running_secs: Option<f64>,
+    /// Profile of the currently running request, if non-default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_profile: Option<String>,
     /// Seconds a follow-up may still continue the current conversation.
     pub follow_up_secs: Option<f64>,
     /// Requests answered or failed since the daemon started.
@@ -144,7 +150,13 @@ impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "agent {}", self.agent)?;
         match (self.running, self.running_secs) {
-            (Some(id), Some(secs)) => write!(f, ", request {id} running for {secs:.1} s")?,
+            (Some(id), Some(secs)) => {
+                if let Some(profile) = &self.running_profile {
+                    write!(f, ", request {id} ({profile}) running for {secs:.1} s")?;
+                } else {
+                    write!(f, ", request {id} running for {secs:.1} s")?;
+                }
+            }
             (Some(id), None) => write!(f, ", request {id} waiting")?,
             _ => f.write_str(", idle")?,
         }
@@ -178,7 +190,8 @@ mod tests {
             Request::Ask {
                 text: "hi".to_string(),
                 wait: false,
-                new: false
+                new: false,
+                profile: None,
             }
         );
     }
@@ -190,6 +203,7 @@ mod tests {
                 text: "Wie spät ist es?".to_string(),
                 wait: true,
                 new: true,
+                profile: Some("deep".to_string()),
             },
             Request::Cancel,
             Request::Status,
@@ -229,6 +243,7 @@ mod tests {
                 agent: AgentState::Ready,
                 running: Some(2),
                 running_secs: Some(1.5),
+                running_profile: Some("deep".to_string()),
                 follow_up_secs: None,
                 handled: 1,
             }),

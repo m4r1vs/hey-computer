@@ -3,6 +3,7 @@
 //! Every key has a default, so a missing file is not an error; an unknown key
 //! is, so a typo cannot silently leave a setting at its default.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -16,12 +17,52 @@ pub struct Config {
     /// live. Empty means `$XDG_STATE_HOME/hey-computer`.
     pub state_dir: PathBuf,
     pub agent: Agent,
+    /// Named model/effort/budget profiles selectable with `ask --profile <name>`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, Profile>,
     pub conversation: Conversation,
     pub permissions: Permissions,
     pub instructions: Instructions,
     pub context: Context,
     pub present: Present,
 }
+
+/// Named profile overriding `[agent]` settings on a per-request basis.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Profile {
+    /// Overrides `agent.model` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Overrides `agent.thought_level` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_level: Option<String>,
+    /// Overrides `agent.inactivity_timeout_secs` when set (must be positive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactivity_timeout_secs: Option<f64>,
+    /// Overrides `agent.max_turn_secs` when set (0 disables the cap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turn_secs: Option<f64>,
+    /// Overrides `agent.max_tool_calls` when set (0 disables the cap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<usize>,
+}
+
+/// Effective model, effort and turn budgets after applying a profile (if any)
+/// on top of `[agent]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProfile {
+    /// Profile name, or `None` for base `[agent]` (`"default"`).
+    pub name: Option<String>,
+    pub model: String,
+    pub thought_level: String,
+    pub inactivity: Duration,
+    pub max_turn: Option<Duration>,
+    pub max_tool_calls: Option<usize>,
+}
+
+/// Maximum length of a profile name in `[profiles.<name>]`.
+pub const MAX_PROFILE_NAME_LEN: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -322,7 +363,85 @@ impl Config {
                 self.instructions.memory_max_chars
             );
         }
+        for (name, profile) in &self.profiles {
+            if name.is_empty()
+                || name.len() > MAX_PROFILE_NAME_LEN
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            {
+                bail!(
+                    "profiles.{name}: profile names must be 1..={MAX_PROFILE_NAME_LEN} ASCII letters, digits, '-' or '_'"
+                );
+            }
+            if name.eq_ignore_ascii_case("default") {
+                bail!("profiles.{name}: \"default\" is reserved for the base [agent] settings");
+            }
+            if let Some(v) = profile.inactivity_timeout_secs
+                && (!v.is_finite() || v <= 0.0 || v > MAX_SECS)
+            {
+                bail!(
+                    "profiles.{name}.inactivity_timeout_secs must be positive and at most {MAX_SECS} seconds, not {v}"
+                );
+            }
+            if let Some(v) = profile.max_turn_secs
+                && (!v.is_finite() || v < 0.0 || v > MAX_SECS)
+            {
+                bail!(
+                    "profiles.{name}.max_turn_secs must be between 0 and {MAX_SECS} seconds, not {v}"
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Resolve a profile name (`None` or `"default"` means base `[agent]`).
+    pub fn resolve_profile(
+        &self,
+        name: Option<&str>,
+    ) -> std::result::Result<ResolvedProfile, String> {
+        let base_inactivity =
+            secs(self.agent.inactivity_timeout_secs).unwrap_or(Duration::from_secs(45));
+        let Some(name) = name else {
+            return Ok(ResolvedProfile {
+                name: None,
+                model: self.agent.model.clone(),
+                thought_level: self.agent.thought_level.clone(),
+                inactivity: base_inactivity,
+                max_turn: secs(self.agent.max_turn_secs),
+                max_tool_calls: (self.agent.max_tool_calls > 0)
+                    .then_some(self.agent.max_tool_calls),
+            });
+        };
+        if name == "default" {
+            return self.resolve_profile(None);
+        }
+        let Some(profile) = self.profiles.get(name) else {
+            let available = if self.profiles.is_empty() {
+                "none configured".to_string()
+            } else {
+                self.profiles.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            return Err(format!("unknown profile `{name}` (available: {available})"));
+        };
+        let max_tool_calls = profile.max_tool_calls.unwrap_or(self.agent.max_tool_calls);
+        Ok(ResolvedProfile {
+            name: Some(name.to_string()),
+            model: profile
+                .model
+                .clone()
+                .unwrap_or_else(|| self.agent.model.clone()),
+            thought_level: profile
+                .thought_level
+                .clone()
+                .unwrap_or_else(|| self.agent.thought_level.clone()),
+            inactivity: profile
+                .inactivity_timeout_secs
+                .and_then(secs)
+                .unwrap_or(base_inactivity),
+            max_turn: secs(profile.max_turn_secs.unwrap_or(self.agent.max_turn_secs)),
+            max_tool_calls: (max_tool_calls > 0).then_some(max_tool_calls),
+        })
     }
 
     /// `state_dir`, or `$XDG_STATE_HOME/hey-computer`.
@@ -548,5 +667,64 @@ mod tests {
         let mut blank = Config::default();
         blank.present.clipboard = vec![String::new()];
         assert!(blank.validate().is_err());
+    }
+
+    #[test]
+    fn profiles_parse_validate_and_resolve() {
+        let parsed: Config = toml::from_str(
+            r#"
+            [agent]
+            model = "fast-model"
+            thought_level = "low"
+            max_tool_calls = 20
+            max_turn_secs = 300
+
+            [profiles.deep]
+            model = "deep-model"
+            thought_level = "high"
+            max_tool_calls = 40
+            max_turn_secs = 600
+
+            [profiles.quick]
+            thought_level = "low"
+            max_tool_calls = 0
+            "#,
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+
+        let base = parsed.resolve_profile(None).unwrap();
+        assert_eq!(base.name, None);
+        assert_eq!(base.model, "fast-model");
+        assert_eq!(base.thought_level, "low");
+        assert_eq!(base.max_tool_calls, Some(20));
+
+        assert_eq!(parsed.resolve_profile(Some("default")).unwrap(), base);
+
+        let deep = parsed.resolve_profile(Some("deep")).unwrap();
+        assert_eq!(deep.name.as_deref(), Some("deep"));
+        assert_eq!(deep.model, "deep-model");
+        assert_eq!(deep.thought_level, "high");
+        assert_eq!(deep.max_tool_calls, Some(40));
+        assert_eq!(deep.max_turn, Some(Duration::from_secs(600)));
+
+        let quick = parsed.resolve_profile(Some("quick")).unwrap();
+        assert_eq!(quick.model, "fast-model");
+        assert_eq!(quick.max_tool_calls, None);
+
+        let err = parsed.resolve_profile(Some("missing")).unwrap_err();
+        assert!(err.contains("unknown profile `missing`"), "{err}");
+        assert!(err.contains("deep"), "{err}");
+
+        // Reserved "default", bad characters, and bad durations are rejected.
+        for bad in [
+            "[profiles.default]\nthought_level = \"high\"\n",
+            "[profiles.\"bad name\"]\nthought_level = \"high\"\n",
+            "[profiles.deep]\ninactivity_timeout_secs = 0\n",
+            "[profiles.deep]\nmax_turn_secs = -5\n",
+        ] {
+            let cfg: Config = toml::from_str(bad).unwrap();
+            assert!(cfg.validate().is_err(), "{bad} should fail validation");
+        }
     }
 }

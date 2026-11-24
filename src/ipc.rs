@@ -143,12 +143,21 @@ pub async fn request(path: &Path, request: &Request) -> Result<Reply> {
 
 /// Ask, and wait for the accepted reply.
 pub async fn ask(path: &Path, text: &str, wait: bool, new: bool) -> Result<(u64, Client)> {
-    let request = Request::Ask {
-        text: text.to_string(),
-        wait,
-        new,
-    };
-    let mut client = Client::send(path, &request).await?;
+    ask_request(
+        path,
+        &Request::Ask {
+            text: text.to_string(),
+            wait,
+            new,
+            profile: None,
+        },
+    )
+    .await
+}
+
+/// Send an `Ask` request and wait for the `Accepted` reply.
+pub async fn ask_request(path: &Path, request: &Request) -> Result<(u64, Client)> {
+    let mut client = Client::send(path, request).await?;
     match client.next(Some(CLIENT_TIMEOUT)).await? {
         Reply::Accepted { id } => Ok((id, client)),
         Reply::Error { message } => bail!("{message}"),

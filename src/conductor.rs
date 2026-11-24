@@ -20,7 +20,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::acp::{self, CallError, Connection, Incoming};
-use crate::config::{Config, MAX_RESTART_DELAY_SECS, secs};
+use crate::config::{Config, MAX_RESTART_DELAY_SECS, ResolvedProfile, secs};
 use crate::context::{self, ContextProvider, SystemContext};
 use crate::environment::{self, Paths};
 use crate::policy::Policy;
@@ -130,6 +130,7 @@ pub struct Ask {
     pub id: u64,
     pub text: String,
     pub new: bool,
+    pub profile: Option<String>,
     pub sink: Sink,
     pub token: Arc<CancelToken>,
 }
@@ -145,13 +146,14 @@ struct Shared {
     /// The newest request, which is the only one that may still run.
     latest: Option<(u64, Arc<CancelToken>)>,
     agent: AgentState,
-    running: Option<(u64, Instant)>,
+    running: Option<(u64, Instant, Option<String>)>,
     follow_up_until: Option<Instant>,
     handled: u64,
 }
 
 #[derive(Clone)]
 pub struct Handle {
+    config: Arc<Config>,
     shared: Arc<Mutex<Shared>>,
     messages: mpsc::UnboundedSender<Message>,
     /// Set at shutdown; interrupts whatever the conductor is waiting on.
@@ -159,8 +161,15 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// Validate a requested profile name against the daemon's configuration
+    /// before queuing a request (so an unknown profile never supersedes an
+    /// active foreground turn).
+    pub fn validate_profile(&self, profile: Option<&str>) -> std::result::Result<(), String> {
+        self.config.resolve_profile(profile).map(|_| ())
+    }
+
     /// Queue a request, superseding the one before. Returns its number.
-    pub fn ask(&self, text: String, new: bool, sink: Sink) -> u64 {
+    pub fn ask(&self, text: String, new: bool, profile: Option<String>, sink: Sink) -> u64 {
         let token = Arc::new(CancelToken::default());
         let id = {
             let mut shared = self
@@ -178,6 +187,7 @@ impl Handle {
             id,
             text,
             new,
+            profile,
             sink,
             token,
         };
@@ -188,6 +198,7 @@ impl Handle {
                 None,
                 ask,
                 Outcome::failed(FailReason::AgentDown, "the daemon is shutting down"),
+                None,
             );
         }
         id
@@ -217,14 +228,19 @@ impl Handle {
                 token.reason().is_none() && !token.state.lock().map(|s| s.finished).unwrap_or(true)
             })
             .map(|(id, _)| *id);
-        let (running, running_secs) = match shared.running {
-            Some((id, since)) => (Some(id), Some(since.elapsed().as_secs_f64())),
-            None => (waiting, None),
+        let (running, running_secs, running_profile) = match &shared.running {
+            Some((id, since, profile)) => (
+                Some(*id),
+                Some(since.elapsed().as_secs_f64()),
+                profile.clone(),
+            ),
+            None => (waiting, None, None),
         };
         Status {
             agent: shared.agent,
             running,
             running_secs,
+            running_profile,
             follow_up_secs: shared
                 .follow_up_until
                 .filter(|until| *until > now)
@@ -272,7 +288,7 @@ fn spawn_inner(
     let stop = Arc::new(CancelToken::default());
     let conductor = Conductor {
         policy: Policy::new(&config.permissions.deny),
-        config,
+        config: Arc::clone(&config),
         presenter,
         context,
         persist_last,
@@ -289,12 +305,20 @@ fn spawn_inner(
     let task = tokio::spawn(conductor.run());
     (
         Handle {
+            config,
             shared,
             messages,
             stop,
         },
         task,
     )
+}
+
+/// A pre-opened session configured for a specific `(model, thought_level)`.
+struct SpareSession {
+    session: String,
+    model: String,
+    thought_level: String,
 }
 
 /// A running agent.
@@ -304,11 +328,17 @@ struct Live {
     started: Instant,
     /// A session made ahead of time: the first session/new of an agent
     /// process takes about a second, later ones about 20 ms.
-    spare: Option<String>,
+    spare: Option<SpareSession>,
+    /// Initial `(model, thought_level)` reported by the agent's first
+    /// `session/new`, used when switching back to an empty config value.
+    agent_defaults: (String, String),
 }
 
 struct Conversation {
     session: String,
+    profile_name: Option<String>,
+    model: String,
+    thought_level: String,
     /// When the last turn ended; follow-ups are measured from here.
     last: Instant,
     turns: u32,
@@ -460,10 +490,29 @@ impl Conductor {
         // Whatever is still queued gets an answer.
         while let Ok(message) = self.inbox.try_recv() {
             if let Message::Ask(ask) = message {
-                self.finish(ask, cancelled(FailReason::AgentDown));
+                let profile = self.effective_display_profile(&ask);
+                self.finish(ask, cancelled(FailReason::AgentDown), profile);
             }
         }
         self.stop_agent().await;
+    }
+
+    fn effective_display_profile(&self, ask: &Ask) -> Option<String> {
+        match ask.profile.as_deref() {
+            Some("default") => None,
+            Some(name) => Some(name.to_string()),
+            None => {
+                let window = secs(self.config.conversation.follow_up_secs);
+                if !ask.new
+                    && let Some(conv) = &self.conversation
+                    && window.is_some_and(|w| conv.last.elapsed() < w)
+                {
+                    conv.profile_name.clone()
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     fn idle_deadline(&self) -> Option<Instant> {
@@ -478,7 +527,7 @@ impl Conductor {
         }
     }
 
-    /// Start the agent ahead of any request, with a session ready.
+    /// Start the agent ahead of any request, with a default session ready.
     async fn start_warm(&mut self) {
         if self.live.is_some() {
             return;
@@ -488,10 +537,18 @@ impl Conductor {
             self.schedule_restart();
             return;
         }
-        match self.new_session().await {
+        let default_profile = self
+            .config
+            .resolve_profile(None)
+            .expect("base [agent] profile always resolves");
+        match self.new_session(&default_profile).await {
             Ok(session) => {
                 if let Some(live) = &mut self.live {
-                    live.spare = Some(session);
+                    live.spare = Some(SpareSession {
+                        session,
+                        model: default_profile.model,
+                        thought_level: default_profile.thought_level,
+                    });
                 }
             }
             // An expired login shows up here; call_failed has stopped the
@@ -573,6 +630,7 @@ impl Conductor {
             incoming,
             started: Instant::now(),
             spare: None,
+            agent_defaults: (String::new(), String::new()),
         });
         Ok(())
     }
@@ -654,25 +712,27 @@ impl Conductor {
     }
 
     async fn take(&mut self, ask: Ask) {
+        let display_profile = self.effective_display_profile(&ask);
         if let Some(reason) = ask.token.reason() {
-            self.finish(ask, cancelled(reason));
+            self.finish(ask, cancelled(reason), display_profile);
             return;
         }
         if let Ok(mut shared) = self.shared.lock() {
-            shared.running = Some((ask.id, Instant::now()));
+            shared.running = Some((ask.id, Instant::now(), display_profile.clone()));
         }
         if matches!(ask.sink, Sink::Present) {
             self.presenter.present(Presentation::Progress {
                 id: ask.id,
                 request: ask.text.clone(),
+                profile: display_profile.clone(),
             });
         }
-        let outcome = self.run_request(&ask).await;
+        let (outcome, used_profile) = self.run_request(&ask).await;
         self.last_used = Instant::now();
-        self.finish(ask, outcome);
+        self.finish(ask, outcome, used_profile.or(display_profile));
     }
 
-    fn finish(&mut self, ask: Ask, outcome: Outcome) {
+    fn finish(&mut self, ask: Ask, outcome: Outcome, profile: Option<String>) {
         ask.token.finish();
         if let Ok(mut shared) = self.shared.lock() {
             shared.running = None;
@@ -697,16 +757,21 @@ impl Conductor {
                 tracing::warn!("cannot save the last answer: {e:#}");
             }
         }
-        deliver(Some(&self.presenter), ask, outcome);
+        deliver(Some(&self.presenter), ask, outcome, profile);
     }
 
-    async fn run_request(&mut self, ask: &Ask) -> Outcome {
+    async fn run_request(&mut self, ask: &Ask) -> (Outcome, Option<String>) {
         let started = Instant::now();
         let token = Arc::clone(&ask.token);
+        let fallback_profile = self.effective_display_profile(ask);
         tracing::info!(
-            "request {}: {} characters",
+            "request {}: {} characters{}",
             ask.id,
-            ask.text.chars().count()
+            ask.text.chars().count(),
+            fallback_profile
+                .as_deref()
+                .map(|p| format!(", profile {p}"))
+                .unwrap_or_default()
         );
         tracing::debug!("request {}: {:?}", ask.id, ask.text);
 
@@ -717,7 +782,7 @@ impl Conductor {
             stop: &stop,
         };
         let mut retried_auth = false;
-        let session = loop {
+        let (session, resolved) = loop {
             let was_live = self.live.is_some();
             if !was_live {
                 self.restart_at = None;
@@ -729,27 +794,30 @@ impl Conductor {
                     reason = stop.cancelled() => {
                         // The half-started agent was dropped, which killed it.
                         self.set_agent(AgentState::Down);
-                        return cancelled(reason);
+                        return (cancelled(reason), fallback_profile);
                     }
                 };
                 if let Err(e) = start {
                     self.schedule_restart_if_warm();
-                    return Outcome::failed(
-                        FailReason::AgentDown,
-                        format!("Cannot start the assistant: {e:#}"),
+                    return (
+                        Outcome::failed(
+                            FailReason::AgentDown,
+                            format!("Cannot start the assistant: {e:#}"),
+                        ),
+                        fallback_profile,
                     );
                 }
                 if let Some(reason) = token.reason() {
-                    return cancelled(reason);
+                    return (cancelled(reason), fallback_profile);
                 }
             }
 
             let result = tokio::select! {
-                result = self.session_for(ask.new) => result,
-                reason = interrupts.wait() => return cancelled(reason),
+                result = self.session_for(ask.new, ask.profile.as_deref()) => result,
+                reason = interrupts.wait() => return (cancelled(reason), fallback_profile),
             };
             match result {
-                Ok(session) => break session,
+                Ok(pair) => break pair,
                 Err(outcome) => {
                     // If a pre-existing agent lost its login and was stopped
                     // for it, retry once on a fresh agent in case the user
@@ -768,15 +836,16 @@ impl Conductor {
                         retried_auth = true;
                         continue;
                     }
-                    return outcome;
+                    return (outcome, fallback_profile);
                 }
             }
         };
+        let used_profile = resolved.name.clone();
 
         let header = if self.config.context.is_enabled() {
             tokio::select! {
                 header = self.context.gather(&self.config.context) => header,
-                reason = interrupts.wait() => return cancelled(reason),
+                reason = interrupts.wait() => return (cancelled(reason), used_profile),
             }
         } else {
             None
@@ -787,14 +856,15 @@ impl Conductor {
         let prompt = context::prepend(header.as_deref(), &ask.text);
 
         let Some(mut live) = self.live.take() else {
-            return Outcome::failed(FailReason::AgentDown, "the assistant exited");
+            return (
+                Outcome::failed(FailReason::AgentDown, "the assistant exited"),
+                used_profile,
+            );
         };
         let budgets = Budgets {
-            inactivity: secs(self.config.agent.inactivity_timeout_secs)
-                .unwrap_or(Duration::from_secs(45)),
-            max_turn: secs(self.config.agent.max_turn_secs),
-            max_tool_calls: (self.config.agent.max_tool_calls > 0)
-                .then_some(self.config.agent.max_tool_calls),
+            inactivity: resolved.inactivity,
+            max_turn: resolved.max_turn,
+            max_tool_calls: resolved.max_tool_calls,
         };
         let ctx = TurnContext {
             policy: &self.policy,
@@ -832,7 +902,10 @@ impl Conductor {
                 message,
             } = &end.outcome
             {
-                return Outcome::failed(FailReason::AgentDown, format!("{message} ({detail})"));
+                return (
+                    Outcome::failed(FailReason::AgentDown, format!("{message} ({detail})")),
+                    used_profile,
+                );
             }
         }
 
@@ -840,7 +913,7 @@ impl Conductor {
             self.failures = 0;
         }
         log_outcome(ask.id, &end.outcome, started);
-        end.outcome
+        (end.outcome, used_profile)
     }
 
     fn schedule_restart_if_warm(&mut self) {
@@ -855,19 +928,75 @@ impl Conductor {
         }
     }
 
-    /// The session this request continues, or a new one.
-    async fn session_for(&mut self, new: bool) -> Result<String, Outcome> {
+    /// The session this request continues (with any mid-conversation profile
+    /// switch applied), or a new one.
+    async fn session_for(
+        &mut self,
+        new: bool,
+        requested: Option<&str>,
+    ) -> Result<(String, ResolvedProfile), Outcome> {
         let window = secs(self.config.conversation.follow_up_secs);
         if !new
             && let Some(conversation) = &self.conversation
             && window.is_some_and(|w| conversation.last.elapsed() < w)
         {
-            tracing::info!(
-                "continuing the conversation (turn {})",
-                conversation.turns + 1
-            );
-            return Ok(conversation.session.clone());
+            if requested.is_none() {
+                let resolved = self
+                    .config
+                    .resolve_profile(conversation.profile_name.as_deref())
+                    .map_err(|e| Outcome::failed(FailReason::AgentError, e))?;
+                tracing::info!(
+                    "continuing the conversation (turn {})",
+                    conversation.turns + 1
+                );
+                return Ok((conversation.session.clone(), resolved));
+            }
+
+            let resolved = self
+                .config
+                .resolve_profile(requested)
+                .map_err(|e| Outcome::failed(FailReason::AgentError, e))?;
+            if resolved.model == conversation.model
+                && resolved.thought_level == conversation.thought_level
+            {
+                let session = conversation.session.clone();
+                let turns = conversation.turns + 1;
+                if let Some(conv) = &mut self.conversation {
+                    conv.profile_name = resolved.name.clone();
+                }
+                tracing::info!("continuing the conversation (turn {turns})");
+                return Ok((session, resolved));
+            }
+
+            let session = conversation.session.clone();
+            let prev_model = conversation.model.clone();
+            let prev_thought = conversation.thought_level.clone();
+            let turns = conversation.turns + 1;
+            match self
+                .apply_profile_switch(&session, &prev_model, &prev_thought, &resolved)
+                .await?
+            {
+                true => {
+                    if let Some(conv) = &mut self.conversation {
+                        conv.profile_name = resolved.name.clone();
+                        conv.model = resolved.model.clone();
+                        conv.thought_level = resolved.thought_level.clone();
+                    }
+                    tracing::info!("switched profile in place on the conversation (turn {turns})");
+                    return Ok((session, resolved));
+                }
+                false => {
+                    tracing::warn!(
+                        "mid-conversation profile switch refused; starting a new session"
+                    );
+                }
+            }
         }
+
+        let resolved = self
+            .config
+            .resolve_profile(requested)
+            .map_err(|e| Outcome::failed(FailReason::AgentError, e))?;
 
         if let Some(old) = self.conversation.take()
             && let Some(live) = &self.live
@@ -880,21 +1009,109 @@ impl Conductor {
         }
         self.set_follow_up(None);
 
-        let spare = self.live.as_mut().and_then(|live| live.spare.take());
-        let session = match spare {
-            Some(session) => session,
-            None => self.new_session().await?,
+        let spare_matches = self
+            .live
+            .as_ref()
+            .and_then(|live| live.spare.as_ref())
+            .is_some_and(|spare| {
+                spare.model == resolved.model && spare.thought_level == resolved.thought_level
+            });
+        let session = if spare_matches {
+            self.live
+                .as_mut()
+                .and_then(|live| live.spare.take())
+                .expect("checked above")
+                .session
+        } else {
+            self.new_session(&resolved).await?
         };
         tracing::info!("new conversation");
         self.conversation = Some(Conversation {
             session: session.clone(),
+            profile_name: resolved.name.clone(),
+            model: resolved.model.clone(),
+            thought_level: resolved.thought_level.clone(),
             last: Instant::now(),
             turns: 0,
         });
-        Ok(session)
+        Ok((session, resolved))
     }
 
-    async fn new_session(&mut self) -> Result<String, Outcome> {
+    /// Apply changed `model` / `thought_level` options onto an existing session.
+    /// Returns `Ok(true)` if every change succeeded, `Ok(false)` if the agent
+    /// rejected the mid-session config change (caller should open a new session),
+    /// or `Err` if the connection itself died/timed out.
+    async fn apply_profile_switch(
+        &mut self,
+        session: &str,
+        prev_model: &str,
+        prev_thought: &str,
+        resolved: &ResolvedProfile,
+    ) -> Result<bool, Outcome> {
+        let Some(live) = &self.live else {
+            return Err(Outcome::failed(
+                FailReason::AgentDown,
+                "the assistant is not running",
+            ));
+        };
+        let mut updates: Vec<(&str, String)> = Vec::new();
+        if resolved.model != prev_model {
+            let target = if resolved.model.is_empty() {
+                live.agent_defaults.0.clone()
+            } else {
+                resolved.model.clone()
+            };
+            if target.is_empty() {
+                return Ok(false);
+            }
+            updates.push(("model", target));
+        }
+        if resolved.thought_level != prev_thought {
+            let target = if resolved.thought_level.is_empty() {
+                live.agent_defaults.1.clone()
+            } else {
+                resolved.thought_level.clone()
+            };
+            if target.is_empty() {
+                return Ok(false);
+            }
+            updates.push(("thought_level", target));
+        }
+        for (key, value) in updates {
+            let Some(live) = &self.live else {
+                return Err(Outcome::failed(
+                    FailReason::AgentDown,
+                    "the assistant is not running",
+                ));
+            };
+            let res = live
+                .conn
+                .call(
+                    "session/set_config_option",
+                    json!({"sessionId": session, "configId": key, "value": value}),
+                    CONFIG_TIMEOUT,
+                )
+                .await;
+            match res {
+                Ok(_) => {}
+                Err(CallError::Rpc(e)) => {
+                    if is_auth_required(&e) {
+                        return Err(self
+                            .call_failed("session/set_config_option", CallError::Rpc(e))
+                            .await);
+                    }
+                    tracing::warn!("cannot switch {key} to {value} mid-session: {e}");
+                    return Ok(false);
+                }
+                Err(other) => {
+                    return Err(self.call_failed("session/set_config_option", other).await);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    async fn new_session(&mut self, resolved: &ResolvedProfile) -> Result<String, Outcome> {
         let started = Instant::now();
         let (Some(live), Some(paths)) = (&self.live, &self.paths) else {
             return Err(Outcome::failed(
@@ -923,12 +1140,22 @@ impl Conductor {
         };
         let session = session.to_string();
 
-        let mut options = vec![];
-        if !self.config.agent.model.is_empty() {
-            options.push(("model", self.config.agent.model.clone()));
+        if let Some(live) = &mut self.live
+            && live.agent_defaults.0.is_empty()
+            && live.agent_defaults.1.is_empty()
+        {
+            live.agent_defaults = (
+                config_option(&result, "model").unwrap_or_default(),
+                config_option(&result, "thought_level").unwrap_or_default(),
+            );
         }
-        if !self.config.agent.thought_level.is_empty() {
-            options.push(("thought_level", self.config.agent.thought_level.clone()));
+
+        let mut options = vec![];
+        if !resolved.model.is_empty() {
+            options.push(("model", resolved.model.clone()));
+        }
+        if !resolved.thought_level.is_empty() {
+            options.push(("thought_level", resolved.thought_level.clone()));
         }
         // Default mode sends every tool call that needs approval to the
         // daemon; agy's "auto" would let its own classifier decide.
@@ -999,7 +1226,12 @@ impl Conductor {
 }
 
 /// Send the outcome where it belongs.
-fn deliver(presenter: Option<&Arc<dyn Presenter>>, ask: Ask, outcome: Outcome) {
+fn deliver(
+    presenter: Option<&Arc<dyn Presenter>>,
+    ask: Ask,
+    outcome: Outcome,
+    profile: Option<String>,
+) {
     match ask.sink {
         Sink::Client(reply) => {
             // A client that left has already cancelled the request.
@@ -1014,11 +1246,13 @@ fn deliver(presenter: Option<&Arc<dyn Presenter>>, ask: Ask, outcome: Outcome) {
                     id: ask.id,
                     text,
                     denied,
+                    profile,
                 },
                 Outcome::Failed { reason, message } => Presentation::Failure {
                     id: ask.id,
                     reason,
                     message,
+                    profile,
                 },
             });
         }
@@ -1454,13 +1688,16 @@ async fn cancel_turn(
 
 /// Run one request without a daemon: start the agent, ask, stop it. For
 /// `debug prompt`, which is how the agent's behaviour is measured.
-pub async fn ask_once(config: Config, text: String) -> Result<Outcome> {
+pub async fn ask_once(config: Config, text: String, profile: Option<String>) -> Result<Outcome> {
+    if let Err(msg) = config.resolve_profile(profile.as_deref()) {
+        anyhow::bail!("{msg}");
+    }
     let mut config = config;
     config.agent.warm_start = false;
     let presenter: Arc<dyn Presenter> = crate::present::Recorder::new();
     let (handle, task) = spawn_inner(Arc::new(config), presenter, Arc::new(SystemContext), false);
     let (tx, rx) = oneshot::channel();
-    let id = handle.ask(text, true, Sink::Client(tx));
+    let id = handle.ask(text, true, profile, Sink::Client(tx));
     let reply = rx.await.context("the conductor stopped")?;
     handle.shutdown();
     let _ = task.await;

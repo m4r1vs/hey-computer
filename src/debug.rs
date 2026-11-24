@@ -62,8 +62,8 @@ pub fn classify(config: &Config, text: &str) {
 
 /// One request straight to the agent, without a daemon. With `-v` the log
 /// shows when each tool call and permission request arrived.
-pub async fn prompt(config: Config, text: String) -> Result<bool> {
-    match conductor::ask_once(config, text).await? {
+pub async fn prompt(config: Config, text: String, profile: Option<String>) -> Result<bool> {
+    match conductor::ask_once(config, text, profile).await? {
         Outcome::Answer { text, denied } => {
             println!("{text}");
             for command in denied {
@@ -86,11 +86,13 @@ pub async fn present(config: &Config, text: String) -> Result<()> {
     presenter.present(Presentation::Progress {
         id: 0,
         request: "debug present".to_string(),
+        profile: None,
     });
     presenter.present(Presentation::Answer {
         id: 0,
         text,
         denied: Vec::new(),
+        profile: None,
     });
     desktop.finish().await;
     Ok(())

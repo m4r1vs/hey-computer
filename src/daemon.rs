@@ -236,19 +236,19 @@ async fn connection(handle: &Handle, stream: UnixStream) -> Result<()> {
         }
         Request::Ask {
             text,
-            wait: false,
+            wait,
             new,
+            profile,
         } => {
-            let id = handle.ask(text, new, Sink::Present);
-            send(&mut write, &Reply::Accepted { id }).await
-        }
-        Request::Ask {
-            text,
-            wait: true,
-            new,
-        } => {
+            if let Err(message) = handle.validate_profile(profile.as_deref()) {
+                return send(&mut write, &Reply::Error { message }).await;
+            }
+            if !wait {
+                let id = handle.ask(text, new, profile, Sink::Present);
+                return send(&mut write, &Reply::Accepted { id }).await;
+            }
             let (tx, rx) = oneshot::channel();
-            let id = handle.ask(text, new, Sink::Client(tx));
+            let id = handle.ask(text, new, profile, Sink::Client(tx));
             send(&mut write, &Reply::Accepted { id }).await?;
             // The client waits for the answer; if it hangs up first, the
             // request is cancelled, since nobody would see the answer.

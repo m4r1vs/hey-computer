@@ -251,12 +251,14 @@ async fn without_wait_the_daemon_presents_progress_then_the_answer() {
         vec![
             Presentation::Progress {
                 id,
-                request: "plain".to_string()
+                request: "plain".to_string(),
+                profile: None,
             },
             Presentation::Answer {
                 id,
                 text: "Hello from the mock.".to_string(),
-                denied: vec![]
+                denied: vec![],
+                profile: None,
             },
         ]
     );
@@ -700,7 +702,8 @@ async fn a_shutdown_replaces_the_progress_popup() {
         Some(&Presentation::Failure {
             id,
             reason: FailReason::AgentDown,
-            message: "The daemon is shutting down.".to_string()
+            message: "The daemon is shutting down.".to_string(),
+            profile: None,
         }),
         "{items:?}"
     );
@@ -739,7 +742,8 @@ async fn a_correction_during_a_cold_start_keeps_the_starting_agent() {
         items.contains(&Presentation::Failure {
             id: first,
             reason: FailReason::Superseded,
-            message: "A newer request replaced this one.".to_string()
+            message: "A newer request replaced this one.".to_string(),
+            profile: None,
         }),
         "{items:?}"
     );
@@ -968,6 +972,7 @@ async fn without_wait_tool_calls_emit_progress_updates() {
             Presentation::Progress {
                 id,
                 request: "check desktop".to_string(),
+                profile: None,
             },
             Presentation::ProgressUpdate {
                 id,
@@ -981,6 +986,7 @@ async fn without_wait_tool_calls_emit_progress_updates() {
                 id,
                 text: "All good.".to_string(),
                 denied: vec![],
+                profile: None,
             },
         ]
     );
@@ -1038,6 +1044,7 @@ async fn ambient_time_context_is_prepended_without_altering_progress_text() {
         Presentation::Progress {
             id,
             request: "what day is it".to_string(),
+            profile: None,
         }
     );
     match &items[1] {
@@ -1200,5 +1207,209 @@ async fn the_last_successful_answer_is_persisted_and_failures_do_not_overwrite_i
     assert_eq!(saved.request, "long");
     assert!(saved.text.starts_with("# Title"));
 
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
+    use hey_computer::config::Profile;
+
+    let script = r#"{
+        "turns": [
+            {"match": "cfg", "steps": ["config_info"]},
+            {"match": "two_tools", "steps": [
+                {"permission": {"command": "echo one"}},
+                {"permission": {"command": "echo two"}},
+                {"chunk": "ok"}
+            ]}
+        ],
+        "default": ["config_info"]
+    }"#;
+    let h = Harness::start(script, |c| {
+        c.profiles.insert(
+            "deep".to_string(),
+            Profile {
+                model: Some("mock-deep".to_string()),
+                thought_level: Some("high".to_string()),
+                max_tool_calls: Some(1),
+                ..Profile::default()
+            },
+        );
+    })
+    .await;
+    // Warm start prepares mock-1 for default [agent].
+    h.wait_log("new mock-1").await;
+
+    // Asking with `deep` opens mock-2, keeping mock-1 spare for a later default ask.
+    let (_, mut client) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "cfg".to_string(),
+            wait: true,
+            new: false,
+            profile: Some("deep".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    let r1 = client.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert_eq!(answer(&r1), "model=mock-deep thought=high turn=1 in mock-2");
+
+    // Follow-up without --profile inherits `deep` (including its max_tool_calls=1 budget).
+    let r2 = h.ask("cfg", false).await;
+    assert_eq!(answer(&r2), "model=mock-deep thought=high turn=2 in mock-2");
+
+    // Switching back to `default` inside the follow-up window updates mock-2 in place.
+    let (_, mut client) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "cfg".to_string(),
+            wait: true,
+            new: false,
+            profile: Some("default".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    let r3 = client.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert_eq!(
+        answer(&r3),
+        "model=gemini-4-hydrogen thought=low turn=3 in mock-2"
+    );
+
+    // Starting a new default conversation consumes the preserved warm spare (mock-1).
+    let r4 = h.ask("cfg", true).await;
+    assert_eq!(
+        answer(&r4),
+        "model=gemini-4-hydrogen thought=low turn=1 in mock-1"
+    );
+
+    // Profile-specific budget (`deep`: max_tool_calls = 1) is enforced.
+    let (_, mut client) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "two_tools".to_string(),
+            wait: true,
+            new: true,
+            profile: Some("deep".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    let r5 = client.next(Some(Duration::from_secs(10))).await.unwrap();
+    let (reason, _) = failure(&r5);
+    assert_eq!(reason, FailReason::LimitReached);
+
+    // Non-waiting ask carries the profile name through Progress and Answer.
+    let (id, _) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "cfg".to_string(),
+            wait: false,
+            new: true,
+            profile: Some("deep".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    let items = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|item| matches!(item, Presentation::Answer { id: got, .. } if *got == id))
+        })
+        .await
+        .expect("deep answer presented");
+    assert!(
+        items.iter().any(|i| matches!(
+            i,
+            Presentation::Progress { id: got, profile: Some(p), .. } if *got == id && p == "deep"
+        )),
+        "{items:?}"
+    );
+    assert!(
+        items.iter().any(|i| matches!(
+            i,
+            Presentation::Answer { id: got, profile: Some(p), .. } if *got == id && p == "deep"
+        )),
+        "{items:?}"
+    );
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mid_session_config_rejection_falls_back_to_a_fresh_session() {
+    use hey_computer::config::Profile;
+
+    let script = r#"{
+        "reject_mid_session_config": true,
+        "default": ["config_info"]
+    }"#;
+    let h = Harness::start(script, |c| {
+        c.profiles.insert(
+            "deep".to_string(),
+            Profile {
+                model: Some("mock-deep".to_string()),
+                thought_level: Some("high".to_string()),
+                ..Profile::default()
+            },
+        );
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    assert_eq!(
+        answer(&h.ask("first", false).await),
+        "model=gemini-4-hydrogen thought=low turn=1 in mock-1"
+    );
+
+    let (_, mut client) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "escalate".to_string(),
+            wait: true,
+            new: false,
+            profile: Some("deep".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    let reply = client.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert_eq!(
+        answer(&reply),
+        "model=mock-deep thought=high turn=1 in mock-2"
+    );
+    h.wait_log("close mock-1").await;
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_profile_returns_error_without_superseding_running_request() {
+    let h = Harness::warm().await;
+    let (running_id, mut slow) = h.ask_waiting("slow").await;
+    h.wait_log("prompt mock-1 slow").await;
+
+    let reply = ipc::request(
+        &h.socket,
+        &Request::Ask {
+            text: "hi".to_string(),
+            wait: false,
+            new: false,
+            profile: Some("nonexistent".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    match reply {
+        Reply::Error { message } => assert!(message.contains("unknown profile"), "{message}"),
+        other => panic!("expected error, got {other:?}"),
+    }
+
+    // The running request must not have been superseded by the rejected ask.
+    assert_eq!(h.status().await.running, Some(running_id));
+    ipc::request(&h.socket, &Request::Cancel).await.unwrap();
+    let (reason, _) = failure(&slow.next(Some(Duration::from_secs(5))).await.unwrap());
+    assert_eq!(reason, FailReason::Cancelled);
     h.stop().await;
 }

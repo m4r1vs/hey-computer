@@ -50,7 +50,11 @@ const VIEWER_STDERR_KEPT: usize = 400;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Presentation {
     /// A request has started.
-    Progress { id: u64, request: String },
+    Progress {
+        id: u64,
+        request: String,
+        profile: Option<String>,
+    },
     /// Mid-turn status update for an in-flight request (e.g. a tool call).
     ProgressUpdate { id: u64, status: String },
     Answer {
@@ -58,11 +62,13 @@ pub enum Presentation {
         text: String,
         /// Commands the agent was refused on the way.
         denied: Vec<String>,
+        profile: Option<String>,
     },
     Failure {
         id: u64,
         reason: FailReason,
         message: String,
+        profile: Option<String>,
     },
 }
 
@@ -939,6 +945,8 @@ enum ProgressSlot {
     Active {
         request_id: u64,
         notif_id: u32,
+        /// Notification summary (e.g. `"Thinking…"` or `"Thinking… (deep)"`).
+        summary: String,
         /// Already truncated & Pango-escaped request preview.
         request_body: String,
         last_status: Option<String>,
@@ -947,6 +955,13 @@ enum ProgressSlot {
     /// "Request replaced" popup id kept from a `Superseded` turn; only the
     /// next `Progress` may reuse it (never a `ProgressUpdate`).
     Reusable(u32),
+}
+
+fn with_profile(base: &str, profile: Option<&str>) -> String {
+    match profile {
+        Some(name) if !name.is_empty() => format!("{base} ({name})"),
+        _ => base.to_string(),
+    }
 }
 
 struct PendingUpdate {
@@ -1007,16 +1022,21 @@ impl Worker {
         while self.watchers.try_join_next().is_some() {}
         self.pending = None;
         match item {
-            Presentation::Progress { id, request } => {
+            Presentation::Progress {
+                id,
+                request,
+                profile,
+            } => {
                 if !self.config.progress {
                     return;
                 }
+                let summary = with_profile("Thinking…", profile.as_deref());
                 let request_body = escape_markup(&truncate(request.trim(), REQUEST_PREVIEW_CHARS));
                 // A superseded request's popup is reused for the next one.
                 let replaces = self.take_progress_id();
                 if let Some(notif_id) = self
                     .notify(
-                        "Thinking…",
+                        &summary,
                         &request_body,
                         Urgency::Low,
                         PROGRESS_EXPIRE_MS,
@@ -1027,6 +1047,7 @@ impl Worker {
                     self.progress = Some(ProgressSlot::Active {
                         request_id: id,
                         notif_id,
+                        summary,
                         request_body,
                         last_status: None,
                         last_sent: None,
@@ -1036,7 +1057,12 @@ impl Worker {
             Presentation::ProgressUpdate { id, status } => {
                 self.progress_update(id, status).await;
             }
-            Presentation::Answer { id, text, denied } => self.answer(id, &text, &denied).await,
+            Presentation::Answer {
+                id,
+                text,
+                denied,
+                profile,
+            } => self.answer(id, &text, &denied, profile.as_deref()).await,
             Presentation::Failure {
                 reason: reason @ (FailReason::Cancelled | FailReason::Superseded),
                 ..
@@ -1061,11 +1087,15 @@ impl Worker {
                 }
             }
             Presentation::Failure {
-                reason, message, ..
+                reason,
+                message,
+                profile,
+                ..
             } => {
                 let replaces = self.take_progress_id();
+                let summary = with_profile(reason.headline(), profile.as_deref());
                 self.notify(
-                    reason.headline(),
+                    &summary,
                     &escape_markup(&message),
                     Urgency::Normal,
                     FAILURE_EXPIRE_MS,
@@ -1134,6 +1164,7 @@ impl Worker {
         let Some(ProgressSlot::Active {
             request_id,
             notif_id,
+            summary,
             request_body,
             ..
         }) = &self.progress
@@ -1144,10 +1175,11 @@ impl Worker {
             return;
         }
         let replaces = *notif_id;
+        let summary = summary.clone();
         let body = format_progress_body(request_body, &status);
         let shown = self
             .notify(
-                "Thinking…",
+                &summary,
                 &body,
                 Urgency::Low,
                 PROGRESS_EXPIRE_MS,
@@ -1172,7 +1204,7 @@ impl Worker {
         }
     }
 
-    async fn answer(&mut self, id: u64, text: &str, denied: &[String]) {
+    async fn answer(&mut self, id: u64, text: &str, denied: &[String], profile: Option<&str>) {
         let replaces = self.take_progress_id();
         let refused = if denied.is_empty() {
             String::new()
@@ -1186,7 +1218,8 @@ impl Worker {
                 body.push_str("\n\n");
                 body.push_str(&escape_markup(&refused));
             }
-            self.notify("Answer", &body, Urgency::Normal, 0, replaces)
+            let summary = with_profile("Answer", profile);
+            self.notify(&summary, &body, Urgency::Normal, 0, replaces)
                 .await;
             return;
         }
@@ -1215,8 +1248,9 @@ impl Worker {
 
         if self.config.viewer.is_empty() {
             let body = format!("{}\n{}", headline(text, 120), file.display());
+            let summary = with_profile("Answer saved", profile);
             self.notify(
-                "Answer saved",
+                &summary,
                 &escape_markup(&body),
                 Urgency::Normal,
                 0,
@@ -1233,9 +1267,10 @@ impl Worker {
                 return;
             }
         };
+        let summary = with_profile("Answer opened", profile);
         let opened_id = self
             .notify(
-                "Answer opened",
+                &summary,
                 &escape_markup(&headline(text, 120)),
                 Urgency::Low,
                 0,
@@ -2053,6 +2088,7 @@ mod tests {
             id: 1,
             text: "# Heading\n\nbody".to_string(),
             denied: vec![],
+            profile: None,
         });
         desktop.finish().await;
         let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -2087,11 +2123,13 @@ mod tests {
         desktop.present(Presentation::Progress {
             id: 1,
             request: "explain".to_string(),
+            profile: None,
         });
         desktop.present(Presentation::Answer {
             id: 1,
             text: "# Heading\n\nbody".to_string(),
             denied: vec![],
+            profile: None,
         });
         desktop.finish().await;
         let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -2118,15 +2156,18 @@ mod tests {
         desktop.present(Presentation::Progress {
             id: 1,
             request: "first".to_string(),
+            profile: None,
         });
         desktop.present(Presentation::Answer {
             id: 1,
             text: "# Heading\n\nbody".to_string(),
             denied: vec![],
+            profile: None,
         });
         desktop.present(Presentation::Progress {
             id: 2,
             request: "second".to_string(),
+            profile: None,
         });
 
         // "Answer opened" and the next popup must arrive without waiting for
@@ -2183,6 +2224,7 @@ mod tests {
             id: 1,
             text: "# Heading\n\nbody".to_string(),
             denied: vec![],
+            profile: None,
         });
         desktop.finish().await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2401,6 +2443,7 @@ mod tests {
         desktop.present(Presentation::Progress {
             id: 1,
             request: "check <lights>".to_string(),
+            profile: Some("deep".to_string()),
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
@@ -2421,6 +2464,7 @@ mod tests {
             id: 1,
             text: "Done.".to_string(),
             denied: vec![],
+            profile: Some("deep".to_string()),
         });
         desktop.finish().await;
         let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -2428,11 +2472,12 @@ mod tests {
 
         assert!(recorded.contains("--urgency=low"), "{recorded}");
         assert!(recorded.contains("--replace-id=7"), "{recorded}");
+        assert!(recorded.contains("Thinking… (deep)"), "{recorded}");
         assert!(
             recorded.contains("check &lt;lights&gt;\n<b>Check &lt;a&amp;b&gt;</b>"),
             "{recorded}"
         );
-        assert!(recorded.contains("Answer Done."), "{recorded}");
+        assert!(recorded.contains("Answer (deep) Done."), "{recorded}");
     }
 
     #[tokio::test]
@@ -2451,6 +2496,7 @@ mod tests {
         desktop.present(Presentation::Progress {
             id: 1,
             request: "work".to_string(),
+            profile: None,
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
@@ -2516,6 +2562,7 @@ mod tests {
         desktop.present(Presentation::Progress {
             id: 1,
             request: "first".to_string(),
+            profile: None,
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
@@ -2540,6 +2587,7 @@ mod tests {
             id: 1,
             text: "Finished.".to_string(),
             denied: vec![],
+            profile: None,
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
@@ -2549,11 +2597,13 @@ mod tests {
         desktop.present(Presentation::Progress {
             id: 2,
             request: "second".to_string(),
+            profile: None,
         });
         desktop.present(Presentation::Failure {
             id: 2,
             reason: FailReason::Superseded,
             message: "replaced".to_string(),
+            profile: None,
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 2,
@@ -2595,6 +2645,7 @@ mod tests {
         desktop.present(Presentation::Progress {
             id: 1,
             request: "hi".to_string(),
+            profile: None,
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
@@ -2604,6 +2655,7 @@ mod tests {
             id: 1,
             text: "ok".to_string(),
             denied: vec![],
+            profile: None,
         });
         desktop.finish().await;
         let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -2637,6 +2689,7 @@ mod tests {
         desktop2.present(Presentation::Progress {
             id: 1,
             request: "hi".to_string(),
+            profile: None,
         });
         desktop2.present(Presentation::ProgressUpdate {
             id: 1,
@@ -2656,6 +2709,7 @@ mod tests {
             id: 1,
             text: "ok".to_string(),
             denied: vec![],
+            profile: None,
         });
         desktop2.finish().await;
         let recorded2 = std::fs::read_to_string(&calls2).unwrap_or_default();

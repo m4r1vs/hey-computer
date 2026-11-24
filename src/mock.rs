@@ -47,6 +47,8 @@ pub struct Script {
     pub init_error: Option<String>,
     /// Fail every `session/new` with this message, as an expired login does.
     pub session_error: Option<String>,
+    /// Reject `session/set_config_option` once a session has completed a turn.
+    pub reject_mid_session_config: bool,
     pub turns: Vec<TurnScript>,
     pub default: Vec<Step>,
 }
@@ -82,6 +84,8 @@ pub enum Step {
     },
     /// "turn N in SESSION", for follow-up tests.
     TurnInfo,
+    /// "model=M thought=T turn=N in SESSION", for profile tests.
+    ConfigInfo,
     /// "you said: TEXT".
     Echo,
     /// Exit at once with this status, mid-turn.
@@ -123,6 +127,7 @@ impl Logger {
 #[derive(Default)]
 struct State {
     sessions: HashMap<String, u32>,
+    session_config: HashMap<String, HashMap<String, String>>,
     cancels: HashMap<String, Arc<Notify>>,
     waiting: HashMap<String, oneshot::Sender<Value>>,
 }
@@ -265,11 +270,18 @@ impl Mock {
                     return;
                 }
                 let session = format!("mock-{}", self.next_session.fetch_add(1, Ordering::Relaxed));
-                self.state
-                    .lock()
-                    .unwrap()
-                    .sessions
-                    .insert(session.clone(), 0);
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.sessions.insert(session.clone(), 0);
+                    state.session_config.insert(
+                        session.clone(),
+                        HashMap::from([
+                            ("model".to_string(), "mock-large".to_string()),
+                            ("thought_level".to_string(), "high".to_string()),
+                            ("mode".to_string(), "auto".to_string()),
+                        ]),
+                    );
+                }
                 let extra = params
                     .get("additionalDirectories")
                     .map(|d| format!(" dirs={d}"))
@@ -289,10 +301,32 @@ impl Mock {
                 );
             }
             "session/set_config_option" => {
+                let session = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 let key = params.get("configId").and_then(Value::as_str).unwrap_or("");
                 let value = params.get("value").and_then(Value::as_str).unwrap_or("");
-                self.log.line(&format!("set {key}={value}"));
-                self.respond(id, json!({"configOptions": []}));
+                let rejected = {
+                    let mut state = self.state.lock().unwrap();
+                    let turns = state.sessions.get(session).copied().unwrap_or(0);
+                    if self.script.reject_mid_session_config && turns > 0 {
+                        true
+                    } else {
+                        if let Some(cfg) = state.session_config.get_mut(session) {
+                            cfg.insert(key.to_string(), value.to_string());
+                        }
+                        false
+                    }
+                };
+                if rejected {
+                    self.log
+                        .line(&format!("set-rejected {key}={value} ({session})"));
+                    self.error(id, -32602, "mid-session config rejected");
+                } else {
+                    self.log.line(&format!("set {key}={value} ({session})"));
+                    self.respond(id, json!({"configOptions": []}));
+                }
             }
             "session/close" => {
                 let session = params
@@ -365,6 +399,24 @@ impl Mock {
             match step {
                 Step::Chunk(chunk) => self.chunk(&session, &chunk),
                 Step::TurnInfo => self.chunk(&session, &format!("turn {turn} in {session}")),
+                Step::ConfigInfo => {
+                    let (model, thought) = {
+                        let state = self.state.lock().unwrap();
+                        let cfg = state.session_config.get(&session);
+                        (
+                            cfg.and_then(|c| c.get("model"))
+                                .cloned()
+                                .unwrap_or_default(),
+                            cfg.and_then(|c| c.get("thought_level"))
+                                .cloned()
+                                .unwrap_or_default(),
+                        )
+                    };
+                    self.chunk(
+                        &session,
+                        &format!("model={model} thought={thought} turn={turn} in {session}"),
+                    );
+                }
                 Step::Echo => self.chunk(&session, &format!("you said: {text}")),
                 Step::SleepMs(ms) => {
                     tokio::select! {
