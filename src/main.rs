@@ -15,8 +15,10 @@ use hey_computer::attachments;
 use hey_computer::config::Config;
 use hey_computer::ipc::{self, NotRunning};
 use hey_computer::present::{self, Urgency};
-use hey_computer::protocol::{self, Attachment, AttachmentKind, MAX_REQUEST_LINE, Reply, Request};
-use hey_computer::{daemon, debug, mock, store};
+use hey_computer::protocol::{
+    self, Attachment, AttachmentKind, InputSource, MAX_REQUEST_LINE, Reply, Request,
+};
+use hey_computer::{daemon, debug, mock, scheduler, store};
 
 #[derive(Debug, Parser)]
 #[command(name = "hey-computer", version, about, long_about = None)]
@@ -61,6 +63,13 @@ enum Command {
         /// Use a named profile from `[profiles.<name>]` (or `default`).
         #[arg(short = 'p', long, value_name = "NAME")]
         profile: Option<String>,
+        /// Tag this request as coming from voice dictation (shorthand for `--source voice`;
+        /// skips LLM triage when `[routing]` is enabled).
+        #[arg(long, conflicts_with = "source")]
+        voice: bool,
+        /// Input source (`cli`, `voice`, or `typed`) for automatic routing.
+        #[arg(long, value_enum)]
+        source: Option<InputSourceArg>,
         /// Attach a UTF-8 text file as embedded context (repeatable).
         #[arg(short = 'f', long = "file", value_name = "PATH")]
         files: Vec<PathBuf>,
@@ -81,6 +90,11 @@ enum Command {
     Tasks {
         #[command(subcommand)]
         action: Option<TasksCommand>,
+    },
+    /// Create, inspect, and manage scheduled jobs in the daemon's SQLite store.
+    Schedule {
+        #[command(subcommand)]
+        action: Option<ScheduleCommand>,
     },
     /// Search past completed answers using the local SQLite FTS5 index.
     Recall {
@@ -149,6 +163,127 @@ enum Command {
         #[command(subcommand)]
         what: DebugCommand,
     },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum InputSourceArg {
+    Cli,
+    Voice,
+    Typed,
+}
+
+impl InputSourceArg {
+    fn into_source(self) -> InputSource {
+        match self {
+            Self::Cli => InputSource::Cli,
+            Self::Voice => InputSource::Voice,
+            Self::Typed => InputSource::Typed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum FailureDeliverArg {
+    Notify,
+    Log,
+    Silent,
+}
+
+impl FailureDeliverArg {
+    fn into_deliver(self) -> store::FailureDeliver {
+        match self {
+            Self::Notify => store::FailureDeliver::Notify,
+            Self::Log => store::FailureDeliver::Log,
+            Self::Silent => store::FailureDeliver::Silent,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ScheduleCommand {
+    /// Add a new scheduled job or reminder.
+    Add {
+        /// Unique job name (letters, digits, `-`, `_`).
+        name: String,
+        /// Schedule specification (`every 15m`, `in 20m`, `at 14:30`, `daily 08:00`,
+        /// `weekdays 09:56`, `fri 16:00`, or 5-field cron `MIN HOUR DOM MON DOW`).
+        #[arg(short = 's', long = "schedule", value_name = "SPEC")]
+        schedule: String,
+        /// Prompt sent to the assistant (or reminder text when `--no-agent` is set).
+        #[arg(long, default_value = "")]
+        prompt: String,
+        /// Named profile from `[profiles.<name>]` for agent runs.
+        #[arg(short = 'p', long, value_name = "NAME")]
+        profile: Option<String>,
+        /// Optional shell pre-collector: exit 0 + empty stdout skips silently (0 LLM tokens);
+        /// non-empty stdout wakes the agent (or notifies directly with `--no-agent`).
+        #[arg(long, value_name = "CMD")]
+        script: Option<String>,
+        /// Notify directly without invoking the LLM (timed reminder or direct script alert).
+        #[arg(long)]
+        no_agent: bool,
+        /// Suppress notifications when the agent replies with this exact token.
+        #[arg(long, value_name = "TOKEN")]
+        suppress_token: Option<String>,
+        /// Failure routing (`notify`, `log`, or `silent`).
+        #[arg(long, value_enum, default_value_t = FailureDeliverArg::Notify)]
+        failure_deliver: FailureDeliverArg,
+        /// Disable automatically after this many runs.
+        #[arg(long, value_name = "N")]
+        max_runs: Option<u64>,
+        /// Auto-disable after this time (`in <N><s|m|h|d>`, `YYYY-MM-DD`, or `YYYY-MM-DD HH:MM`).
+        #[arg(long, value_name = "SPEC")]
+        expires: Option<String>,
+    },
+    /// List scheduled jobs (enabled jobs by default; works even when daemon is stopped).
+    List {
+        /// Include paused and expired jobs.
+        #[arg(long)]
+        all: bool,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show full details of one scheduled job by numeric ID or name.
+    Show {
+        target: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Edit an existing scheduled job.
+    Edit {
+        target: String,
+        #[arg(short = 's', long = "schedule", value_name = "SPEC")]
+        schedule: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(short = 'p', long, value_name = "NAME")]
+        profile: Option<String>,
+        #[arg(long, value_name = "CMD")]
+        script: Option<String>,
+        #[arg(long)]
+        no_agent: Option<bool>,
+        /// Set or clear (`""`) the suppress token.
+        #[arg(long, value_name = "TOKEN")]
+        suppress_token: Option<String>,
+        #[arg(long, value_enum)]
+        failure_deliver: Option<FailureDeliverArg>,
+        /// Set max runs (0 clears the limit).
+        #[arg(long, value_name = "N")]
+        max_runs: Option<u64>,
+        /// Set or clear (`""`) expiration (`in ...`, `YYYY-MM-DD`, or `YYYY-MM-DD HH:MM`).
+        #[arg(long, value_name = "SPEC")]
+        expires: Option<String>,
+    },
+    /// Pause a scheduled job.
+    Pause { target: String },
+    /// Resume a paused scheduled job.
+    Resume { target: String },
+    /// Permanently remove a scheduled job.
+    Remove { target: String },
+    /// Trigger an immediate test run via the running daemon.
+    Run { target: String },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -314,11 +449,20 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             background,
             suppress_token,
             profile,
+            voice,
+            source,
             files,
             images,
             text,
         } => {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
+            let input_source = if voice {
+                InputSource::Voice
+            } else {
+                source
+                    .map(InputSourceArg::into_source)
+                    .unwrap_or(InputSource::Cli)
+            };
             ask(
                 &config,
                 &socket,
@@ -328,6 +472,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
                 background,
                 suppress_token,
                 profile,
+                input_source,
                 files,
                 images,
             )
@@ -340,6 +485,10 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Tasks { action } => {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
             tasks(&config, &socket, action).await
+        }
+        Command::Schedule { action } => {
+            let socket = ipc::socket_path(cli.socket.as_deref())?;
+            schedule_cmd(&config, &socket, action).await
         }
         Command::Recall {
             since,
@@ -708,6 +857,307 @@ async fn tasks(config: &Config, socket: &Path, action: Option<TasksCommand>) -> 
     }
 }
 
+async fn notify_scheduler_reload(socket: &Path) {
+    let _ = ipc::request(socket, &Request::ScheduleReload).await;
+}
+
+fn validate_schedule_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        anyhow::bail!("schedule name `{name}` must be 1..=64 ASCII letters, digits, '-' or '_'");
+    }
+    if name.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!("schedule name `{name}` cannot be purely numeric (ambiguous with job IDs)");
+    }
+    Ok(())
+}
+
+async fn schedule_cmd(
+    config: &Config,
+    socket: &Path,
+    action: Option<ScheduleCommand>,
+) -> Result<ExitCode> {
+    let action = action.unwrap_or(ScheduleCommand::List {
+        all: false,
+        json: false,
+    });
+    match action {
+        ScheduleCommand::List { all, json } => {
+            let state_dir = config.state_dir()?;
+            let jobs = store::list_schedules(&state_dir, all)?;
+            if json {
+                println!("{}", serde_json::to_string(&jobs)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            if jobs.is_empty() {
+                println!("no scheduled jobs");
+                return Ok(ExitCode::SUCCESS);
+            }
+            for job in jobs {
+                let state = if job.enabled { "active" } else { "paused" };
+                let next = job
+                    .next_run_at
+                    .map(store::format_local_timestamp)
+                    .unwrap_or_else(|| "-".to_string());
+                let mode = if !job.script.is_empty() && job.no_agent {
+                    "script+notify"
+                } else if !job.script.is_empty() {
+                    "script+agent"
+                } else if job.no_agent {
+                    "reminder"
+                } else {
+                    "agent"
+                };
+                println!(
+                    "#{}  {:<20}  {:<6}  {:<13}  {:<16}  next: {}",
+                    job.id, job.name, state, mode, job.schedule_spec, next
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        ScheduleCommand::Show { target, json } => {
+            let state_dir = config.state_dir()?;
+            let Some(job) = store::get_schedule(&state_dir, &target)? else {
+                eprintln!("hey-computer: schedule `{target}` not found");
+                return Ok(ExitCode::FAILURE);
+            };
+            if json {
+                println!("{}", serde_json::to_string(&job)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!(
+                "#{} {} [{}]",
+                job.id,
+                job.name,
+                if job.enabled { "active" } else { "paused" }
+            );
+            println!("Schedule:        {}", job.schedule_spec);
+            if let Some(next) = job.next_run_at {
+                println!("Next run:        {}", store::format_local_timestamp(next));
+            }
+            if let Some(last) = job.last_run_at {
+                println!(
+                    "Last run:        {} ({})",
+                    store::format_local_timestamp(last),
+                    job.last_status.as_deref().unwrap_or("unknown")
+                );
+            }
+            println!(
+                "Runs:            {}{}",
+                job.run_count,
+                job.max_runs.map(|m| format!(" / {m}")).unwrap_or_default()
+            );
+            println!("Failure deliver: {}", job.failure_deliver);
+            if !job.profile.is_empty() {
+                println!("Profile:         {}", job.profile);
+            }
+            if job.no_agent {
+                println!("No agent:        true");
+            }
+            if let Some(tok) = &job.suppress_token {
+                println!("Suppress token:  {tok}");
+            }
+            if let Some(exp) = job.expires_at {
+                println!("Expires:         {}", store::format_local_timestamp(exp));
+            }
+            if !job.script.is_empty() {
+                println!("Script:          {}", job.script);
+            }
+            if !job.prompt.is_empty() {
+                println!("Prompt:          {}", job.prompt);
+            }
+            if let Some(err) = &job.last_error {
+                println!("Last error:      {err}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        ScheduleCommand::Add {
+            name,
+            schedule,
+            prompt,
+            profile,
+            script,
+            no_agent,
+            suppress_token,
+            failure_deliver,
+            max_runs,
+            expires,
+        } => {
+            validate_schedule_name(&name)?;
+            let parsed = scheduler::ScheduleSpec::parse(&schedule)?;
+            parsed.check_min_interval(config.scheduler.min_interval_secs)?;
+            if let Some(prof) = profile.as_deref()
+                && let Err(msg) = config.resolve_profile(Some(prof))
+            {
+                anyhow::bail!("{msg}");
+            }
+            let script_str = script.unwrap_or_default();
+            scheduler::validate_script(&script_str, &config.permissions.deny)?;
+            if prompt.trim().is_empty() && script_str.trim().is_empty() {
+                anyhow::bail!("provide --prompt, --script, or both");
+            }
+            if let Some(tok) = &suppress_token
+                && tok.trim().is_empty()
+            {
+                anyhow::bail!("--suppress-token must not be empty");
+            }
+            if max_runs == Some(0) {
+                anyhow::bail!("--max-runs must be at least 1");
+            }
+            let now_ms = store::unix_timestamp_ms();
+            let next_run_at = parsed.first_run_after(now_ms)?;
+            let expires_at = expires
+                .as_deref()
+                .map(|s| scheduler::parse_expires_at(s, now_ms))
+                .transpose()?;
+            if let Some(exp) = expires_at
+                && exp <= now_ms
+            {
+                anyhow::bail!("--expires time must be in the future");
+            }
+            let state_dir = config.state_dir()?;
+            let created = store::create_schedule(
+                &state_dir,
+                &store::NewSchedule {
+                    name,
+                    schedule_spec: schedule.trim().to_string(),
+                    prompt,
+                    profile: profile.filter(|p| p != "default").unwrap_or_default(),
+                    script: script_str,
+                    no_agent,
+                    suppress_token,
+                    failure_deliver: failure_deliver.into_deliver(),
+                    max_runs,
+                    expires_at,
+                    next_run_at,
+                },
+                config.scheduler.max_jobs,
+            )?;
+            notify_scheduler_reload(socket).await;
+            println!(
+                "scheduled #{} ({}) — next run: {}",
+                created.id,
+                created.name,
+                created
+                    .next_run_at
+                    .map(store::format_local_timestamp)
+                    .unwrap_or_else(|| "-".to_string())
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        ScheduleCommand::Edit {
+            target,
+            schedule,
+            prompt,
+            profile,
+            script,
+            no_agent,
+            suppress_token,
+            failure_deliver,
+            max_runs,
+            expires,
+        } => {
+            let now_ms = store::unix_timestamp_ms();
+            let mut patch = store::SchedulePatch::default();
+            if let Some(spec_str) = schedule {
+                let parsed = scheduler::ScheduleSpec::parse(&spec_str)?;
+                parsed.check_min_interval(config.scheduler.min_interval_secs)?;
+                let next = parsed.first_run_after(now_ms)?;
+                patch.schedule_spec = Some(spec_str.trim().to_string());
+                patch.next_run_at = Some(Some(next));
+            }
+            if let Some(prof) = profile {
+                if !prof.is_empty()
+                    && let Err(msg) = config.resolve_profile(Some(&prof))
+                {
+                    anyhow::bail!("{msg}");
+                }
+                patch.profile = Some(if prof == "default" {
+                    String::new()
+                } else {
+                    prof
+                });
+            }
+            if let Some(s) = script {
+                scheduler::validate_script(&s, &config.permissions.deny)?;
+                patch.script = Some(s);
+            }
+            patch.prompt = prompt;
+            patch.no_agent = no_agent;
+            if let Some(tok) = suppress_token {
+                patch.suppress_token = Some((!tok.trim().is_empty()).then_some(tok));
+            }
+            if let Some(fd) = failure_deliver {
+                patch.failure_deliver = Some(fd.into_deliver());
+            }
+            if let Some(mr) = max_runs {
+                patch.max_runs = Some((mr > 0).then_some(mr));
+            }
+            if let Some(exp) = expires {
+                if exp.trim().is_empty() {
+                    patch.expires_at = Some(None);
+                } else {
+                    let ts = scheduler::parse_expires_at(&exp, now_ms)?;
+                    patch.expires_at = Some(Some(ts));
+                }
+            }
+            let state_dir = config.state_dir()?;
+            let updated = store::update_schedule(&state_dir, &target, &patch)?;
+            notify_scheduler_reload(socket).await;
+            println!("updated schedule #{} ({})", updated.id, updated.name);
+            Ok(ExitCode::SUCCESS)
+        }
+        ScheduleCommand::Pause { target } => {
+            let state_dir = config.state_dir()?;
+            let job = store::set_schedule_enabled(&state_dir, &target, false, None)?;
+            notify_scheduler_reload(socket).await;
+            println!("paused schedule #{} ({})", job.id, job.name);
+            Ok(ExitCode::SUCCESS)
+        }
+        ScheduleCommand::Resume { target } => {
+            let state_dir = config.state_dir()?;
+            let Some(existing) = store::get_schedule(&state_dir, &target)? else {
+                eprintln!("hey-computer: schedule `{target}` not found");
+                return Ok(ExitCode::FAILURE);
+            };
+            let parsed = scheduler::ScheduleSpec::parse(&existing.schedule_spec)?;
+            let next = parsed.first_run_after(store::unix_timestamp_ms())?;
+            let job = store::set_schedule_enabled(&state_dir, &target, true, Some(next))?;
+            notify_scheduler_reload(socket).await;
+            println!(
+                "resumed schedule #{} ({}) — next run: {}",
+                job.id,
+                job.name,
+                store::format_local_timestamp(next)
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        ScheduleCommand::Remove { target } => {
+            let state_dir = config.state_dir()?;
+            let Some(removed) = store::delete_schedule(&state_dir, &target)? else {
+                eprintln!("hey-computer: schedule `{target}` not found");
+                return Ok(ExitCode::FAILURE);
+            };
+            notify_scheduler_reload(socket).await;
+            println!("removed schedule #{} ({})", removed.id, removed.name);
+            Ok(ExitCode::SUCCESS)
+        }
+        ScheduleCommand::Run { target } => {
+            match ipc::request(socket, &Request::ScheduleRun { target }).await? {
+                Reply::Ok { message } => {
+                    println!("{message}");
+                    Ok(ExitCode::SUCCESS)
+                }
+                other => unexpected(other),
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ask(
     config: &Config,
@@ -718,6 +1168,7 @@ async fn ask(
     background: bool,
     suppress_token: Option<String>,
     profile: Option<String>,
+    source: InputSource,
     files: Vec<PathBuf>,
     images: Vec<PathBuf>,
 ) -> Result<ExitCode> {
@@ -752,6 +1203,7 @@ async fn ask(
                 background,
                 suppress_token,
                 attachments,
+                source,
             };
             match request_size(&req) {
                 Ok(()) => ipc::ask_request(socket, &req).await,

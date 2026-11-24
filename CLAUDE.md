@@ -72,16 +72,28 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   files without logging secret values). Per-profile `mcp_servers` allowlists
   and restricted-lane MCP blocking are enforced on `call_mcp_tool` / `mcp_*`
   permission requests in `policy.rs`.
-- `environment`: the agent's private `--gemini-dir` (settings.json, linked skills) and the
-  workspace with the generated `AGENTS.md`. Rewritten before every agent start.
-- `context`: opt-in per-turn ambient time (`localtime_r`) and Hyprland active window/workspace
-  header prepended to user prompts inside `<untrusted_desktop_context>` delimiters.
+- `environment`: the agent's private `--gemini-dir` (settings.json, linked skills),
+  the `0700` `artifacts/` scratch dir (age-pruned alongside `history_days`), and the
+  workspace with the generated `AGENTS.md` (including live `MEMORY: <used> / <max>`
+  capacity header). Rewritten before every agent start.
+- `context`: opt-in per-turn ambient time (`localtime_r`), Hyprland active
+  window/workspace, focused terminal/editor `/proc` CWD, and Ghostty/terminal
+  `tmux` session/window/pane metadata prepended inside `<untrusted_desktop_context>`.
 - `store`: private `0600` SQLite WAL + FTS5 database at
-  `<state_dir>/history.db` (`PRAGMA secure_delete = ON`, dedicated `hc-store`
-  actor thread with `wal_checkpoint(TRUNCATE)` on shutdown, crash recovery,
-  monotonic ID seeding from `sqlite_sequence`, legacy `last.json` migration,
-  safe FTS5 query sanitizer + BM25/recency ranking, `<untrusted_recall>`
-  formatter) backing `last`, `tasks`, and `recall`.
+  `<state_dir>/history.db` (schema v2 with `turns` + `schedules`,
+  `PRAGMA secure_delete = ON`, automatic FTS5/SQLite `maintain_connection`,
+  dedicated `hc-store` actor thread with `wal_checkpoint(TRUNCATE)` on shutdown,
+  crash recovery, monotonic ID seeding from `sqlite_sequence`, legacy `last.json`
+  migration, safe FTS5 query sanitizer + BM25/recency ranking, `<untrusted_recall>`
+  formatter) backing `last`, `tasks`, `recall`, and `schedule`.
+- `scheduler`: SQLite-backed hybrid job scheduler (`[scheduler]`, `hey-computer schedule`)
+  with local-time human/cron specs, `--script` pre-collectors (0 tokens on empty stdout),
+  `--no-agent` timed notifications, `Policy::denied_word` validation, and split
+  `--failure-deliver` routing (`notify` with exponential backoff, `log`, `silent`).
+- `routing`: opt-in 3-tier automatic profile and lane routing (`[routing]`,
+  `InputSource` `--voice`/`--source`): zero-latency heuristics (including follow-up
+  correction escalation and auto-backgrounding), Tier 2 retry-on-failure escalation,
+  and Tier 3 restricted LLM triage strictly for non-voice unsure new turns.
 - `policy`: `LanePolicy` (`standard` and Phase 6-ready `restricted`) + deny
   list matched as command words through wrappers, `sh -c`, pipes and `$(…)`,
   and behind `systemd-run`. A courtesy, not a boundary.
@@ -105,7 +117,7 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   `env_files`/`header_files`, skills, viewer launched via
   `systemd-run --user --scope`, service with `NoNewPrivileges`). `nix/module-check.nix`
   evaluates it in a minimal Home Manager configuration (`checks.module`).
-- `skills/{hyprland-desktop,openhue,recall}`: bundled skills installed to
+- `skills/{hyprland-desktop,openhue,recall,tmux,schedule}`: bundled skills installed to
   `$out/share/hey-computer/skills`. Write only what has been checked against a
   real system; say so where something comes from `--help` alone.
 

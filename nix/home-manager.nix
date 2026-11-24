@@ -36,6 +36,8 @@
     lib.optionals cfg.skills.enable (
       ["${cfg.package}/share/hey-computer/skills/hyprland-desktop"]
       ++ lib.optionals cfg.recall.enable ["${cfg.package}/share/hey-computer/skills/recall"]
+      ++ lib.optionals cfg.tmux.enable ["${cfg.package}/share/hey-computer/skills/tmux"]
+      ++ lib.optionals cfg.schedule.enable ["${cfg.package}/share/hey-computer/skills/schedule"]
       ++ lib.optionals cfg.obsidian.enable obsidianSkillDirs
       ++ lib.optionals cfg.openhue.enable ["${cfg.package}/share/hey-computer/skills/openhue"]
     )
@@ -65,6 +67,7 @@
       (lib.makeBinPath (
         lib.optional cfg.obsidian.enable obsidianShim
         ++ lib.optional cfg.openhue.enable cfg.openhue.package
+        ++ lib.optional cfg.tmux.enable cfg.tmux.package
         ++ lib.optional (cfg.agent.package != null) cfg.agent.package
         ++ [cfg.package]
         ++ cfg.extraPackages
@@ -311,6 +314,34 @@ in {
       '';
     };
 
+    tmux = {
+      enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Put `tmux` on the daemon/agent PATH (used by `context.desktop` for
+          Ghostty/terminal ambient context) and link the bundled `tmux` skill
+          when {option}`skills.enable` is set.
+        '';
+      };
+
+      package = mkOption {
+        type = types.package;
+        default = pkgs.tmux;
+        defaultText = literalExpression "pkgs.tmux";
+        description = "The tmux package placed on the daemon/agent PATH.";
+      };
+    };
+
+    schedule.enable = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Link the bundled `schedule` skill (when {option}`skills.enable` is set)
+        so the agent can create and manage jobs via `hey-computer schedule`.
+      '';
+    };
+
     mcp = {
       servers = mkOption {
         type = types.attrsOf (types.attrsOf types.anything);
@@ -326,11 +357,12 @@ in {
           }
         '';
         description = ''
-          MCP servers passed to ACP sessions via `session/new` `mcpServers`.
-          Accepts the same `env` / `headers` `{ file = "/abs/path"; }` form as
-          Home Manager's `programs.mcp.servers` and lowers secret file entries to
-          `settings.mcp.<name>.env_files` / `header_files` so credentials never
-          enter the Nix store.
+          MCP servers written to `<agent_dir>/config/mcp_config.json` (mode 0600)
+          and gated per turn by `LanePolicy` (using each profile's `mcp_servers`
+          allowlist). Accepts the same `env` / `headers` `{ file = "/abs/path"; }`
+          form as Home Manager's `programs.mcp.servers` and lowers secret file
+          entries to `settings.mcp.<name>.env_files` / `header_files` so
+          credentials never enter the Nix store.
         '';
       };
 
@@ -355,7 +387,9 @@ in {
         default = true;
         description = ''
           Give the agent the bundled `hyprland-desktop` skill, the bundled
-          `recall` skill when {option}`recall.enable` is set, the Obsidian
+          `recall` skill when {option}`recall.enable` is set, the bundled
+          `tmux` skill when {option}`tmux.enable` is set, the bundled
+          `schedule` skill when {option}`schedule.enable` is set, the Obsidian
           skills when {option}`obsidian.enable` is set, and the bundled
           `openhue` skill when {option}`openhue.enable` is set.
         '';

@@ -6,7 +6,7 @@
 //! transitions (start, restart, idle stop, follow-up tracking, queueing, and
 //! shutdown) stay serialized inside `Conductor::run`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,8 +23,9 @@ use crate::config::{Config, MAX_RESTART_DELAY_SECS, ResolvedProfile, secs};
 use crate::context::{self, ContextProvider, SystemContext};
 use crate::environment::{self, Paths};
 use crate::policy::{LanePolicy, PermissionDecision};
-use crate::present::{Presentation, Presenter};
-use crate::protocol::{AgentState, FailReason, Reply, Status};
+use crate::present::{Presentation, Presenter, Urgency};
+use crate::protocol::{AgentState, FailReason, InputSource, Reply, Status};
+use crate::routing::{self, HeuristicResult, LaneChoice, RouteDecision, TierChoice};
 use crate::store::{self, Lane, NewTurn, Store, TurnStatus};
 
 /// initialize and session/new answer in about a second; this only catches an
@@ -55,6 +56,7 @@ pub struct AskParams {
     pub background: bool,
     pub suppress_token: Option<String>,
     pub attachments: Vec<LoadedAttachment>,
+    pub source: InputSource,
 }
 
 /// What became of a request.
@@ -159,6 +161,9 @@ pub struct Ask {
     pub background: bool,
     pub suppress_token: Option<String>,
     pub attachments: Vec<LoadedAttachment>,
+    pub source: InputSource,
+    pub auto_routed_fast: bool,
+    pub escalated_once: bool,
     pub sink: Sink,
     pub token: Arc<CancelToken>,
 }
@@ -273,6 +278,9 @@ impl Handle {
             background: params.background,
             suppress_token: params.suppress_token,
             attachments: params.attachments,
+            source: params.source,
+            auto_routed_fast: false,
+            escalated_once: false,
             sink,
             token,
         };
@@ -450,12 +458,12 @@ pub fn spawn_with_store(
     )
 }
 
-/// A pre-opened session configured for a specific `(model, thought_level, mcp_servers)`.
+/// A pre-opened session configured for a specific `(model, thought_level)`.
+/// MCP server allowlists are enforced per turn by `LanePolicy`.
 struct SpareSession {
     session: String,
     model: String,
     thought_level: String,
-    mcp_servers: Vec<String>,
 }
 
 /// A running agent process shared by concurrent lanes.
@@ -481,7 +489,6 @@ struct Conversation {
     profile_name: Option<String>,
     model: String,
     thought_level: String,
-    mcp_servers: Vec<String>,
     /// When the last turn ended; follow-ups are measured from here.
     last: Instant,
     turns: u32,
@@ -550,6 +557,7 @@ struct Budgets {
     inactivity: Duration,
     max_turn: Option<Duration>,
     max_tool_calls: Option<usize>,
+    max_repeat_tool_calls: Option<usize>,
 }
 
 struct TurnContext<'a> {
@@ -563,49 +571,198 @@ enum TurnAbort {
     Quiet,
     TurnTimeout(Duration),
     ToolLimit(usize),
+    RepeatToolLoop { count: usize, tool: String },
     Cancelled(FailReason),
 }
 
 /// Counts distinct tool calls in a single turn without double-counting
-/// repeated `tool_call` updates or the matching `session/request_permission`.
+/// repeated `tool_call` updates or the matching `session/request_permission`,
+/// and detects consecutive identical tool-call retry loops.
 #[derive(Default)]
 struct ToolTracker {
     seen: HashSet<String>,
     count: usize,
+    last_id: Option<String>,
+    last_sig: Option<(String, String)>,
+    last_had_args: bool,
+    prev_sig: Option<(String, String)>,
+    prev_streak: usize,
+    streak: usize,
 }
 
 impl ToolTracker {
-    fn record_update(&mut self, id: Option<&str>) -> bool {
+    fn record_update(&mut self, call: &Value) -> bool {
+        let id = acp::tool_call_id(call);
+        let (sig, has_args) = tool_signature(call);
         match id {
             Some(id) => {
                 if self.seen.insert(id.to_string()) {
-                    self.count += 1;
+                    self.push_new(Some(id), sig, has_args);
                     true
                 } else {
+                    self.maybe_upgrade(id, sig, has_args);
                     false
                 }
             }
             None => {
-                self.count += 1;
+                self.push_new(None, sig, has_args);
                 true
             }
         }
     }
 
-    fn record_permission(&mut self, id: Option<&str>) -> bool {
-        if let Some(id) = id
-            && self.seen.insert(id.to_string())
-        {
-            self.count += 1;
+    fn record_permission(&mut self, call: Option<&Value>) -> bool {
+        let Some(call) = call else {
+            return false;
+        };
+        let Some(id) = acp::tool_call_id(call) else {
+            return false;
+        };
+        let (sig, has_args) = tool_signature(call);
+        if self.seen.insert(id.to_string()) {
+            self.push_new(Some(id), sig, has_args);
             true
         } else {
+            self.maybe_upgrade(id, sig, has_args);
             false
+        }
+    }
+
+    fn push_new(&mut self, id: Option<&str>, sig: (String, String), has_args: bool) {
+        self.count += 1;
+        self.prev_sig = self.last_sig.take();
+        self.prev_streak = self.streak;
+        if self.prev_sig.as_ref() == Some(&sig) {
+            self.streak = self.prev_streak + 1;
+        } else {
+            self.streak = 1;
+        }
+        self.last_id = id.map(String::from);
+        self.last_sig = Some(sig);
+        self.last_had_args = has_args;
+    }
+
+    fn maybe_upgrade(&mut self, id: &str, sig: (String, String), has_args: bool) {
+        if self.last_id.as_deref() == Some(id) && !self.last_had_args && has_args {
+            if self.prev_sig.as_ref() == Some(&sig) {
+                self.streak = self.prev_streak + 1;
+            } else {
+                self.streak = 1;
+            }
+            self.last_sig = Some(sig);
+            self.last_had_args = true;
         }
     }
 
     fn count(&self) -> usize {
         self.count
     }
+
+    fn repeat_streak(&self) -> usize {
+        self.streak
+    }
+
+    fn last_tool_name(&self) -> String {
+        self.last_sig
+            .as_ref()
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| "tool".to_string())
+    }
+}
+
+fn tool_signature(call: &Value) -> ((String, String), bool) {
+    let raw_name = call
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let name = if raw_name == Some("call_mcp_tool") {
+        match (acp::mcp_server_name(call), acp::mcp_tool_name(call)) {
+            (Some(s), Some(t)) => format!("mcp:{s}/{t}"),
+            (Some(s), None) => format!("mcp:{s}"),
+            _ => "call_mcp_tool".to_string(),
+        }
+    } else if let Some(n) = raw_name {
+        n.to_string()
+    } else {
+        call.get("kind")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("other")
+            .to_string()
+    };
+
+    let input = ["rawInput", "args"]
+        .into_iter()
+        .find_map(|key| call.get(key).filter(|v| !is_empty_json(v)));
+    let (args, has_args) = match input {
+        Some(v) => (canonical_json(v), true),
+        None => {
+            if let Some(cmd) = acp::tool_command(call).filter(|c| !c.trim().is_empty()) {
+                (canonical_json(&Value::String(cmd)), true)
+            } else if let Some(title) = call
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|t| !t.trim().is_empty())
+            {
+                (canonical_json(&Value::String(title.to_string())), false)
+            } else {
+                ("{}".to_string(), false)
+            }
+        }
+    };
+    ((name, args), has_args)
+}
+
+fn is_empty_json(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::Object(map) => map.is_empty(),
+        Value::Array(arr) => arr.is_empty(),
+        Value::String(s) => s.is_empty(),
+        _ => false,
+    }
+}
+
+/// Deterministic JSON serialization with object keys sorted lexicographically.
+fn canonical_json(value: &Value) -> String {
+    fn write_canon(v: &Value, out: &mut String) {
+        match v {
+            Value::Object(map) => {
+                let sorted: BTreeMap<&str, &Value> =
+                    map.iter().map(|(k, v)| (k.as_str(), v)).collect();
+                out.push('{');
+                for (i, (k, val)) in sorted.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    if let Ok(ks) = serde_json::to_string(k) {
+                        out.push_str(&ks);
+                    }
+                    out.push(':');
+                    write_canon(val, out);
+                }
+                out.push('}');
+            }
+            Value::Array(arr) => {
+                out.push('[');
+                for (i, val) in arr.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_canon(val, out);
+                }
+                out.push(']');
+            }
+            primitive => {
+                if let Ok(s) = serde_json::to_string(primitive) {
+                    out.push_str(&s);
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    write_canon(value, &mut out);
+    out
 }
 
 /// Check whether a completed answer matches `suppress_token` (e.g.
@@ -827,7 +984,39 @@ impl Conductor {
         }
     }
 
-    async fn launch_ask(&mut self, ask: Ask) {
+    async fn launch_ask(&mut self, mut ask: Ask) {
+        if let Some(reason) = ask.token.reason() {
+            let display_profile = self.effective_display_profile(&ask);
+            self.finish_request(ask, cancelled(reason), display_profile, false);
+            return;
+        }
+
+        // Three-tier smart routing (runs only when enabled and caller did not
+        // pass explicit --profile or --background).
+        if self.config.routing.enabled
+            && ask.profile.is_none()
+            && !ask.background
+            && !ask.escalated_once
+        {
+            if let Some(reason) = self.apply_routing(&mut ask).await {
+                let display_profile = self.effective_display_profile(&ask);
+                self.finish_request(ask, cancelled(reason), display_profile, false);
+                return;
+            }
+            if ask.background {
+                // Promoted to background lane: hand off to bg_queue and let
+                // dispatch_ready launch it without blocking interactive asks.
+                let preview = attachments::progress_label(&ask.text, &ask.attachments);
+                self.presenter.present(Presentation::Notice {
+                    summary: "Working in the background".to_string(),
+                    body: preview,
+                    urgency: Urgency::Low,
+                });
+                self.bg_queue.push_back(ask);
+                return;
+            }
+        }
+
         let display_profile = self.effective_display_profile(&ask);
         if let Some(reason) = ask.token.reason() {
             self.finish_request(ask, cancelled(reason), display_profile, false);
@@ -973,8 +1162,14 @@ impl Conductor {
 
         let used_profile = resolved.name.clone();
         if let Some(store) = &self.store {
+            let lane = if ask.background {
+                Lane::Background
+            } else {
+                Lane::Interactive
+            };
             store.mark_running(
                 ask.id,
+                lane,
                 session.clone(),
                 conv_id,
                 used_profile.clone().unwrap_or_default(),
@@ -1001,6 +1196,7 @@ impl Conductor {
             inactivity: resolved.inactivity,
             max_turn: resolved.max_turn,
             max_tool_calls: resolved.max_tool_calls,
+            max_repeat_tool_calls: resolved.max_repeat_tool_calls,
         };
         let config = Arc::clone(&self.config);
         let context_provider = Arc::clone(&self.context);
@@ -1191,9 +1387,239 @@ impl Conductor {
         if matches!(end.outcome, Outcome::Answer { .. }) {
             self.failures = 0;
         }
+
+        // Tier 2 failure escalation: if an auto-routed fast turn fails with a
+        // retryable error (empty answer, agent error, or tool/repeat limit),
+        // retry once transparently on `deep_profile`.
+        if self.config.routing.enabled
+            && self.config.routing.escalate_on_failure
+            && ask.auto_routed_fast
+            && !ask.escalated_once
+            && end.alive
+            && !end.auth_required
+            && !end.wedged
+            && ask.token.reason().is_none()
+            && self.config.routing.deep_profile != self.config.routing.fast_profile
+            && !ask.background
+            && self.fg_pending.is_none()
+            && matches!(
+                end.outcome,
+                Outcome::Failed {
+                    reason: FailReason::Empty | FailReason::AgentError | FailReason::LimitReached,
+                    ..
+                }
+            )
+        {
+            tracing::info!(
+                "request {}: escalating failed fast turn to {} profile",
+                ask.id,
+                self.config.routing.deep_profile
+            );
+            let mut retry = ask;
+            retry.escalated_once = true;
+            retry.auto_routed_fast = false;
+            retry.profile = Some(self.config.routing.deep_profile.clone());
+            retry.new = true;
+            self.fg_pending = Some(retry);
+            return;
+        }
+
         self.last_used = Instant::now();
         log_outcome(ask.id, &end.outcome, started);
         self.finish_request(ask, end.outcome, used_profile, false);
+    }
+
+    /// Apply Tier 1 heuristics and (for non-voice unsure new turns) Tier 3
+    /// restricted LLM triage. Returns `Some(reason)` if cancelled during triage.
+    async fn apply_routing(&mut self, ask: &mut Ask) -> Option<FailReason> {
+        let window = secs(self.config.conversation.follow_up_secs);
+        let is_followup = !ask.new
+            && self
+                .conversation
+                .as_ref()
+                .is_some_and(|c| window.is_some_and(|w| c.last.elapsed() < w));
+        let can_background = matches!(ask.sink, Sink::Present);
+        let heuristic = routing::classify_heuristic(
+            &ask.text,
+            !ask.attachments.is_empty(),
+            is_followup,
+            can_background,
+            self.config.routing.auto_background,
+        );
+
+        if is_followup {
+            if let HeuristicResult::Decided(RouteDecision {
+                profile: TierChoice::Deep,
+                ..
+            }) = heuristic
+            {
+                tracing::info!(
+                    "request {}: follow-up escalated to {} profile",
+                    ask.id,
+                    self.config.routing.deep_profile
+                );
+                ask.profile = Some(self.config.routing.deep_profile.clone());
+            }
+            return None;
+        }
+
+        let decision = match heuristic {
+            HeuristicResult::Decided(d) => d,
+            HeuristicResult::Unsure => {
+                if ask.source != InputSource::Voice && self.config.routing.triage_non_voice {
+                    match self.run_triage(ask, can_background).await {
+                        Ok(d) => d,
+                        Err(reason) => return Some(reason),
+                    }
+                } else {
+                    RouteDecision {
+                        profile: TierChoice::Fast,
+                        lane: LaneChoice::Interactive,
+                    }
+                }
+            }
+        };
+
+        let chosen_profile = match decision.profile {
+            TierChoice::Fast => self.config.routing.fast_profile.clone(),
+            TierChoice::Deep => self.config.routing.deep_profile.clone(),
+        };
+        tracing::info!(
+            "request {}: routed to {} ({})",
+            ask.id,
+            chosen_profile,
+            if decision.lane == LaneChoice::Background && can_background {
+                "background"
+            } else {
+                "interactive"
+            }
+        );
+        ask.profile = Some(chosen_profile);
+        ask.auto_routed_fast = decision.profile == TierChoice::Fast;
+
+        if decision.lane == LaneChoice::Background && can_background {
+            let promoted = if let Ok(mut shared) = self.shared.lock() {
+                if shared.bg_queued < self.config.tasks.max_queued {
+                    if shared
+                        .fg_latest
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == ask.id)
+                    {
+                        shared.fg_latest = None;
+                    }
+                    shared.bg_tasks.insert(ask.id, Arc::clone(&ask.token));
+                    shared.bg_queued += 1;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if promoted {
+                ask.background = true;
+            }
+        }
+        None
+    }
+
+    /// Tier 3 bounded, tool-disabled LLM triage on `fast_profile` for non-voice
+    /// requests where heuristics returned `Unsure`. Never called for `Voice`.
+    async fn run_triage(
+        &mut self,
+        ask: &Ask,
+        can_background: bool,
+    ) -> std::result::Result<RouteDecision, FailReason> {
+        let fallback = RouteDecision {
+            profile: TierChoice::Fast,
+            lane: LaneChoice::Interactive,
+        };
+        if let Some(reason) = ask.token.reason() {
+            return Err(reason);
+        }
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.running = Some((ask.id, Instant::now(), None));
+        }
+        if self.live.is_none() {
+            self.restart_at = None;
+            let stop = Arc::clone(&self.stop);
+            let started = tokio::select! {
+                res = self.start_agent() => res,
+                reason = stop.cancelled() => return Err(reason),
+            };
+            if started.is_err() {
+                self.schedule_restart_if_warm();
+                return Ok(fallback);
+            }
+        }
+        if let Some(reason) = ask.token.reason() {
+            return Err(reason);
+        }
+        let Ok(fast_resolved) = self
+            .config
+            .resolve_profile(Some(&self.config.routing.fast_profile))
+        else {
+            return Ok(fallback);
+        };
+        let session = match self.new_session(&fast_resolved, false).await {
+            Ok(s) => s,
+            Err(_) => return Ok(fallback),
+        };
+        let Some(live) = &self.live else {
+            return Ok(fallback);
+        };
+        let client = live.conn.client();
+        let sub = client.subscribe(&session);
+        let timeout = Duration::from_secs_f64(self.config.routing.triage_timeout_secs.max(0.2));
+        let restricted = LanePolicy::restricted();
+        let budgets = Budgets {
+            inactivity: timeout,
+            max_turn: Some(timeout),
+            max_tool_calls: Some(0),
+            max_repeat_tool_calls: None,
+        };
+        let ctx = TurnContext {
+            policy: &restricted,
+            budgets,
+            progress: None,
+            id: ask.id,
+        };
+        let stop = Arc::clone(&self.stop);
+        let interrupts = Interrupts {
+            request: &ask.token,
+            stop: &stop,
+        };
+        let prompt = routing::build_triage_prompt(
+            &ask.text,
+            can_background && self.config.routing.auto_background,
+        );
+        let blocks = vec![json!({"type": "text", "text": prompt})];
+        let end = turn(&client, sub, &session, blocks, interrupts, &ctx).await;
+
+        if end.alive {
+            if let Some(live) = &self.live {
+                drop(
+                    live.conn
+                        .start_call("session/close", json!({"sessionId": session})),
+                );
+            }
+        } else if let Some(live) = self.live.take() {
+            let detail = self.agent_died(live).await;
+            self.last_death_detail = Some(detail);
+        }
+
+        if let Some(reason) = ask.token.reason() {
+            return Err(reason);
+        }
+        if let Outcome::Answer { text, .. } = end.outcome
+            && let Some(mut decision) = routing::parse_triage_response(&text)
+        {
+            if !can_background || !self.config.routing.auto_background {
+                decision.lane = LaneChoice::Interactive;
+            }
+            return Ok(decision);
+        }
+        Ok(fallback)
     }
 
     fn finish_request(
@@ -1311,7 +1737,6 @@ impl Conductor {
                         session,
                         model: default_profile.model,
                         thought_level: default_profile.thought_level,
-                        mcp_servers: default_profile.mcp_servers,
                     });
                 }
             }
@@ -1343,6 +1768,7 @@ impl Conductor {
             environment::prepare(&self.config).context("preparing the agent's directory")?;
         // The agent is not running, so nothing it has open is deleted.
         environment::prune_history(&paths.agent_dir, self.config.agent.history_days);
+        environment::prune_artifacts(&paths.artifacts, self.config.agent.history_days);
         let argv = paths.agent_command(&self.config);
         let (conn, exited) = Connection::spawn(&argv, &paths.workspace, &paths.state_dir)?;
         let init = conn
@@ -1488,44 +1914,43 @@ impl Conductor {
                 .config
                 .resolve_profile(requested)
                 .map_err(|e| Outcome::failed(FailReason::AgentError, e))?;
-            // MCP servers are fixed at session/new; a different MCP set needs a fresh session.
-            if resolved.mcp_servers == conversation.mcp_servers {
-                if resolved.model == conversation.model
-                    && resolved.thought_level == conversation.thought_level
-                {
-                    let session = conversation.session.clone();
-                    let turns = conversation.turns + 1;
+            // `session/new` always passes `mcpServers: []` (`config/mcp_config.json`
+            // is process-wide) and `LanePolicy` enforces `resolved.mcp_servers` per
+            // turn, so switching profiles across different MCP allowlists stays in
+            // place and preserves conversation history.
+            if resolved.model == conversation.model
+                && resolved.thought_level == conversation.thought_level
+            {
+                let session = conversation.session.clone();
+                let turns = conversation.turns + 1;
+                if let Some(conv) = &mut self.conversation {
+                    conv.profile_name = resolved.name.clone();
+                }
+                tracing::info!("continuing the conversation (turn {turns})");
+                return Ok((session, resolved));
+            }
+
+            let session = conversation.session.clone();
+            let prev_model = conversation.model.clone();
+            let prev_thought = conversation.thought_level.clone();
+            let turns = conversation.turns + 1;
+            match self
+                .apply_profile_switch(&session, &prev_model, &prev_thought, &resolved)
+                .await?
+            {
+                true => {
                     if let Some(conv) = &mut self.conversation {
                         conv.profile_name = resolved.name.clone();
+                        conv.model = resolved.model.clone();
+                        conv.thought_level = resolved.thought_level.clone();
                     }
-                    tracing::info!("continuing the conversation (turn {turns})");
+                    tracing::info!("switched profile in place on the conversation (turn {turns})");
                     return Ok((session, resolved));
                 }
-
-                let session = conversation.session.clone();
-                let prev_model = conversation.model.clone();
-                let prev_thought = conversation.thought_level.clone();
-                let turns = conversation.turns + 1;
-                match self
-                    .apply_profile_switch(&session, &prev_model, &prev_thought, &resolved)
-                    .await?
-                {
-                    true => {
-                        if let Some(conv) = &mut self.conversation {
-                            conv.profile_name = resolved.name.clone();
-                            conv.model = resolved.model.clone();
-                            conv.thought_level = resolved.thought_level.clone();
-                        }
-                        tracing::info!(
-                            "switched profile in place on the conversation (turn {turns})"
-                        );
-                        return Ok((session, resolved));
-                    }
-                    false => {
-                        tracing::warn!(
-                            "mid-conversation profile switch refused; starting a new session"
-                        );
-                    }
+                false => {
+                    tracing::warn!(
+                        "mid-conversation profile switch refused; starting a new session"
+                    );
                 }
             }
         }
@@ -1550,9 +1975,7 @@ impl Conductor {
             .as_ref()
             .and_then(|live| live.spare.as_ref())
             .is_some_and(|spare| {
-                spare.model == resolved.model
-                    && spare.thought_level == resolved.thought_level
-                    && spare.mcp_servers == resolved.mcp_servers
+                spare.model == resolved.model && spare.thought_level == resolved.thought_level
             });
         let session = if spare_matches {
             self.live
@@ -1570,7 +1993,6 @@ impl Conductor {
             profile_name: resolved.name.clone(),
             model: resolved.model.clone(),
             thought_level: resolved.thought_level.clone(),
-            mcp_servers: resolved.mcp_servers.clone(),
             last: Instant::now(),
             turns: 0,
         });
@@ -2004,7 +2426,7 @@ async fn turn(
                 } else {
                     match update.get("sessionUpdate").and_then(Value::as_str) {
                         Some("tool_call") => {
-                            if tracker.record_update(acp::tool_call_id(&update)) {
+                            if tracker.record_update(&update) {
                                 let kind = update
                                     .get("kind")
                                     .and_then(Value::as_str)
@@ -2020,6 +2442,14 @@ async fn turn(
                                 {
                                     break Err(TurnAbort::ToolLimit(limit));
                                 }
+                            }
+                            if let Some(limit) = budgets.max_repeat_tool_calls
+                                && tracker.repeat_streak() >= limit
+                            {
+                                break Err(TurnAbort::RepeatToolLoop {
+                                    count: tracker.repeat_streak(),
+                                    tool: tracker.last_tool_name(),
+                                });
                             }
                             if !policy.will_deny_update(&update) {
                                 emit_progress(&mut last_progress, acp::tool_progress(&update));
@@ -2043,13 +2473,21 @@ async fn turn(
                     break Err(TurnAbort::TurnTimeout(limit));
                 }
                 deadline = Instant::now() + budgets.inactivity;
-                let _ =
-                    tracker.record_permission(params.get("toolCall").and_then(acp::tool_call_id));
+                let _ = tracker.record_permission(params.get("toolCall"));
                 if let Some(limit) = budgets.max_tool_calls
                     && tracker.count() > limit
                 {
                     client.respond(request, json!({"outcome": {"outcome": "cancelled"}}));
                     break Err(TurnAbort::ToolLimit(limit));
+                }
+                if let Some(limit) = budgets.max_repeat_tool_calls
+                    && tracker.repeat_streak() >= limit
+                {
+                    client.respond(request, json!({"outcome": {"outcome": "cancelled"}}));
+                    break Err(TurnAbort::RepeatToolLoop {
+                        count: tracker.repeat_streak(),
+                        tool: tracker.last_tool_name(),
+                    });
                 }
                 let kind = params
                     .pointer("/toolCall/kind")
@@ -2131,6 +2569,19 @@ async fn turn(
                         FailReason::LimitReached,
                         format!(
                             "The assistant exceeded the limit of {limit} {noun} and was stopped."
+                        ),
+                        true,
+                    )
+                }
+                TurnAbort::RepeatToolLoop { count, tool } => {
+                    tracing::warn!(
+                        "request {id}: +{:.2} s aborted repeat tool loop ({count} consecutive calls to {tool})",
+                        at()
+                    );
+                    (
+                        FailReason::LimitReached,
+                        format!(
+                            "The assistant repeated the same tool call {count} times ({tool}) and was stopped."
                         ),
                         true,
                     )
@@ -2290,6 +2741,7 @@ pub async fn ask_once(
                 background: false,
                 suppress_token: None,
                 attachments: loaded,
+                source: InputSource::Cli,
             },
             Sink::Client(tx),
         )
@@ -2325,18 +2777,68 @@ mod tests {
     #[test]
     fn tool_tracker_counts_distinct_calls_without_double_counting() {
         let mut tracker = ToolTracker::default();
-        assert!(tracker.record_update(Some("call_1")));
-        assert!(!tracker.record_update(Some("call_1")));
-        assert!(!tracker.record_permission(Some("call_1")));
+        let c1 = json!({"toolCallId": "call_1", "name": "read_file", "rawInput": {"Path": "/a"}});
+        let c2 = json!({"toolCallId": "call_2", "name": "read_file", "rawInput": {"Path": "/b"}});
+        let c_anon = json!({"name": "read_file", "rawInput": {"Path": "/c"}});
+        assert!(tracker.record_update(&c1));
+        assert!(!tracker.record_update(&c1));
+        assert!(!tracker.record_permission(Some(&c1)));
         assert_eq!(tracker.count(), 1);
+        assert_eq!(tracker.repeat_streak(), 1);
 
-        assert!(tracker.record_permission(Some("call_2")));
-        assert!(!tracker.record_update(Some("call_2")));
+        assert!(tracker.record_permission(Some(&c2)));
+        assert!(!tracker.record_update(&c2));
         assert_eq!(tracker.count(), 2);
+        assert_eq!(tracker.repeat_streak(), 1);
 
-        assert!(tracker.record_update(None));
+        assert!(tracker.record_update(&c_anon));
         assert!(!tracker.record_permission(None));
         assert_eq!(tracker.count(), 3);
+    }
+
+    #[test]
+    fn tool_tracker_detects_consecutive_repeats_across_key_order_and_upgraded_args() {
+        let mut tracker = ToolTracker::default();
+        // Call 1: tool_call arrives empty, permission upgrades with populated rawInput.
+        tracker
+            .record_update(&json!({"toolCallId": "c1", "name": "run_command", "kind": "execute"}));
+        tracker.record_permission(Some(&json!({
+            "toolCallId": "c1",
+            "name": "run_command",
+            "kind": "execute",
+            "rawInput": {"b": 2, "a": 1}
+        })));
+        assert_eq!(tracker.repeat_streak(), 1);
+
+        // Call 2: same args in different JSON key order.
+        tracker
+            .record_update(&json!({"toolCallId": "c2", "name": "run_command", "kind": "execute"}));
+        tracker.record_permission(Some(&json!({
+            "toolCallId": "c2",
+            "name": "run_command",
+            "kind": "execute",
+            "rawInput": {"a": 1, "b": 2}
+        })));
+        assert_eq!(tracker.repeat_streak(), 2);
+
+        // Call 3: identical again -> streak reaches 3.
+        tracker.record_update(&json!({
+            "toolCallId": "c3",
+            "name": "run_command",
+            "kind": "execute",
+            "rawInput": {"a": 1, "b": 2}
+        }));
+        assert_eq!(tracker.repeat_streak(), 3);
+        assert_eq!(tracker.last_tool_name(), "run_command");
+
+        // Different call resets streak to 1.
+        tracker.record_update(&json!({
+            "toolCallId": "c4",
+            "name": "run_command",
+            "kind": "execute",
+            "rawInput": {"a": 9, "b": 2}
+        }));
+        assert_eq!(tracker.repeat_streak(), 1);
     }
 
     #[test]

@@ -39,6 +39,23 @@ pub struct Attachment {
     pub path: PathBuf,
 }
 
+/// Where an `ask` request originated; used by automatic routing so voice inputs
+/// never pay for LLM triage overhead.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputSource {
+    #[default]
+    Cli,
+    Voice,
+    Typed,
+}
+
+impl InputSource {
+    fn is_default(&self) -> bool {
+        *self == Self::Cli
+    }
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -67,6 +84,9 @@ pub enum Request {
         /// Optional file or image attachments (absolute paths read by the daemon).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<Attachment>,
+        /// Origin of the request (`cli`, `voice`, or `typed`).
+        #[serde(default, skip_serializing_if = "InputSource::is_default")]
+        source: InputSource,
     },
     Cancel {
         /// When omitted, cancels the active interactive request; when set,
@@ -75,6 +95,12 @@ pub enum Request {
         id: Option<u64>,
     },
     Status,
+    /// Wake the daemon's scheduler after a CLI mutation to `schedules`.
+    ScheduleReload,
+    /// Trigger an immediate test run of a scheduled job by numeric id or name.
+    ScheduleRun {
+        target: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,6 +130,10 @@ pub enum Reply {
         id: Option<u64>,
     },
     Status(Status),
+    /// Generic acknowledgement for control requests (`schedule_reload`, `schedule_run`).
+    Ok {
+        message: String,
+    },
     Error {
         message: String,
     },
@@ -244,6 +274,7 @@ mod tests {
                 background: false,
                 suppress_token: None,
                 attachments: vec![],
+                source: InputSource::Cli,
             }
         );
         let cancel: Request = serde_json::from_str(r#"{"type":"cancel"}"#).unwrap();
@@ -267,10 +298,15 @@ mod tests {
                     kind: AttachmentKind::Image,
                     path: PathBuf::from("/tmp/shot.png"),
                 }],
+                source: InputSource::Voice,
             },
             Request::Cancel { id: None },
             Request::Cancel { id: Some(9) },
             Request::Status,
+            Request::ScheduleReload,
+            Request::ScheduleRun {
+                target: "ci-watch".to_string(),
+            },
         ] {
             let line = encode(&request);
             assert!(!line.contains('\n'));

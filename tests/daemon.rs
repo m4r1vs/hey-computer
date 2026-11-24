@@ -17,7 +17,7 @@ use hey_computer::context::ContextProvider;
 use hey_computer::daemon;
 use hey_computer::ipc::{self, Client};
 use hey_computer::present::{Presentation, Presenter, Recorder};
-use hey_computer::protocol::{AgentState, FailReason, Reply, Request};
+use hey_computer::protocol::{AgentState, FailReason, InputSource, Reply, Request};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
@@ -1270,6 +1270,7 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             background: false,
             suppress_token: None,
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1292,6 +1293,7 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             background: false,
             suppress_token: None,
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1320,6 +1322,7 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             background: false,
             suppress_token: None,
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1339,6 +1342,7 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             background: false,
             suppress_token: None,
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1410,6 +1414,7 @@ async fn mid_session_config_rejection_falls_back_to_a_fresh_session() {
             background: false,
             suppress_token: None,
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1439,6 +1444,7 @@ async fn unknown_profile_returns_error_without_superseding_running_request() {
             background: false,
             suppress_token: None,
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1497,6 +1503,7 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
                     path: img.clone(),
                 },
             ],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1538,6 +1545,7 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
                 kind: AttachmentKind::File,
                 path: note,
             }],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1564,6 +1572,7 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
                 kind: AttachmentKind::Image,
                 path: h.dir.join("missing.png"),
             }],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1609,6 +1618,7 @@ async fn background_task_runs_concurrently_with_interactive_and_survives_interac
             background: true,
             suppress_token: None,
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1706,6 +1716,7 @@ async fn background_tasks_queue_fifo_respect_max_queued_and_cancel_by_id() {
             background: true,
             suppress_token: None,
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1722,6 +1733,7 @@ async fn background_tasks_queue_fifo_respect_max_queued_and_cancel_by_id() {
             background: true,
             suppress_token: None,
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1740,6 +1752,7 @@ async fn background_tasks_queue_fifo_respect_max_queued_and_cancel_by_id() {
             background: true,
             suppress_token: None,
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1789,6 +1802,7 @@ async fn suppress_token_silences_heartbeats_and_notifies_on_alerts() {
             background: true,
             suppress_token: Some("HEARTBEAT_OK".to_string()),
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1814,6 +1828,7 @@ async fn suppress_token_silences_heartbeats_and_notifies_on_alerts() {
             background: true,
             suppress_token: Some("HEARTBEAT_OK".to_string()),
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1834,6 +1849,7 @@ async fn suppress_token_silences_heartbeats_and_notifies_on_alerts() {
             background: true,
             suppress_token: Some("HEARTBEAT_OK".to_string()),
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1931,6 +1947,7 @@ async fn mcp_config_is_written_privately_and_profile_mcp_allowlist_is_enforced()
             background: false,
             suppress_token: None,
             attachments: vec![],
+            source: InputSource::Cli,
         },
     )
     .await
@@ -1939,5 +1956,408 @@ async fn mcp_config_is_written_privately_and_profile_mcp_allowlist_is_enforced()
     let (reason, msg) = failure(&reply);
     assert_eq!(reason, FailReason::Denied);
     assert!(msg.contains("mcp:nixos/nix"), "{msg}");
+    // Switching profiles across different `mcp_servers` keeps the same session in place.
+    assert_eq!(h.log_count("new mock-2"), 0);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeat_tool_call_guard_aborts_wedged_retry_loops() {
+    let script = r#"{
+        "turns": [
+            {
+                "match": "looping",
+                "steps": [
+                    {"permission": {"command": "echo stuck"}},
+                    {"permission": {"command": "echo stuck"}},
+                    {"permission": {"command": "echo stuck"}},
+                    {"chunk": "should not reach here"}
+                ]
+            }
+        ],
+        "default": ["echo"]
+    }"#;
+    let h = Harness::start(script, |c| {
+        c.agent.max_repeat_tool_calls = 3;
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    let reply = h.ask("looping", false).await;
+    let (reason, msg) = failure(&reply);
+    assert_eq!(reason, FailReason::LimitReached);
+    assert!(msg.contains("repeated the same tool call 3 times"), "{msg}");
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_runs_no_agent_pre_collector_and_split_failure_routing() {
+    use hey_computer::store::{self, FailureDeliver, NewSchedule};
+
+    let script = r#"{
+        "turns": [
+            {"match": "COLLECTOR_WAKE", "steps": [{"chunk": "Alert: build failed"}]}
+        ],
+        "default": ["echo"]
+    }"#;
+    let h = Harness::start(script, |c| {
+        c.scheduler.enabled = true;
+        c.scheduler.min_interval_secs = 1.0;
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    let state_dir = h.dir.join("state");
+    let now = store::unix_timestamp_ms();
+
+    // 1. --no-agent timed reminder (zero LLM tokens).
+    store::create_schedule(
+        &state_dir,
+        &NewSchedule {
+            name: "remind-me".to_string(),
+            schedule_spec: "in 1h".to_string(),
+            prompt: "Standup in 5 minutes".to_string(),
+            profile: String::new(),
+            script: String::new(),
+            no_agent: true,
+            suppress_token: None,
+            failure_deliver: FailureDeliver::Notify,
+            max_runs: None,
+            expires_at: None,
+            next_run_at: now + 3_600_000,
+        },
+        128,
+    )
+    .unwrap();
+    let res = ipc::request(
+        &h.socket,
+        &Request::ScheduleRun {
+            target: "remind-me".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(res, Reply::Ok { .. }), "{res:?}");
+    let items = h
+        .recorder
+        .wait_for(Duration::from_secs(5), |items| {
+            items.iter().any(|i| {
+                matches!(
+                    i,
+                    Presentation::Notice { summary, body, .. }
+                        if summary.contains("remind-me") && body == "Standup in 5 minutes"
+                )
+            })
+        })
+        .await
+        .expect("reminder notice");
+    assert!(!items.is_empty());
+
+    // 2. --script pre-collector with empty stdout -> skipped (0 LLM turns).
+    store::create_schedule(
+        &state_dir,
+        &NewSchedule {
+            name: "quiet-check".to_string(),
+            schedule_spec: "every 5m".to_string(),
+            prompt: "COLLECTOR_WAKE".to_string(),
+            profile: String::new(),
+            script: "true".to_string(),
+            no_agent: false,
+            suppress_token: None,
+            failure_deliver: FailureDeliver::Notify,
+            max_runs: None,
+            expires_at: None,
+            next_run_at: now + 300_000,
+        },
+        128,
+    )
+    .unwrap();
+    ipc::request(
+        &h.socket,
+        &Request::ScheduleRun {
+            target: "quiet-check".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    h.eventually("quiet-check marked skipped", || {
+        store::get_schedule(&state_dir, "quiet-check")
+            .ok()
+            .flatten()
+            .is_some_and(|j| j.last_status.as_deref() == Some("skipped"))
+    })
+    .await;
+    assert_eq!(h.log_count("prompt "), 0);
+
+    // 3. --script pre-collector with output -> wakes agent with <untrusted_collector_output>.
+    store::create_schedule(
+        &state_dir,
+        &NewSchedule {
+            name: "noisy-check".to_string(),
+            schedule_spec: "every 5m".to_string(),
+            prompt: "COLLECTOR_WAKE".to_string(),
+            profile: String::new(),
+            script: "echo 'job 42 failed'".to_string(),
+            no_agent: false,
+            suppress_token: None,
+            failure_deliver: FailureDeliver::Notify,
+            max_runs: None,
+            expires_at: None,
+            next_run_at: now + 300_000,
+        },
+        128,
+    )
+    .unwrap();
+    ipc::request(
+        &h.socket,
+        &Request::ScheduleRun {
+            target: "noisy-check".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    h.recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items.iter().any(|i| {
+                matches!(
+                    i,
+                    Presentation::TaskComplete { text, .. } if text == "Alert: build failed"
+                )
+            })
+        })
+        .await
+        .expect("collector triggered agent TaskComplete");
+    h.wait_log("untrusted_collector_output").await;
+
+    // 4. Failing collector notifies under failure_deliver = notify.
+    store::create_schedule(
+        &state_dir,
+        &NewSchedule {
+            name: "broken-check".to_string(),
+            schedule_spec: "every 5m".to_string(),
+            prompt: "unused".to_string(),
+            profile: String::new(),
+            script: "echo 'auth expired' >&2; exit 2".to_string(),
+            no_agent: false,
+            suppress_token: None,
+            failure_deliver: FailureDeliver::Notify,
+            max_runs: None,
+            expires_at: None,
+            next_run_at: now + 300_000,
+        },
+        128,
+    )
+    .unwrap();
+    ipc::request(
+        &h.socket,
+        &Request::ScheduleRun {
+            target: "broken-check".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    h.recorder
+        .wait_for(Duration::from_secs(5), |items| {
+            items.iter().any(|i| {
+                matches!(
+                    i,
+                    Presentation::Notice { summary, body, .. }
+                        if summary.contains("broken-check") && body.contains("auth expired")
+                )
+            })
+        })
+        .await
+        .expect("failure alert notice");
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed_triage() {
+    use hey_computer::config::Profile;
+
+    let script = r#"{
+        "turns": [
+            {"match": "Classify the user request below", "steps": [{"chunk": "{\"profile\":\"deep\",\"lane\":\"interactive\"}"}]},
+            {"match": "empty_fast", "steps": []},
+            {"match": "Write a report on consensus algorithms", "steps": ["config_info"]}
+        ],
+        "default": ["config_info"]
+    }"#;
+    let h = Harness::start(script, |c| {
+        c.profiles.insert(
+            "fast".to_string(),
+            Profile {
+                model: Some("mock-fast".to_string()),
+                thought_level: Some("low".to_string()),
+                ..Profile::default()
+            },
+        );
+        c.profiles.insert(
+            "deep".to_string(),
+            Profile {
+                model: Some("mock-deep".to_string()),
+                thought_level: Some("high".to_string()),
+                ..Profile::default()
+            },
+        );
+        c.routing.enabled = true;
+        c.routing.fast_profile = "fast".to_string();
+        c.routing.deep_profile = "deep".to_string();
+        c.routing.auto_background = true;
+        c.routing.escalate_on_failure = true;
+        c.routing.triage_non_voice = true;
+        c.routing.triage_timeout_secs = 4.0;
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    // 1. Voice short command -> fast (Tier 1), zero triage turns.
+    let (_, mut c) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "turn off the lamp".to_string(),
+            wait: true,
+            new: true,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Voice,
+        },
+    )
+    .await
+    .unwrap();
+    let r = c.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert!(answer(&r).contains("model=mock-fast thought=low"), "{r:?}");
+
+    // 2. Follow-up correction ("no, ...") escalates in place to deep on the same session!
+    let (_, mut c) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "no, I meant the desk lamp".to_string(),
+            wait: true,
+            new: false,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Voice,
+        },
+    )
+    .await
+    .unwrap();
+    let r2 = c.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert!(
+        answer(&r2).contains("model=mock-deep thought=high turn=2"),
+        "{r2:?}"
+    );
+
+    // 3. Ambiguous ("Unsure") VOICE prompt MUST NOT invoke LLM triage; defaults to fast.
+    let before_triage = h.log_count("Classify the user request below");
+    let (_, mut c) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "Could you put together a short outline of the quarterly roadmap items we discussed?"
+                .to_string(),
+            wait: true,
+            new: true,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Voice,
+        },
+    )
+    .await
+    .unwrap();
+    let r3 = c.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert!(answer(&r3).contains("model=mock-fast"), "{r3:?}");
+    assert_eq!(
+        h.log_count("Classify the user request below"),
+        before_triage
+    );
+
+    // 4. Same ambiguous prompt from TYPED input DOES run Tier 3 restricted triage -> routes to deep!
+    let (_, mut c) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "Could you put together a short outline of the quarterly roadmap items we discussed?"
+                .to_string(),
+            wait: true,
+            new: true,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Typed,
+        },
+    )
+    .await
+    .unwrap();
+    let r4 = c.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert!(answer(&r4).contains("model=mock-deep"), "{r4:?}");
+    assert_eq!(
+        h.log_count("Classify the user request below"),
+        before_triage + 1
+    );
+
+    // 5. Non-waiting multi-step report prompt auto-routes to background + deep with Notice + TaskComplete.
+    let (bg_id, _) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "Write a report on consensus algorithms".to_string(),
+            wait: false,
+            new: true,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Voice,
+        },
+    )
+    .await
+    .unwrap();
+    let items = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items.iter().any(|i| {
+                matches!(
+                    i,
+                    Presentation::TaskComplete { id, profile: Some(p), .. }
+                        if *id == bg_id && p == "deep"
+                )
+            })
+        })
+        .await
+        .expect("auto-background TaskComplete");
+    assert!(
+        items.iter().any(|i| matches!(
+            i,
+            Presentation::Notice { summary, .. } if summary == "Working in the background"
+        )),
+        "{items:?}"
+    );
+
+    // 6. Tier 2 failure escalation: an auto-routed fast turn that returns Empty
+    //    retries once transparently on `deep` (and never loops indefinitely).
+    let (_, mut c) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "empty_fast".to_string(),
+            wait: true,
+            new: true,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Voice,
+        },
+    )
+    .await
+    .unwrap();
+    let r6 = c.next(Some(Duration::from_secs(10))).await.unwrap();
+    let (reason6, _) = failure(&r6);
+    assert_eq!(reason6, FailReason::Empty);
+    assert_eq!(h.log_count("empty_fast"), 2);
     h.stop().await;
 }

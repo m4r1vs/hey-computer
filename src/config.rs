@@ -20,11 +20,14 @@ pub struct Config {
     /// Named model/effort/budget profiles selectable with `ask --profile <name>`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, Profile>,
-    /// MCP servers passed to ACP sessions via `session/new` `mcpServers`.
+    /// MCP servers written to `<agent_dir>/config/mcp_config.json` and gated
+    /// per turn by `LanePolicy` (using each profile's `mcp_servers` allowlist).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServer>,
     pub conversation: Conversation,
     pub tasks: Tasks,
+    pub scheduler: Scheduler,
+    pub routing: Routing,
     pub permissions: Permissions,
     pub instructions: Instructions,
     pub context: Context,
@@ -74,8 +77,12 @@ pub struct Profile {
     /// Overrides `agent.max_tool_calls` when set (0 disables the cap).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_calls: Option<usize>,
-    /// Restricts which configured `[mcp.<name>]` servers this profile attaches
-    /// on `session/new`. `None` attaches all enabled servers; `Some([])` attaches none.
+    /// Overrides `agent.max_repeat_tool_calls` when set (0 disables the guard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_repeat_tool_calls: Option<usize>,
+    /// Restricts which configured `[mcp.<name>]` servers this profile may call
+    /// (enforced per turn by `LanePolicy` on `call_mcp_tool` / `mcp_*` calls).
+    /// `None` allows all enabled servers; `Some([])` allows none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<Vec<String>>,
     /// Custom progress notification summary while this profile is running
@@ -84,7 +91,7 @@ pub struct Profile {
     pub thinking_label: Option<String>,
 }
 
-/// Configuration for one MCP server passed to `session/new` `mcpServers`.
+/// Configuration for one MCP server written to `<agent_dir>/config/mcp_config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpServer {
@@ -142,7 +149,8 @@ pub struct ResolvedProfile {
     pub inactivity: Duration,
     pub max_turn: Option<Duration>,
     pub max_tool_calls: Option<usize>,
-    /// Sorted list of enabled `[mcp.<name>]` servers to attach on `session/new`.
+    pub max_repeat_tool_calls: Option<usize>,
+    /// Sorted list of enabled `[mcp.<name>]` servers allowed for this profile.
     pub mcp_servers: Vec<String>,
     /// Optional custom progress notification summary for this profile.
     pub thinking_label: Option<String>,
@@ -179,6 +187,10 @@ pub struct Agent {
     /// Maximum distinct tool calls allowed in a single turn. Zero disables the
     /// cap.
     pub max_tool_calls: usize,
+    /// Abort a turn when the agent makes this many consecutive identical tool
+    /// calls (same tool name/kind and canonical JSON arguments). Zero disables
+    /// the guard.
+    pub max_repeat_tool_calls: usize,
     /// First delay before restarting an agent that died; it doubles with
     /// every failure in a row, up to a minute.
     pub restart_delay_secs: f64,
@@ -222,6 +234,69 @@ impl Default for Tasks {
             max_concurrent: 1,
             max_queued: 32,
             profile: None,
+        }
+    }
+}
+
+/// Settings for the daemon's SQLite-backed hybrid scheduler (`hey-computer schedule`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Scheduler {
+    /// Enable the background job scheduler loop inside the daemon.
+    pub enabled: bool,
+    /// Minimum allowed interval between recurring runs in seconds.
+    pub min_interval_secs: f64,
+    /// Timeout in seconds for `--script` pre-collector shell commands.
+    pub script_timeout_secs: f64,
+    /// Maximum number of scheduled jobs stored in `history.db`.
+    pub max_jobs: usize,
+}
+
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_interval_secs: 60.0,
+            script_timeout_secs: 30.0,
+            max_jobs: 128,
+        }
+    }
+}
+
+/// Automatic model/effort profile and background-lane routing when `--profile`
+/// and `--background` are omitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Routing {
+    /// Enable automatic profile and lane routing.
+    pub enabled: bool,
+    /// Profile used for fast/simple interactive turns (`"default"` or a named profile).
+    pub fast_profile: String,
+    /// Profile used for complex/analytical turns or escalations.
+    pub deep_profile: String,
+    /// Automatically route long multi-step / delegation prompts on new non-waiting
+    /// turns to the background lane.
+    pub auto_background: bool,
+    /// Retry once on `deep_profile` if an auto-routed `fast_profile` turn ends
+    /// with an empty answer or retryable agent/tool failure.
+    pub escalate_on_failure: bool,
+    /// Run a bounded, tool-disabled LLM triage turn on `fast_profile` when
+    /// heuristics are unsure — strictly for non-voice inputs (`source != voice`).
+    pub triage_non_voice: bool,
+    /// Timeout in seconds for the non-voice LLM triage turn.
+    pub triage_timeout_secs: f64,
+}
+
+impl Default for Routing {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fast_profile: "default".to_string(),
+            deep_profile: "deep".to_string(),
+            auto_background: true,
+            escalate_on_failure: true,
+            triage_non_voice: true,
+            triage_timeout_secs: 4.0,
         }
     }
 }
@@ -327,6 +402,7 @@ impl Default for Agent {
             inactivity_timeout_secs: 45.0,
             max_turn_secs: 300.0,
             max_tool_calls: 20,
+            max_repeat_tool_calls: 3,
             restart_delay_secs: 1.0,
             history_days: 7.0,
             mcp_oauth_tokens_file: PathBuf::new(),
@@ -625,6 +701,38 @@ impl Config {
         {
             bail!("tasks.profile: {msg}");
         }
+        for (key, value) in [
+            (
+                "scheduler.min_interval_secs",
+                self.scheduler.min_interval_secs,
+            ),
+            (
+                "scheduler.script_timeout_secs",
+                self.scheduler.script_timeout_secs,
+            ),
+            (
+                "routing.triage_timeout_secs",
+                self.routing.triage_timeout_secs,
+            ),
+        ] {
+            if !value.is_finite() || value <= 0.0 || value > MAX_SECS {
+                bail!("{key} must be positive and at most {MAX_SECS} seconds, not {value}");
+            }
+        }
+        if !(1..=1024).contains(&self.scheduler.max_jobs) {
+            bail!(
+                "scheduler.max_jobs must be between 1 and 1024, not {}",
+                self.scheduler.max_jobs
+            );
+        }
+        if self.routing.enabled {
+            if let Err(msg) = self.resolve_profile(Some(&self.routing.fast_profile)) {
+                bail!("routing.fast_profile: {msg}");
+            }
+            if let Err(msg) = self.resolve_profile(Some(&self.routing.deep_profile)) {
+                bail!("routing.deep_profile: {msg}");
+            }
+        }
         Ok(())
     }
 
@@ -650,6 +758,8 @@ impl Config {
                 max_turn: secs(self.agent.max_turn_secs),
                 max_tool_calls: (self.agent.max_tool_calls > 0)
                     .then_some(self.agent.max_tool_calls),
+                max_repeat_tool_calls: (self.agent.max_repeat_tool_calls > 0)
+                    .then_some(self.agent.max_repeat_tool_calls),
                 mcp_servers: all_enabled_mcp,
                 thinking_label: None,
             });
@@ -666,6 +776,9 @@ impl Config {
             return Err(format!("unknown profile `{name}` (available: {available})"));
         };
         let max_tool_calls = profile.max_tool_calls.unwrap_or(self.agent.max_tool_calls);
+        let max_repeat_tool_calls = profile
+            .max_repeat_tool_calls
+            .unwrap_or(self.agent.max_repeat_tool_calls);
         let mcp_servers = match &profile.mcp_servers {
             None => all_enabled_mcp,
             Some(list) => {
@@ -695,6 +808,7 @@ impl Config {
                 .unwrap_or(base_inactivity),
             max_turn: secs(profile.max_turn_secs.unwrap_or(self.agent.max_turn_secs)),
             max_tool_calls: (max_tool_calls > 0).then_some(max_tool_calls),
+            max_repeat_tool_calls: (max_repeat_tool_calls > 0).then_some(max_repeat_tool_calls),
             mcp_servers,
             thinking_label: profile
                 .thinking_label
@@ -990,9 +1104,71 @@ mod tests {
             "[profiles.deep]\nthinking_label = \"   \"\n",
             "[profiles.deep]\nthinking_label = \"line1\\nline2\"\n",
             "[agent]\nmcp_oauth_tokens_file = \"relative/tokens.json\"\n",
+            "[scheduler]\nmin_interval_secs = 0\n",
+            "[scheduler]\nscript_timeout_secs = -1\n",
+            "[scheduler]\nmax_jobs = 0\n",
+            "[routing]\nenabled = true\nfast_profile = \"missing\"\ndeep_profile = \"default\"\n",
+            "[routing]\nenabled = true\nfast_profile = \"default\"\ndeep_profile = \"missing\"\n",
+            "[routing]\ntriage_timeout_secs = 0\n",
         ] {
             let cfg: Config = toml::from_str(bad).unwrap();
             assert!(cfg.validate().is_err(), "{bad} should fail validation");
         }
+    }
+
+    #[test]
+    fn scheduler_routing_and_repeat_guard_defaults_and_validation() {
+        let cfg = Config::default();
+        assert_eq!(cfg.agent.max_repeat_tool_calls, 3);
+        assert!(cfg.scheduler.enabled);
+        assert_eq!(cfg.scheduler.min_interval_secs, 60.0);
+        assert_eq!(cfg.scheduler.script_timeout_secs, 30.0);
+        assert_eq!(cfg.scheduler.max_jobs, 128);
+        assert!(!cfg.routing.enabled);
+        assert_eq!(cfg.routing.fast_profile, "default");
+        assert_eq!(cfg.routing.deep_profile, "deep");
+        cfg.validate().unwrap();
+
+        let parsed: Config = toml::from_str(
+            r#"
+            [agent]
+            max_repeat_tool_calls = 4
+            [profiles.fast]
+            thought_level = "low"
+            max_repeat_tool_calls = 0
+            [profiles.deep]
+            thought_level = "high"
+            [routing]
+            enabled = true
+            fast_profile = "fast"
+            deep_profile = "deep"
+            triage_timeout_secs = 3.5
+            [scheduler]
+            enabled = true
+            min_interval_secs = 30
+            script_timeout_secs = 15
+            max_jobs = 64
+            "#,
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(
+            parsed.resolve_profile(None).unwrap().max_repeat_tool_calls,
+            Some(4)
+        );
+        assert_eq!(
+            parsed
+                .resolve_profile(Some("fast"))
+                .unwrap()
+                .max_repeat_tool_calls,
+            None
+        );
+        assert_eq!(
+            parsed
+                .resolve_profile(Some("deep"))
+                .unwrap()
+                .max_repeat_tool_calls,
+            Some(4)
+        );
     }
 }

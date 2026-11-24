@@ -404,13 +404,16 @@ tooling are mature.
   `<untrusted_recall>` framing) and the bundled `skills/recall/SKILL.md`
   enabled by default via `programs.hey-computer.recall.enable` in the Home
   Manager module.
-- `[Important]` `[Upstream]` `[Done: d0b7732]` **MCP passthrough (#19).**
-  Verified live on `agy` 1.5.13 that `session/new` `mcpServers` supports
-  `stdio`, `http`, and `sse` transports (with `env` and `headers`). Added
-  `src/mcp.rs`, `[mcp.<name>]` (`env_files` / `header_files` loaded at runtime
-  so secrets stay out of `config.toml` and `/nix/store`), per-profile
-  `mcp_servers` selection, and `programs.hey-computer.mcp.servers` in
-  `nix/home-manager.nix`.
+- `[Important]` `[Upstream]` `[Done: d0b7732, 815dbfb]` **MCP passthrough (#19).**
+  Added `src/mcp.rs`, `[mcp.<name>]` (`env_files` / `header_files` loaded at
+  prepare time so secrets stay out of `config.toml` and `/nix/store`),
+  `agent.mcp_oauth_tokens_file`, per-profile `mcp_servers` allowlists enforced
+  per turn by `LanePolicy`, and `programs.hey-computer.mcp.servers` in
+  `nix/home-manager.nix`. Writes enabled servers to
+  `<agent_dir>/config/mcp_config.json` (mode `0600`) and passes `mcpServers: []`
+  on `session/new` so `agy acp` 1.5.13 enables lazy `call_mcp_tool` loading
+  without eagerly truncating large tool sets, while preserving conversations on
+  mid-session profile switches across different `mcp_servers` allowlists.
 - `[Important]` `[Upstream]` `[Done: 3e3b6e1]` **Bounded, frozen-snapshot memory
   and fail-loudly prompt rule (#8).** Added `instructions.memory_file` /
   `instructions.memory_max_chars` (default `4000`, Home Manager `memory.file`

@@ -23,4 +23,6 @@ pub mod mock;
 pub mod policy;
 pub mod present;
 pub mod protocol;
+pub mod routing;
+pub mod scheduler;
 pub mod store;

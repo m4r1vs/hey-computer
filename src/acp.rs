@@ -234,6 +234,7 @@ impl Connection {
             .args(args)
             .current_dir(cwd)
             .env("HEY_COMPUTER_STATE_DIR", state_dir)
+            .env("HEY_COMPUTER_ARTIFACTS_DIR", state_dir.join("artifacts"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

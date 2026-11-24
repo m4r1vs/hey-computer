@@ -26,7 +26,7 @@ use crate::protocol::FailReason;
 pub const DB_FILE: &str = "history.db";
 pub const LAST_FILE: &str = "last.json";
 pub const SCHEMA_VERSION: u32 = 1;
-pub const DB_SCHEMA_VERSION: i32 = 1;
+pub const DB_SCHEMA_VERSION: i32 = 2;
 
 const PRUNE_EVERY_TURNS: u64 = 100;
 
@@ -214,6 +214,7 @@ enum StoreCmd {
     CreateTurn(NewTurn),
     MarkRunning {
         id: u64,
+        lane: Lane,
         session_id: String,
         conversation_id: Option<u64>,
         profile: String,
@@ -273,6 +274,9 @@ impl Store {
             tracing::info!("pruned {pruned} old history row(s)");
         }
         import_legacy_last_json(&mut conn, state_dir)?;
+        if let Err(e) = maintain_connection(&conn) {
+            tracing::warn!("history database maintenance on startup failed: {e:#}");
+        }
         tighten_db_permissions(state_dir);
         let initial_last_id = read_last_id(&conn)?;
 
@@ -292,6 +296,7 @@ impl Store {
                         }
                         StoreCmd::MarkRunning {
                             id,
+                            lane,
                             session_id,
                             conversation_id,
                             profile,
@@ -299,14 +304,16 @@ impl Store {
                         } => {
                             if let Err(e) = conn.execute(
                                 "UPDATE turns
-                                 SET status = 'running',
-                                     session_id = ?2,
-                                     conversation_id = ?3,
-                                     profile = ?4,
-                                     started_at = COALESCE(started_at, ?5)
+                                 SET lane = ?2,
+                                     status = 'running',
+                                     session_id = ?3,
+                                     conversation_id = ?4,
+                                     profile = ?5,
+                                     started_at = COALESCE(started_at, ?6)
                                  WHERE id = ?1",
                                 params![
                                     id as i64,
+                                    lane.as_str(),
                                     session_id,
                                     conversation_id.map(|c| c as i64),
                                     profile,
@@ -344,6 +351,9 @@ impl Store {
                                         }
                                         Ok(_) => {}
                                         Err(e) => tracing::warn!("history prune failed: {e:#}"),
+                                    }
+                                    if let Err(e) = maintain_connection(&conn) {
+                                        tracing::warn!("history maintenance failed: {e:#}");
                                     }
                                 }
                             }
@@ -406,6 +416,9 @@ impl Store {
                         StoreCmd::Shutdown => break,
                     }
                 }
+                if let Err(e) = maintain_connection(&conn) {
+                    tracing::warn!("history maintenance on shutdown failed: {e:#}");
+                }
                 let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
                 tighten_db_permissions(&state_dir_owned);
             })
@@ -427,6 +440,7 @@ impl Store {
     pub fn mark_running(
         &self,
         id: u64,
+        lane: Lane,
         session_id: String,
         conversation_id: Option<u64>,
         profile: String,
@@ -434,6 +448,7 @@ impl Store {
     ) {
         let _ = self.tx.send(StoreCmd::MarkRunning {
             id,
+            lane,
             session_id,
             conversation_id,
             profile,
@@ -704,9 +719,38 @@ BEGIN
 END;
 "#;
 
+const SCHEMA_V2: &str = r#"
+CREATE TABLE schedules (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                 TEXT    NOT NULL UNIQUE,
+    enabled              INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    schedule_spec        TEXT    NOT NULL,
+    prompt               TEXT    NOT NULL DEFAULT '',
+    profile              TEXT    NOT NULL DEFAULT '',
+    script               TEXT    NOT NULL DEFAULT '',
+    no_agent             INTEGER NOT NULL DEFAULT 0 CHECK (no_agent IN (0, 1)),
+    suppress_token       TEXT,
+    failure_deliver      TEXT    NOT NULL DEFAULT 'notify'
+                         CHECK (failure_deliver IN ('notify', 'log', 'silent')),
+    max_runs             INTEGER,
+    expires_at           INTEGER,
+    run_count            INTEGER NOT NULL DEFAULT 0,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    next_run_at          INTEGER,
+    last_run_at          INTEGER,
+    last_status          TEXT,
+    last_error           TEXT,
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX idx_schedules_due ON schedules(next_run_at ASC)
+    WHERE enabled = 1 AND next_run_at IS NOT NULL;
+"#;
+
 fn migrate(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let version: i32 = tx.query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+    let mut version: i32 = tx.query_row("PRAGMA user_version;", [], |r| r.get(0))?;
     if version > DB_SCHEMA_VERSION {
         bail!(
             "history database was created by a newer version of hey-computer (schema v{version}, supported v{DB_SCHEMA_VERSION})"
@@ -715,9 +759,27 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if version == 0 {
         tx.execute_batch(SCHEMA_V1)
             .context("initializing history database schema v1")?;
-        tx.pragma_update(None, "user_version", DB_SCHEMA_VERSION)?;
+        version = 1;
     }
+    if version == 1 {
+        tx.execute_batch(SCHEMA_V2)
+            .context("migrating history database schema v1 -> v2")?;
+        version = 2;
+    }
+    tx.pragma_update(None, "user_version", version)?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Optimize the FTS5 index, run SQLite's query-planner optimizer, and reclaim
+/// up to 256 freed pages via incremental vacuum.
+fn maintain_connection(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "INSERT INTO turns_fts(turns_fts) VALUES('optimize');
+         PRAGMA optimize;
+         PRAGMA incremental_vacuum(256);",
+    )
+    .context("running SQLite/FTS5 maintenance")?;
     Ok(())
 }
 
@@ -1502,6 +1564,496 @@ pub fn format_recall_output(
     }
 }
 
+/// How scheduled job failures are delivered.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureDeliver {
+    #[default]
+    Notify,
+    Log,
+    Silent,
+}
+
+impl FailureDeliver {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Notify => "notify",
+            Self::Log => "log",
+            Self::Silent => "silent",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "notify" => Some(Self::Notify),
+            "log" => Some(Self::Log),
+            "silent" => Some(Self::Silent),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for FailureDeliver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One row from the `schedules` table (schema v2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleRecord {
+    pub id: u64,
+    pub name: String,
+    pub enabled: bool,
+    pub schedule_spec: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub script: String,
+    pub no_agent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppress_token: Option<String>,
+    pub failure_deliver: FailureDeliver,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_runs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    pub run_count: u64,
+    pub consecutive_failures: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Input fields for creating a scheduled job.
+#[derive(Debug, Clone)]
+pub struct NewSchedule {
+    pub name: String,
+    pub schedule_spec: String,
+    pub prompt: String,
+    pub profile: String,
+    pub script: String,
+    pub no_agent: bool,
+    pub suppress_token: Option<String>,
+    pub failure_deliver: FailureDeliver,
+    pub max_runs: Option<u64>,
+    pub expires_at: Option<i64>,
+    pub next_run_at: i64,
+}
+
+/// Patch fields for editing an existing scheduled job.
+#[derive(Debug, Default, Clone)]
+pub struct SchedulePatch {
+    pub schedule_spec: Option<String>,
+    pub next_run_at: Option<Option<i64>>,
+    pub prompt: Option<String>,
+    pub profile: Option<String>,
+    pub script: Option<String>,
+    pub no_agent: Option<bool>,
+    pub suppress_token: Option<Option<String>>,
+    pub failure_deliver: Option<FailureDeliver>,
+    pub max_runs: Option<Option<u64>>,
+    pub expires_at: Option<Option<i64>>,
+}
+
+const SCHEDULE_COLUMNS: &str = "id, name, enabled, schedule_spec, prompt, profile, script, \
+    no_agent, suppress_token, failure_deliver, max_runs, expires_at, run_count, \
+    consecutive_failures, next_run_at, last_run_at, last_status, last_error, \
+    created_at, updated_at";
+
+fn row_to_schedule(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRecord> {
+    let id: i64 = row.get(0)?;
+    let name: String = row.get(1)?;
+    let enabled: i64 = row.get(2)?;
+    let schedule_spec: String = row.get(3)?;
+    let prompt: String = row.get(4)?;
+    let profile: String = row.get(5)?;
+    let script: String = row.get(6)?;
+    let no_agent: i64 = row.get(7)?;
+    let suppress_token: Option<String> = row.get(8)?;
+    let failure_deliver_str: String = row.get(9)?;
+    let max_runs: Option<i64> = row.get(10)?;
+    let expires_at: Option<i64> = row.get(11)?;
+    let run_count: i64 = row.get(12)?;
+    let consecutive_failures: i64 = row.get(13)?;
+    let next_run_at: Option<i64> = row.get(14)?;
+    let last_run_at: Option<i64> = row.get(15)?;
+    let last_status: Option<String> = row.get(16)?;
+    let last_error: Option<String> = row.get(17)?;
+    let created_at: i64 = row.get(18)?;
+    let updated_at: i64 = row.get(19)?;
+    Ok(ScheduleRecord {
+        id: id.max(0) as u64,
+        name,
+        enabled: enabled != 0,
+        schedule_spec,
+        prompt,
+        profile,
+        script,
+        no_agent: no_agent != 0,
+        suppress_token,
+        failure_deliver: FailureDeliver::parse(&failure_deliver_str).unwrap_or_default(),
+        max_runs: max_runs.map(|v| v.max(0) as u64),
+        expires_at,
+        run_count: run_count.max(0) as u64,
+        consecutive_failures: consecutive_failures.max(0) as u64,
+        next_run_at,
+        last_run_at,
+        last_status,
+        last_error,
+        created_at,
+        updated_at,
+    })
+}
+
+fn has_schedules_table(conn: &Connection) -> Result<bool> {
+    let version: i32 = conn.query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+    Ok(version >= 2)
+}
+
+fn open_migrated_writer(state_dir: &Path) -> Result<Connection> {
+    let mut conn = open_writer_connection(state_dir)?;
+    migrate(&mut conn)?;
+    tighten_db_permissions(state_dir);
+    Ok(conn)
+}
+
+fn lookup_schedule(conn: &Connection, id_or_name: &str) -> Result<Option<ScheduleRecord>> {
+    if let Ok(id) = id_or_name.parse::<u64>()
+        && let Some(row) = conn
+            .query_row(
+                &format!("SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE id = ?1"),
+                params![id as i64],
+                row_to_schedule,
+            )
+            .optional()?
+    {
+        return Ok(Some(row));
+    }
+    let row = conn
+        .query_row(
+            &format!("SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE name = ?1"),
+            params![id_or_name],
+            row_to_schedule,
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// List scheduled jobs directly from `history.db` (read-only; works when daemon is stopped).
+pub fn list_schedules(state_dir: &Path, include_disabled: bool) -> Result<Vec<ScheduleRecord>> {
+    let Some(conn) = open_reader_connection(state_dir)? else {
+        return Ok(Vec::new());
+    };
+    if !has_schedules_table(&conn)? {
+        return Ok(Vec::new());
+    }
+    let sql = if include_disabled {
+        format!("SELECT {SCHEDULE_COLUMNS} FROM schedules ORDER BY enabled DESC, id ASC")
+    } else {
+        format!(
+            "SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE enabled = 1 ORDER BY next_run_at ASC, id ASC"
+        )
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_schedule)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Fetch one scheduled job by numeric ID or exact name (read-only).
+pub fn get_schedule(state_dir: &Path, id_or_name: &str) -> Result<Option<ScheduleRecord>> {
+    let Some(conn) = open_reader_connection(state_dir)? else {
+        return Ok(None);
+    };
+    if !has_schedules_table(&conn)? {
+        return Ok(None);
+    }
+    lookup_schedule(&conn, id_or_name)
+}
+
+/// Insert a new scheduled job, enforcing `max_jobs`.
+pub fn create_schedule(
+    state_dir: &Path,
+    spec: &NewSchedule,
+    max_jobs: usize,
+) -> Result<ScheduleRecord> {
+    let conn = open_migrated_writer(state_dir)?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM schedules", [], |r| r.get(0))?;
+    if count as usize >= max_jobs {
+        bail!("maximum number of scheduled jobs reached (scheduler.max_jobs = {max_jobs})");
+    }
+    let now_ms = unix_timestamp_ms();
+    conn.execute(
+        "INSERT INTO schedules (
+            name, enabled, schedule_spec, prompt, profile, script, no_agent,
+            suppress_token, failure_deliver, max_runs, expires_at, next_run_at,
+            created_at, updated_at
+        ) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+        params![
+            spec.name,
+            spec.schedule_spec,
+            spec.prompt,
+            spec.profile,
+            spec.script,
+            i64::from(spec.no_agent),
+            spec.suppress_token,
+            spec.failure_deliver.as_str(),
+            spec.max_runs.map(|v| v as i64),
+            spec.expires_at,
+            spec.next_run_at,
+            now_ms,
+        ],
+    )
+    .with_context(|| format!("creating schedule `{}`", spec.name))?;
+    let id = conn.last_insert_rowid() as u64;
+    lookup_schedule(&conn, &id.to_string())?.context("created schedule could not be read back")
+}
+
+/// Apply partial edits to a scheduled job.
+pub fn update_schedule(
+    state_dir: &Path,
+    id_or_name: &str,
+    patch: &SchedulePatch,
+) -> Result<ScheduleRecord> {
+    let conn = open_migrated_writer(state_dir)?;
+    let Some(mut job) = lookup_schedule(&conn, id_or_name)? else {
+        bail!("schedule `{id_or_name}` not found");
+    };
+    if let Some(s) = &patch.schedule_spec {
+        job.schedule_spec = s.clone();
+    }
+    if let Some(next) = patch.next_run_at {
+        job.next_run_at = next;
+    }
+    if let Some(p) = &patch.prompt {
+        job.prompt = p.clone();
+    }
+    if let Some(p) = &patch.profile {
+        job.profile = p.clone();
+    }
+    if let Some(s) = &patch.script {
+        job.script = s.clone();
+    }
+    if let Some(n) = patch.no_agent {
+        job.no_agent = n;
+    }
+    if let Some(tok) = &patch.suppress_token {
+        job.suppress_token = tok.clone();
+    }
+    if let Some(fd) = patch.failure_deliver {
+        job.failure_deliver = fd;
+    }
+    if let Some(mr) = patch.max_runs {
+        job.max_runs = mr;
+    }
+    if let Some(exp) = patch.expires_at {
+        job.expires_at = exp;
+    }
+    let now_ms = unix_timestamp_ms();
+    conn.execute(
+        "UPDATE schedules
+         SET schedule_spec = ?2,
+             prompt = ?3,
+             profile = ?4,
+             script = ?5,
+             no_agent = ?6,
+             suppress_token = ?7,
+             failure_deliver = ?8,
+             max_runs = ?9,
+             expires_at = ?10,
+             next_run_at = ?11,
+             updated_at = ?12
+         WHERE id = ?1",
+        params![
+            job.id as i64,
+            job.schedule_spec,
+            job.prompt,
+            job.profile,
+            job.script,
+            i64::from(job.no_agent),
+            job.suppress_token,
+            job.failure_deliver.as_str(),
+            job.max_runs.map(|v| v as i64),
+            job.expires_at,
+            job.next_run_at,
+            now_ms,
+        ],
+    )?;
+    lookup_schedule(&conn, &job.id.to_string())?.context("updated schedule could not be read back")
+}
+
+/// Enable (resume) or disable (pause) a scheduled job.
+pub fn set_schedule_enabled(
+    state_dir: &Path,
+    id_or_name: &str,
+    enabled: bool,
+    next_run_at: Option<i64>,
+) -> Result<ScheduleRecord> {
+    let conn = open_migrated_writer(state_dir)?;
+    let Some(job) = lookup_schedule(&conn, id_or_name)? else {
+        bail!("schedule `{id_or_name}` not found");
+    };
+    let now_ms = unix_timestamp_ms();
+    conn.execute(
+        "UPDATE schedules
+         SET enabled = ?2,
+             next_run_at = ?3,
+             consecutive_failures = CASE WHEN ?2 = 1 THEN 0 ELSE consecutive_failures END,
+             updated_at = ?4
+         WHERE id = ?1",
+        params![job.id as i64, i64::from(enabled), next_run_at, now_ms],
+    )?;
+    lookup_schedule(&conn, &job.id.to_string())?.context("updated schedule could not be read back")
+}
+
+/// Delete a scheduled job by numeric ID or exact name.
+pub fn delete_schedule(state_dir: &Path, id_or_name: &str) -> Result<Option<ScheduleRecord>> {
+    let conn = open_migrated_writer(state_dir)?;
+    let Some(job) = lookup_schedule(&conn, id_or_name)? else {
+        return Ok(None);
+    };
+    conn.execute(
+        "DELETE FROM schedules WHERE id = ?1",
+        params![job.id as i64],
+    )?;
+    Ok(Some(job))
+}
+
+/// Return all enabled schedules whose `next_run_at <= now_ms`.
+pub fn due_schedules(state_dir: &Path, now_ms: i64) -> Result<Vec<ScheduleRecord>> {
+    let Some(conn) = open_reader_connection(state_dir)? else {
+        return Ok(Vec::new());
+    };
+    if !has_schedules_table(&conn)? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SCHEDULE_COLUMNS}
+         FROM schedules
+         WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?1
+         ORDER BY next_run_at ASC, id ASC"
+    ))?;
+    let rows = stmt.query_map(params![now_ms], row_to_schedule)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Earliest `next_run_at` among enabled jobs, for sleeping efficiently.
+pub fn next_schedule_wake_ms(state_dir: &Path) -> Result<Option<i64>> {
+    let Some(conn) = open_reader_connection(state_dir)? else {
+        return Ok(None);
+    };
+    if !has_schedules_table(&conn)? {
+        return Ok(None);
+    }
+    let next: Option<i64> = conn.query_row(
+        "SELECT MIN(next_run_at) FROM schedules WHERE enabled = 1 AND next_run_at IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(next)
+}
+
+pub fn advance_schedule_next_run(
+    state_dir: &Path,
+    id: u64,
+    next_run_at: Option<i64>,
+    now_ms: i64,
+) -> Result<()> {
+    let conn = open_migrated_writer(state_dir)?;
+    conn.execute(
+        "UPDATE schedules SET next_run_at = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id as i64, next_run_at, now_ms],
+    )?;
+    Ok(())
+}
+
+pub fn disable_expired_schedule(state_dir: &Path, id: u64, now_ms: i64) -> Result<()> {
+    let conn = open_migrated_writer(state_dir)?;
+    conn.execute(
+        "UPDATE schedules
+         SET enabled = 0, next_run_at = NULL, last_status = 'expired', updated_at = ?2
+         WHERE id = ?1",
+        params![id as i64, now_ms],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_schedule_outcome(
+    state_dir: &Path,
+    id: u64,
+    last_run_at: i64,
+    updated_at: i64,
+    last_status: &str,
+    last_error: Option<&str>,
+    run_count: u64,
+    consecutive_failures: u64,
+    disable: bool,
+) -> Result<()> {
+    let conn = open_migrated_writer(state_dir)?;
+    if disable {
+        conn.execute(
+            "UPDATE schedules
+             SET enabled = 0,
+                 next_run_at = NULL,
+                 run_count = ?2,
+                 consecutive_failures = ?3,
+                 last_run_at = ?4,
+                 last_status = ?5,
+                 last_error = ?6,
+                 updated_at = ?7
+             WHERE id = ?1",
+            params![
+                id as i64,
+                run_count as i64,
+                consecutive_failures as i64,
+                last_run_at,
+                last_status,
+                last_error,
+                updated_at,
+            ],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE schedules
+             SET run_count = ?2,
+                 consecutive_failures = ?3,
+                 last_run_at = ?4,
+                 last_status = ?5,
+                 last_error = ?6,
+                 updated_at = ?7
+             WHERE id = ?1",
+            params![
+                id as i64,
+                run_count as i64,
+                consecutive_failures as i64,
+                last_run_at,
+                last_status,
+                last_error,
+                updated_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1599,6 +2151,7 @@ mod tests {
         });
         store.mark_running(
             2,
+            Lane::Background,
             "sess-2".to_string(),
             None,
             "deep".to_string(),
@@ -1735,5 +2288,56 @@ mod tests {
         );
         assert!(parse_time_spec("2026-11-24", now).is_ok());
         assert!(parse_time_spec("bogus", now).is_err());
+    }
+
+    #[tokio::test]
+    async fn migrates_v1_to_v2_and_runs_schedule_crud_and_maintenance() {
+        let dir = scratch("v1-to-v2");
+        // Seed a schema v1 database directly.
+        {
+            let conn = open_writer_connection(&dir).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        // Opening Store upgrades v1 -> v2 in place and runs FTS5/SQLite maintenance.
+        let (store, _) = Store::open(&dir, &HistoryConfig::default()).unwrap();
+        let now = unix_timestamp_ms();
+        let created = create_schedule(
+            &dir,
+            &NewSchedule {
+                name: "ci-watch".to_string(),
+                schedule_spec: "every 15m".to_string(),
+                prompt: "check CI".to_string(),
+                profile: "deep".to_string(),
+                script: "echo fail".to_string(),
+                no_agent: false,
+                suppress_token: Some("HEARTBEAT_OK".to_string()),
+                failure_deliver: FailureDeliver::Notify,
+                max_runs: Some(5),
+                expires_at: None,
+                next_run_at: now - 1000,
+            },
+            128,
+        )
+        .unwrap();
+        assert_eq!(created.name, "ci-watch");
+        assert!(created.enabled);
+        assert_eq!(list_schedules(&dir, false).unwrap().len(), 1);
+        assert_eq!(due_schedules(&dir, now).unwrap().len(), 1);
+
+        let paused = set_schedule_enabled(&dir, "ci-watch", false, None).unwrap();
+        assert!(!paused.enabled);
+        assert!(list_schedules(&dir, false).unwrap().is_empty());
+        assert_eq!(list_schedules(&dir, true).unwrap().len(), 1);
+
+        assert!(
+            delete_schedule(&dir, &created.id.to_string())
+                .unwrap()
+                .is_some()
+        );
+        assert!(list_schedules(&dir, true).unwrap().is_empty());
+
+        store.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -18,6 +18,7 @@ use crate::context::{ContextProvider, SystemContext};
 use crate::lines::{self, Line};
 use crate::present::{Desktop, Presenter};
 use crate::protocol::{self, FailReason, MAX_REQUEST_LINE, Reply, Request};
+use crate::scheduler::{self, SchedulerHandle};
 use crate::store::Store;
 use crate::{environment, ipc};
 
@@ -89,11 +90,18 @@ pub async fn serve_with_context(
     tracing::info!("agent directory {}", paths.agent_dir.display());
     tracing::info!("listening on {}", socket.display());
 
+    let config = Arc::new(config);
     let (handle, mut conductor) = conductor::spawn_with_store(
-        Arc::new(config),
-        presenter,
+        Arc::clone(&config),
+        Arc::clone(&presenter),
         context,
         Some((store.clone(), initial_last_id)),
+    );
+    let (sched_handle, sched_task) = scheduler::spawn(
+        Arc::clone(&config),
+        paths.state_dir.clone(),
+        handle.clone(),
+        presenter,
     );
     tokio::pin!(shutdown);
     let mut connections = tokio::task::JoinSet::new();
@@ -102,8 +110,9 @@ pub async fn serve_with_context(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     let handle = handle.clone();
+                    let sched = sched_handle.clone();
                     connections.spawn(async move {
-                        if let Err(e) = connection(&handle, stream).await {
+                        if let Err(e) = connection(&handle, &sched, stream).await {
                             tracing::debug!("client connection: {e:#}");
                         }
                     });
@@ -120,6 +129,8 @@ pub async fn serve_with_context(
             // (a panic), the daemon would accept requests and answer none;
             // exiting with an error lets systemd restart it instead.
             ended = &mut conductor => {
+                sched_handle.shutdown();
+                let _ = sched_task.await;
                 let _ = std::fs::remove_file(socket);
                 return Err(match ended {
                     Err(e) if e.is_panic() => anyhow::anyhow!("the conductor panicked"),
@@ -136,6 +147,8 @@ pub async fn serve_with_context(
     if let Err(e) = std::fs::remove_file(socket) {
         tracing::warn!("cannot remove {}: {e}", socket.display());
     }
+    sched_handle.shutdown();
+    let _ = sched_task.await;
     // Cancels the running request too: with an agent that keeps working,
     // waiting for the turn would hold up a restart until systemd kills us.
     handle.shutdown();
@@ -208,7 +221,11 @@ async fn bind(path: &Path) -> Result<UnixListener> {
 }
 
 /// One request in, one or more replies out.
-async fn connection(handle: &Handle, stream: UnixStream) -> Result<()> {
+async fn connection(
+    handle: &Handle,
+    scheduler: &SchedulerHandle,
+    stream: UnixStream,
+) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
 
@@ -235,6 +252,20 @@ async fn connection(handle: &Handle, stream: UnixStream) -> Result<()> {
 
     match request {
         Request::Status => send(&mut write, &Reply::Status(handle.status())).await,
+        Request::ScheduleReload => {
+            scheduler.reload();
+            send(
+                &mut write,
+                &Reply::Ok {
+                    message: "scheduler reloaded".to_string(),
+                },
+            )
+            .await
+        }
+        Request::ScheduleRun { target } => match scheduler.run_now(target).await {
+            Ok(message) => send(&mut write, &Reply::Ok { message }).await,
+            Err(message) => send(&mut write, &Reply::Error { message }).await,
+        },
         Request::Cancel { id } => {
             let cancelled_id = handle.cancel(id, FailReason::Cancelled);
             send(&mut write, &Reply::Cancelled { id: cancelled_id }).await
@@ -258,6 +289,7 @@ async fn connection(handle: &Handle, stream: UnixStream) -> Result<()> {
             background,
             suppress_token,
             attachments,
+            source,
         } => {
             if let Some(tok) = &suppress_token
                 && tok.trim().is_empty()
@@ -306,6 +338,7 @@ async fn connection(handle: &Handle, stream: UnixStream) -> Result<()> {
                 background,
                 suppress_token,
                 attachments: loaded_attachments,
+                source,
             };
             if !wait {
                 return match handle.ask(params, Sink::Present) {

@@ -71,9 +71,27 @@ Inspect or manage them with `hey-computer tasks`.
 **Timeouts and budgets.** A request is cancelled if the agent sends nothing for
 45 s (`agent.inactivity_timeout_secs`). To stop runaway retry loops even while
 updates keep arriving, each turn also has generous hard caps of 300 s wall-clock
-time (`agent.max_turn_secs`) and 20 distinct tool calls (`agent.max_tool_calls`);
-set either to 0 to disable it. Profiles can override `max_turn_secs` and
-`max_tool_calls`.
+time (`agent.max_turn_secs`), 20 distinct tool calls (`agent.max_tool_calls`),
+and a consecutive identical tool-call guard (`agent.max_repeat_tool_calls`,
+default 3); set any of them to 0 to disable it. Profiles can override
+`max_turn_secs`, `max_tool_calls`, and `max_repeat_tool_calls`.
+
+**Agent-authored hybrid scheduler (`hey-computer schedule`).** Recurring and
+one-shot jobs live in `history.db` (`schedules` table) and run inside the daemon
+in local time (`every`, `in`, `at`, `daily`, `weekdays`, `<dow> HH:MM`, or
+5-field cron). Jobs can run a cheap `--script` pre-collector first (exit 0 +
+empty stdout skips silently with zero LLM tokens; non-empty stdout wakes the
+background lane with `<untrusted_collector_output>`), run as zero-token
+`--no-agent` reminders/alerts, and route failures via `--failure-deliver`
+(`notify` with exponential backoff, `log`, or `silent`).
+
+**Automatic model, effort, and lane routing (`[routing]`).** Opt-in 3-tier
+routing when `-p/--profile` and `-b/--background` are omitted: zero-latency
+heuristics (all inputs, including follow-up correction escalation and
+auto-backgrounding of long multi-step delegation prompts on non-waiting turns),
+automatic one-time retry on `deep_profile` when an auto-routed `fast_profile`
+turn fails, and bounded tool-disabled LLM triage on `Unsure` new turns for
+non-voice inputs only (`--voice` / `--source voice` never runs LLM triage).
 
 ### The agent's own directory
 
@@ -89,7 +107,8 @@ $XDG_STATE_HOME/hey-computer/          (default ~/.local/state/hey-computer)
     config/skills/<name>/…             links to the configured skills
   workspace/                           every session's working directory
     AGENTS.md                          the instructions, generated
-  history.db                           SQLite WAL + FTS5 history store, mode 0600
+  artifacts/                           private (0700) scratch dir for large CLI outputs
+  history.db                           SQLite WAL + FTS5 history & schedule store, mode 0600
 ```
 
 `settings.json` puts agy in its default mode (every tool call that needs
@@ -132,11 +151,12 @@ hey-computer [--config FILE] [--socket PATH] [-v|-vv] COMMAND
 | Command | What it does |
 |---|---|
 | `daemon` | Run the daemon. |
-| `ask [--print] [--new] [-b\|--background] [--suppress-token TOKEN] [-p\|--profile NAME] [-f\|--file PATH]... [-i\|--image PATH]... [--] [TEXT...]` | Hand the daemon a request: the arguments joined by spaces, or stdin when there are none (up to 256 KiB; skipped if stdin is a TTY and attachments were passed). Without `--print` it exits 0 as soon as accepted; background tasks print their task ID to stdout with no submission popup. With `--print` it waits, prints the answer on stdout and exits 0 (silently when matched by `--suppress-token`), or prints the failure on stderr and exits 1; the daemon shows nothing. `--new` starts a new conversation; `-p`/`--profile` picks a `[profiles.<name>]` (or `default`); `-f`/`--file` attaches UTF-8 text files; `-i`/`--image` attaches PNG/JPEG/WebP/GIF images. Ctrl-C while waiting cancels the request. |
+| `ask [--print] [--new] [-b\|--background] [--suppress-token TOKEN] [-p\|--profile NAME] [--voice \| --source cli\|voice\|typed] [-f\|--file PATH]... [-i\|--image PATH]... [--] [TEXT...]` | Hand the daemon a request: the arguments joined by spaces, or stdin when there are none (up to 256 KiB; skipped if stdin is a TTY and attachments were passed). Without `--print` it exits 0 as soon as accepted; background tasks print their task ID to stdout with no submission popup. With `--print` it waits, prints the answer on stdout and exits 0 (silently when matched by `--suppress-token`), or prints the failure on stderr and exits 1; the daemon shows nothing. `--new` starts a new conversation; `-p`/`--profile` picks a `[profiles.<name>]` (or `default`); `--voice` / `--source` tags input origin for `[routing]` (voice skips LLM triage); `-f`/`--file` attaches UTF-8 text files; `-i`/`--image` attaches PNG/JPEG/WebP/GIF images. Ctrl-C while waiting cancels the request. |
 | `cancel [--id ID]` | Cancel the running interactive request, or a specific running/queued task with `--id`: `cancelled request N` or `nothing to cancel`. |
 | `status [--json]` | For example `agent ready, idle, follow-ups for 78 s, 7 handled` (plus active profile and background running/queued counts when non-zero). |
 | `last [--copy \| --open] [--lane interactive\|background\|all] [--json]` | Retrieve the last successful answer (defaults to the `interactive` lane): print it, output JSON, copy to the clipboard (`present.clipboard`), or open in the Markdown viewer (`present.viewer`). Works even when the daemon is stopped. |
 | `tasks [list \| show ID \| open ID \| copy ID \| cancel ID]` | List recent tasks (`--lane`, `--status`, `--all`, `--limit`, `--json`; defaults to the `background` lane), inspect one task, open it in the viewer, copy its answer, or cancel a running/queued task. `list`, `show`, `open`, and `copy` work even when the daemon is stopped. |
+| `schedule [add \| list \| show \| edit \| pause \| resume \| remove \| run]` | Create, inspect, pause, resume, edit, remove, or test-run scheduled jobs stored in `history.db`. `list`/`show` and mutations work even when the daemon is stopped (mutations wake a running daemon automatically); `run <id\|name>` triggers an immediate test run in the running daemon. |
 | `recall [--since SPEC] [--until SPEC] [-n\|--limit N] [--lane ...] [--sort relevance\|recent] [--any] [--full] [--max-chars N] [--raw-fts] [--json] [--plain] [QUERY...]` | Full-text search (SQLite FTS5) over past completed answers, wrapped in `<untrusted_recall>` by default (for agent skill use; `--plain` or `--json` for direct terminal/script use). Time specs accept relative (`24h`, `7d`, `2w`) and calendar (`today`, `yesterday`, `YYYY-MM-DD`) forms. Works even when the daemon is stopped. |
 
 - An empty or whitespace-only request (with no attachments) is reported on stderr and exits 2.
@@ -152,8 +172,9 @@ hey-computer [--config FILE] [--socket PATH] [-v|-vv] COMMAND
   path but refuses to start when something else is there.
 - The state directory is `state_dir` in `config.toml`, else
   `$HEY_COMPUTER_STATE_DIR`, else `$XDG_STATE_HOME/hey-computer`. The daemon
-  exports `HEY_COMPUTER_STATE_DIR` to the spawned agent so the bundled `recall`
-  skill queries the same database.
+  exports `HEY_COMPUTER_STATE_DIR` and `HEY_COMPUTER_ARTIFACTS_DIR`
+  (`$HEY_COMPUTER_STATE_DIR/artifacts`) to the spawned agent so skills query
+  the same database and offload bulky outputs to the private artifacts folder.
 
 Hidden commands for checking one part at a time:
 `hey-computer debug config` (check the configuration and print it with every
@@ -177,12 +198,13 @@ reply lines until the daemon closes the connection.
 **ask**
 
 ```json
-{"type":"ask","text":"how warm is it outside","wait":false,"new":false,"profile":"deep","background":false,"suppress_token":null,"attachments":[{"kind":"file","path":"/abs/path/to/file.txt"}]}
+{"type":"ask","text":"how warm is it outside","wait":false,"new":false,"profile":"deep","background":false,"suppress_token":null,"source":"voice","attachments":[{"kind":"file","path":"/abs/path/to/file.txt"}]}
 ```
 
 Only `type` and `text` (or at least one attachment) are required; `wait`,
 `new`, `background` default to `false`, `profile` and `suppress_token` default
-to `null`, and `attachments` defaults to `[]` (`kind` is `"file"` or `"image"`,
+to `null`, `source` defaults to `"cli"` (`"cli"`, `"voice"`, or `"typed"`), and
+`attachments` defaults to `[]` (`kind` is `"file"` or `"image"`,
 `path` must be an existing regular file; up to 8 attachments, 512 KiB per text
 file, 10 MiB per image, 16 MiB total raw bytes). The reply is
 `{"type":"accepted","id":7}`. With `"wait": false` that is all: the daemon
@@ -203,7 +225,7 @@ empty; `suppressed` is omitted when false and `true` when the answer matched
 | `cancelled` | `cancel`, or the waiting client went away |
 | `superseded` | a newer request replaced it |
 | `timeout` | the agent sent nothing for `agent.inactivity_timeout_secs`, or the turn exceeded `agent.max_turn_secs` |
-| `limit_reached` | the agent exceeded `agent.max_tool_calls` |
+| `limit_reached` | the agent exceeded `agent.max_tool_calls` or `agent.max_repeat_tool_calls` |
 | `agent_down` | the agent could not be started, or exited mid-request |
 | `agent_error` | the agent refused the request; `message` is what it said. Without a login agy says `Authentication required`, and the message adds how to sign in (`agy acp --login`) |
 | `denied` | the only thing the agent tried was refused by the deny list |
@@ -259,8 +281,9 @@ idle_stop_secs = 0                  # stop the agent after this long unused; 0 =
 inactivity_timeout_secs = 45        # cancel a request after this long without an update
 max_turn_secs = 300                 # hard wall-clock cap per turn; 0 = unlimited
 max_tool_calls = 20                 # maximum distinct tool calls per turn; 0 = unlimited
+max_repeat_tool_calls = 3           # abort after N consecutive identical tool calls; 0 = disabled
 restart_delay_secs = 1              # doubles with every failure in a row, up to 60 s
-history_days = 7                    # delete agy's conversations older than this at agent start; 0 = keep
+history_days = 7                    # prune agy history and artifacts older than this at agent start; 0 = keep
 # mcp_oauth_tokens_file = "/home/alice/.gemini/antigravity-cli/mcp_oauth_tokens.json"
 
 [agent.settings]                    # merged over the generated agy settings.json
@@ -283,7 +306,7 @@ memory_max_chars = 4000             # character cap for memory_file (1..=32768)
 
 [context]
 time = false                        # prepend local date, time, offset and weekday to each user turn
-desktop = false                     # prepend active Hyprland workspace/window (requires hyprctl on PATH)
+desktop = false                     # prepend active Hyprland workspace/window, terminal/editor CWD, and tmux metadata
 
 [present]
 notifications = true                # every notification, errors included
@@ -300,6 +323,21 @@ max_concurrent = 1                  # concurrent turns in the background lane (1
 max_queued = 32                     # queued background tasks before rejecting new ones (1..=256)
 # profile = "deep"                  # optional default profile for `ask --background`
 
+[scheduler]
+enabled = true                      # run the SQLite-backed hybrid scheduler loop
+min_interval_secs = 60              # minimum recurring interval allowed (seconds)
+script_timeout_secs = 30            # timeout for `--script` pre-collectors (seconds)
+max_jobs = 128                      # maximum scheduled jobs stored in history.db (1..=1024)
+
+[routing]
+enabled = false                     # automatic profile/lane routing when -p/-b are omitted
+fast_profile = "default"            # profile for quick interactive turns
+deep_profile = "deep"               # profile for deep/analytical turns or escalations
+auto_background = true              # move long multi-step delegation prompts to background lane
+escalate_on_failure = true          # retry once on deep_profile after retryable fast failure
+triage_non_voice = true             # restricted LLM triage on unsure non-voice turns (never on voice)
+triage_timeout_secs = 4             # timeout for non-voice LLM triage (seconds)
+
 [history]
 retention_days = 90                 # prune completed/failed/cancelled turns older than this; 0 = keep
 max_entries = 10000                 # maximum rows kept in history.db; 0 = unlimited
@@ -312,8 +350,9 @@ suppressed_days = 7                 # prune suppressed heartbeat turns older tha
 # thought_level = "high"
 # max_turn_secs = 600
 # max_tool_calls = 40
+# max_repeat_tool_calls = 3
 # thinking_label = "Pondering Hard…"  # optional custom progress notification summary
-# mcp_servers = ["nixos"]             # omit to inherit all enabled [mcp.*] servers; [] passes none
+# mcp_servers = ["nixos"]             # omit to inherit all enabled [mcp.*] servers; [] allows none
 
 # MCP servers written to `<agent_dir>/config/mcp_config.json` (mode 0600) so
 # `agy acp` loads their schemas lazily via `call_mcp_tool` without truncating
@@ -414,9 +453,12 @@ told about Obsidian.
 | `openhue.enable` | false | puts `openhue` on the agent's PATH and links the bundled `openhue` skill |
 | `openhue.package` | `pkgs.openhue-cli` | the openhue CLI package |
 | `recall.enable` | true | links the bundled `recall` skill (uses `hey-computer recall` from the agent's PATH) |
-| `mcp.servers` | `{}` | MCP server definitions passed into `settings.mcp.<name>`; `{ file = "/abs/path"; }` entries in `env` or `headers` are automatically lowered into `env_files` / `header_files` so secrets stay out of `/nix/store` |
+| `tmux.enable` | true | puts `tmux` on the daemon/agent PATH (for `context.desktop` Ghostty/terminal context) and links the bundled `tmux` skill |
+| `tmux.package` | `pkgs.tmux` | the tmux package |
+| `schedule.enable` | true | links the bundled `schedule` skill (uses `hey-computer schedule` from the agent's PATH) |
+| `mcp.servers` | `{}` | MCP server definitions written to `config/mcp_config.json` and gated per profile; `{ file = "/abs/path"; }` entries in `env` or `headers` are lowered into `env_files` / `header_files` so secrets stay out of `/nix/store` |
 | `mcp.oauthTokensFile` | null | optional path to an existing `mcp_oauth_tokens.json` (e.g. from interactive `agy`) symlinked into the agent's private directory so OAuth-authenticated remote MCP servers share tokens |
-| `skills.enable` | true | the bundled `hyprland-desktop` skill, plus `recall`, Obsidian, and `openhue` skills when enabled |
+| `skills.enable` | true | the bundled `hyprland-desktop` skill, plus `recall`, `tmux`, `schedule`, Obsidian, and `openhue` skills when enabled |
 | `skills.extra` | `[]` | more skill directories |
 | `viewer.package` | `pkgs.marker` | installed |
 | `viewer.command` | `env DBUS_SESSION_BUS_ADDRESS=disabled: marker --name=hey-computer.answer --preview {file}` | |

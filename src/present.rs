@@ -87,6 +87,13 @@ pub enum Presentation {
         profile: Option<String>,
         background: bool,
     },
+    /// A standalone notification (e.g. scheduled reminder, split failure alert,
+    /// or background-delegation notice) that never replaces interactive progress.
+    Notice {
+        summary: String,
+        body: String,
+        urgency: Urgency,
+    },
 }
 
 pub trait Presenter: Send + Sync + 'static {
@@ -1044,7 +1051,7 @@ struct Worker {
     action_timeout: Duration,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Urgency {
     Low,
     Normal,
@@ -1069,6 +1076,7 @@ impl Worker {
         if !matches!(
             item,
             Presentation::TaskComplete { .. }
+                | Presentation::Notice { .. }
                 | Presentation::Failure {
                     background: true,
                     ..
@@ -1186,6 +1194,18 @@ impl Worker {
                         self.progress = shown.map(ProgressSlot::Reusable);
                     }
                 }
+            }
+            Presentation::Notice {
+                summary,
+                body,
+                urgency,
+            } => {
+                let expire = match urgency {
+                    Urgency::Low => 4_000,
+                    Urgency::Normal => FAILURE_EXPIRE_MS,
+                };
+                self.notify(&summary, &escape_markup(&body), urgency, expire, None)
+                    .await;
             }
             Presentation::Failure {
                 reason,
