@@ -37,52 +37,20 @@ All Phase 1 items (#1–#7) are implemented and listed under [Done](#done).
 
 ## Phase 2: Small upstream hardening & everyday latency/UX fixes
 
-Surgical changes while `conductor.rs` is still single-lane. Landing budgets and
-bug fixes before background tasks prevents unattended runaway loops later.
+Surgical changes while `conductor.rs` is still single-lane. All `[Important]`
+items (#8, #9, #12, #13, #14) are implemented and listed under [Done](#done);
+only the two `[Lower priority]` cleanups remain below.
 
-8. `[Important]` `[Upstream]` **Bounded, frozen-snapshot memory and fail-loudly
-   prompt rule.** Support an optional, strictly size-capped user-owned memory
-   file (e.g. `~/.config/hey-computer/memory.md`, kept outside the untrusted
-   vault) loaded into `AGENTS.md` at agent start and frozen for the life of the
-   session so prompt caching is never busted mid-session. Also add an explicit
-   "fail loudly" rule to `BUILT_IN` (`src/environment.rs:165-186`) prohibiting
-   the model from claiming success or guessing when a tool errors or returns
-   empty output.
-9. `[Important]` `[Upstream]` **Hard step and wall-clock budgets.**
-   `inactivity_timeout_secs` resets on every `session/update`
-   (`src/conductor.rs:1045`), so an agent stuck retrying failing commands can
-   loop indefinitely and burn quota. Add `agent.max_tool_calls` (e.g. 15–20) and
-   a generous `agent.max_turn_secs` (e.g. 300 s).
 10. `[Lower priority]` `[Upstream]` **Timed-out turns still extend the follow-up
     window.** On `FailReason::Timeout`, `turn()` returns `broken: false`
-    (`src/conductor.rs:1101-1106`), so `run_request()` increments
-    `conversation.turns` and extends `follow_up_until`
-    (`src/conductor.rs:690-696`). Marking timed-out turns `broken: true` avoids
-    reusing a half-completed or wedged session on the next request.
+    (`src/conductor.rs`), so `run_request()` increments `conversation.turns`
+    and extends `follow_up_until`. Marking timed-out turns `broken: true`
+    avoids reusing a half-completed or wedged session on the next request.
 11. `[Lower priority]` `[Upstream]` **Hardcoded "would become root" denial
-    message.** In `src/conductor.rs:1161-1167`, a denied command always reports
-    *"which would become root"*, even though `nix/home-manager.nix:115` suggests
+    message.** In `src/conductor.rs`, a denied command always reports
+    *"which would become root"*, even though `nix/home-manager.nix` suggests
     adding non-root commands like `"shutdown"` to `permissions.deny`. Make the
     refusal message generic (naming the refused command and deny list).
-12. `[Important]` `[Upstream]` **Live progress updates in the `"Thinking…"`
-    notification.** `src/conductor.rs:1049-1059` already receives `tool_call`
-    updates (`kind`, `title`, `toolSummary`). Forwarding throttled summaries to
-    `Desktop` using the existing `--replace-id` lets the user see mid-turn what
-    the agent is doing and hit `cancel` (#4) early if speech recognition
-    misheard the request.
-13. `[Important]` `[Upstream]` **Ambient desktop and time context injection.**
-    Every shell call costs 5–10 s (`README.md`). Prepending a tiny, opt-in
-    ephemeral header to the **user turn** (not `AGENTS.md`, keeping the
-    system-prompt prefix cacheable) with local date/time/weekday and active
-    Hyprland window class/title/workspace wrapped in
-    `<untrusted_desktop_context>` delimiters lets contextual requests ("put that
-    in today's note", "move this to workspace 3") finish in fewer tool
-    round-trips.
-14. `[Important]` `[Upstream]` **Quick retrieval (`hey-computer last`).** Add
-    `hey-computer last [--copy | --open]` so short answers whose notifications
-    faded—or long answers needed on the clipboard—are immediately retrievable.
-    (The SQLite FTS5 recall index follows in #18 so it shares the persistent
-    `$XDG_STATE_HOME` store with background tasks.)
 
 ## Phase 3: Core delegation primitives (protocol, sessions, lanes)
 
@@ -322,6 +290,35 @@ tooling are mature.
 
 ## Done
 
+- `[Important]` `[Upstream]` `[Done: 3e3b6e1]` **Bounded, frozen-snapshot memory
+  and fail-loudly prompt rule (#8).** Added `instructions.memory_file` /
+  `instructions.memory_max_chars` (default `4000`, Home Manager `memory.file`
+  defaulting to `~/.config/hey-computer/memory.md`, rejected inside the vault or
+  via symlinks into the vault), loaded into `AGENTS.md` on agent start and kept
+  frozen for the life of the agent process, plus the explicit fail-loudly rule
+  in `BUILT_IN`.
+- `[Important]` `[Upstream]` `[Done: acedf5b]` **Hard step and wall-clock
+  budgets (#9).** Added `agent.max_tool_calls` (default `20`, deduplicated by
+  `toolCallId`, wire reason `limit_reached`) and `agent.max_turn_secs` (default
+  `300`, `0` disables either cap), closing broken sessions and clearing the
+  follow-up window when tripped.
+- `[Important]` `[Upstream]` `[Done: 9533fc9]` **Live progress updates in the
+  `"Thinking…"` notification (#12).** Forwarded sanitized `toolSummary`/title
+  summaries (never raw shell arguments) from `conductor.rs` through
+  `Presentation::ProgressUpdate` with 400 ms trailing-edge throttling, burst
+  coalescing, and `--replace-id` replacement in `Desktop`.
+- `[Important]` `[Upstream]` `[Done: bcf844e]` **Ambient desktop and time
+  context injection (#13).** Added opt-in `[context]` (`time`, `desktop`),
+  prepending a sanitized `<untrusted_desktop_context>` header with local
+  date/time/offset/weekday (`localtime_r`) and active Hyprland workspace/window
+  (with stale-signature and empty-workspace fallbacks) per user turn without
+  busting `AGENTS.md` caching, plus `debug context`.
+- `[Important]` `[Upstream]` `[Done: 199b2a9]` **Quick retrieval (`hey-computer
+  last`) (#14).** Persisted the last successful answer atomically to
+  `<state_dir>/last.json` (mode `0600`) in `src/store.rs`, added `hey-computer
+  last [--copy | --open]` with HTML-disarmed viewer launching and `wl-copy`-safe
+  `present.clipboard` handling (defaulting to `${pkgs.wl-clipboard}/bin/wl-copy`
+  in the Home Manager module).
 - `[Important]` `[Config]` `[Done: NixConfig 8329b59, 4a0f1aa]` **Interactive
   agy sandbox disabled & `toolPermission = "always-proceed"` (intended).** Set
   `enableTerminalSandbox = false` (broken on NixOS with agy 1.5.13) and
