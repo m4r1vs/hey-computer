@@ -143,7 +143,9 @@ impl Connection {
         tokio::spawn(async move {
             let mut stdin = stdin;
             while let Some(line) = lines_out.recv().await {
-                tracing::trace!("acp ← {line}");
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    tracing::trace!("acp ← {}", redact_outbound_for_trace(&line));
+                }
                 let written = async {
                     stdin.write_all(line.as_bytes()).await?;
                     stdin.write_all(b"\n").await?;
@@ -456,8 +458,66 @@ pub fn tool_call_id(value: &Value) -> Option<&str> {
 /// Maximum characters in a live progress status line shown in the notification.
 const PROGRESS_STATUS_CHARS: usize = 80;
 
+/// Redact bulky attachment payloads and MCP secret values before logging an
+/// outbound JSON-RPC line at `trace`.
+fn redact_outbound_for_trace(line: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+        return format!("<non-json {} bytes>", line.len());
+    };
+    if let Some(params) = value.get_mut("params").and_then(Value::as_object_mut) {
+        if let Some(blocks) = params.get_mut("prompt").and_then(Value::as_array_mut) {
+            for block in blocks {
+                if let Some(obj) = block.as_object_mut() {
+                    if let Some(Value::String(data)) = obj.get("data") {
+                        let len = data.len();
+                        obj.insert("data".to_string(), json!(format!("<redacted {len} bytes>")));
+                    }
+                    if let Some(res) = obj.get_mut("resource").and_then(Value::as_object_mut) {
+                        for key in ["text", "blob"] {
+                            if let Some(Value::String(s)) = res.get(key) {
+                                let len = s.len();
+                                res.insert(
+                                    key.to_string(),
+                                    json!(format!("<redacted {len} bytes>")),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(servers) = params.get_mut("mcpServers").and_then(Value::as_array_mut) {
+            for server in servers {
+                if let Some(obj) = server.as_object_mut() {
+                    for list_key in ["env", "headers"] {
+                        if let Some(items) = obj.get_mut(list_key).and_then(Value::as_array_mut) {
+                            for item in items {
+                                if let Some(entry) = item.as_object_mut()
+                                    && entry.contains_key("value")
+                                {
+                                    entry.insert("value".to_string(), json!("<redacted>"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    value.to_string()
+}
+
 /// The shell command on a `toolCall` object, if it is one.
+///
+/// Scoped to shell-execution tool calls (`kind == "execute"` or
+/// `name == "run_command"`) so non-shell tools such as MCP tools that happen
+/// to take a `command` parameter are never misparsed as shell commands.
 pub fn tool_command(call: &Value) -> Option<String> {
+    let is_execute = call.get("kind").and_then(Value::as_str) == Some("execute")
+        || call.get("name").and_then(Value::as_str) == Some("run_command");
+    if !is_execute {
+        return None;
+    }
     for key in ["rawInput", "args"] {
         if let Some(line) = call
             .get(key)
@@ -670,6 +730,55 @@ mod tests {
         assert_eq!(permission_command(&title_only).as_deref(), Some("ls -l"));
         let edit = json!({"toolCall": {"kind": "edit", "title": "Edit notes.md"}});
         assert_eq!(permission_command(&edit), None);
+        // Non-execute tools (e.g. MCP) with a `command` parameter are not shell commands.
+        let mcp = json!({
+            "toolCall": {
+                "kind": "other",
+                "name": "mcp_demo_tool",
+                "rawInput": {"command": "sudo something"}
+            }
+        });
+        assert_eq!(permission_command(&mcp), None);
+    }
+
+    #[test]
+    fn outbound_trace_redacts_attachments_and_mcp_secrets() {
+        let prompt = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "s1",
+                "prompt": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image", "mimeType": "image/png", "data": "QUJDREVGRw=="},
+                    {"type": "resource", "resource": {"uri": "file:///a.txt", "mimeType": "text/plain", "text": "secret file body"}},
+                ]
+            }
+        })
+        .to_string();
+        let redacted = redact_outbound_for_trace(&prompt);
+        assert!(!redacted.contains("QUJDREVGRw=="), "{redacted}");
+        assert!(!redacted.contains("secret file body"), "{redacted}");
+        assert!(redacted.contains("<redacted 12 bytes>"), "{redacted}");
+
+        let session = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "params": {
+                "cwd": "/tmp",
+                "mcpServers": [
+                    {"name": "s", "command": "mcp", "env": [{"name": "TOKEN", "value": "top-secret"}]},
+                    {"type": "http", "name": "h", "url": "https://example.test", "headers": [{"name": "Authorization", "value": "Bearer xyz"}]}
+                ]
+            }
+        })
+        .to_string();
+        let redacted = redact_outbound_for_trace(&session);
+        assert!(!redacted.contains("top-secret"), "{redacted}");
+        assert!(!redacted.contains("Bearer xyz"), "{redacted}");
+        assert!(redacted.contains("<redacted>"), "{redacted}");
     }
 
     #[test]

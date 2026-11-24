@@ -337,7 +337,8 @@ struct TurnEnd {
     outcome: Outcome,
     /// False when the agent died or had to be killed.
     alive: bool,
-    /// The session should not be continued (the agent refused the prompt).
+    /// The session should not be continued (for example, the agent refused
+    /// the prompt, timed out, or hit a per-turn budget).
     broken: bool,
     /// The agent rejected the turn for lack of a login and must be restarted
     /// on the next request to re-read the keyring.
@@ -1297,7 +1298,7 @@ async fn turn(
                         "The assistant sent nothing for {} s and was stopped.",
                         budgets.inactivity.as_secs_f64().round()
                     ),
-                    false,
+                    true,
                 ),
                 TurnAbort::TurnTimeout(limit) => {
                     tracing::warn!(
@@ -1394,13 +1395,16 @@ async fn turn(
         },
         // A refused tool call ends agy's turn with no text at all, so the
         // daemon has to say what happened.
-        _ if !denied.is_empty() => Outcome::failed(
-            FailReason::Denied,
-            format!(
-                "The assistant wanted to run `{}`, which would become root. Such commands are refused.",
-                denied.join("`, `")
-            ),
-        ),
+        _ if !denied.is_empty() => {
+            let verb = if denied.len() == 1 { "is" } else { "are" };
+            Outcome::failed(
+                FailReason::Denied,
+                format!(
+                    "The assistant wanted to run `{}`, which {verb} on the deny list and cannot be run.",
+                    denied.join("`, `")
+                ),
+            )
+        }
         "refusal" => Outcome::failed(FailReason::AgentError, "The model refused to answer."),
         _ => Outcome::failed(
             FailReason::Empty,

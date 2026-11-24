@@ -279,10 +279,33 @@ async fn a_privileged_command_is_refused_and_the_daemon_says_why() {
     let (reason, message) = failure(&reply);
     assert_eq!(reason, FailReason::Denied);
     assert!(message.contains("sudo -n true"), "{message}");
-    assert!(message.contains("root"), "{message}");
+    assert!(message.contains("deny list"), "{message}");
     assert_eq!(h.log_count("permission reject_once sudo -n true"), 1);
     // The agent stays up and the conversation goes on.
     assert_eq!(answer(&h.ask("plain", false).await), "Hello from the mock.");
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_custom_denied_command_uses_a_generic_refusal_message() {
+    let script = r#"{
+        "turns": [
+            {"match": "power off", "steps": [{"permission": {"command": "shutdown now"}}, {"chunk": "never"}]}
+        ],
+        "default": ["echo"]
+    }"#;
+    let h = Harness::start(script, |c| {
+        c.permissions.deny.push("shutdown".to_string());
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    let reply = h.ask("power off", false).await;
+    let (reason, message) = failure(&reply);
+    assert_eq!(reason, FailReason::Denied);
+    assert!(message.contains("shutdown now"), "{message}");
+    assert!(message.contains("deny list"), "{message}");
+    assert!(!message.contains("root"), "{message}");
     h.stop().await;
 }
 
@@ -391,6 +414,10 @@ async fn a_crashed_agent_is_reported_and_restarted() {
 async fn an_agent_that_goes_quiet_is_timed_out() {
     let h = Harness::start(SCRIPT, |c| c.agent.inactivity_timeout_secs = 0.5).await;
     h.wait_log("new mock-1").await;
+    // Open a follow-up window on mock-1 first so we can confirm the timeout clears it.
+    assert_eq!(answer(&h.ask("turn", false).await), "turn 1 in mock-1");
+    assert!(h.status().await.follow_up_secs.is_some());
+
     let started = Instant::now();
     let reply = h.ask("slow", false).await;
     let (reason, message) = failure(&reply);
@@ -398,8 +425,11 @@ async fn an_agent_that_goes_quiet_is_timed_out() {
     assert!(message.contains("sent nothing"), "{message}");
     assert!(started.elapsed() < Duration::from_secs(3));
     assert_eq!(h.log_count("cancel mock-1"), 1);
-    // The agent answered the cancel, so it stays.
-    assert_eq!(answer(&h.ask("plain", false).await), "Hello from the mock.");
+    // The timed-out session is closed and the follow-up window cleared.
+    assert_eq!(h.status().await.follow_up_secs, None);
+    h.wait_log("close mock-1").await;
+    // The agent answered the cancel, so it stays up and opens a fresh session.
+    assert_eq!(answer(&h.ask("turn", false).await), "turn 1 in mock-2");
     assert_eq!(h.log_count("start"), 1);
     h.stop().await;
 }
