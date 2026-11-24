@@ -453,9 +453,11 @@ pub fn tool_call_id(value: &Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// The shell command a permission request is about, if it is one.
-pub fn permission_command(params: &Value) -> Option<String> {
-    let call = params.get("toolCall")?;
+/// Maximum characters in a live progress status line shown in the notification.
+const PROGRESS_STATUS_CHARS: usize = 80;
+
+/// The shell command on a `toolCall` object, if it is one.
+pub fn tool_command(call: &Value) -> Option<String> {
     for key in ["rawInput", "args"] {
         if let Some(line) = call
             .get(key)
@@ -476,6 +478,154 @@ pub fn permission_command(params: &Value) -> Option<String> {
         return call.get("title").and_then(Value::as_str).map(String::from);
     }
     None
+}
+
+/// The shell command a permission request is about, if it is one.
+pub fn permission_command(params: &Value) -> Option<String> {
+    tool_command(params.get("toolCall")?)
+}
+
+/// A short, sanitized progress summary for a `tool_call`, `tool_call_update`,
+/// or `request_permission` `toolCall` object. Never exposes raw shell arguments.
+pub fn tool_progress(tool_call: &Value) -> Option<String> {
+    let is_update =
+        tool_call.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call_update");
+    if is_update
+        && matches!(
+            tool_call.get("status").and_then(Value::as_str),
+            Some("completed" | "failed" | "cancelled")
+        )
+    {
+        return None;
+    }
+
+    let summary = ["rawInput", "args"]
+        .into_iter()
+        .find_map(|key| {
+            tool_call
+                .get(key)
+                .and_then(|input| input.get("toolSummary"))
+                .and_then(Value::as_str)
+        })
+        .and_then(|s| sanitize_status(s, PROGRESS_STATUS_CHARS));
+    if summary.is_some() {
+        return summary;
+    }
+
+    let raw_title = tool_call.get("title").and_then(Value::as_str);
+    if is_update && raw_title.is_none() {
+        return None;
+    }
+
+    let kind = tool_call
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("other");
+    if kind == "execute" {
+        let label = tool_command(tool_call)
+            .as_deref()
+            .and_then(command_program)
+            .map(|prog| format!("Running {prog}…"))
+            .unwrap_or_else(|| "Running command…".to_string());
+        return sanitize_status(&label, PROGRESS_STATUS_CHARS);
+    }
+
+    if let Some(title) = raw_title
+        && let Some(clean) = sanitize_status(title, PROGRESS_STATUS_CHARS)
+        && !clean.eq_ignore_ascii_case(kind)
+    {
+        return Some(clean);
+    }
+
+    if is_update {
+        return None;
+    }
+
+    match kind {
+        "read" => Some("Reading file…".to_string()),
+        "edit" => Some("Editing file…".to_string()),
+        "delete" => Some("Deleting file…".to_string()),
+        "move" => Some("Moving file…".to_string()),
+        "search" => Some("Searching…".to_string()),
+        "fetch" => Some("Fetching page…".to_string()),
+        "think" => None,
+        _ => Some("Working…".to_string()),
+    }
+}
+
+/// Extract a clean program basename from a command line, skipping leading
+/// `KEY=value` assignments and `env` wrappers, and ignoring generic shells.
+fn command_program(line: &str) -> Option<&str> {
+    let mut words = line.split_whitespace();
+    let mut skip_next = false;
+    for raw in &mut words {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        let word = raw.trim_matches(|c| matches!(c, '\'' | '"'));
+        if word.is_empty() {
+            continue;
+        }
+        if let Some((name, _)) = word.split_once('=')
+            && !name.is_empty()
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            continue;
+        }
+        let base = word.rsplit('/').next().unwrap_or(word);
+        if base == "env" {
+            continue;
+        }
+        if base.starts_with('-') {
+            if matches!(base, "-u" | "-C" | "-S") {
+                skip_next = true;
+            }
+            continue;
+        }
+        if matches!(base, "sh" | "bash" | "zsh" | "dash" | "fish") {
+            return None;
+        }
+        if base
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Some(base);
+        }
+        return None;
+    }
+    None
+}
+
+fn sanitize_status(text: &str, max_chars: usize) -> Option<String> {
+    let mut out = String::with_capacity(text.len().min(max_chars));
+    let mut pending_space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !out.is_empty() {
+                pending_space = true;
+            }
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(c);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    if out.chars().count() <= max_chars {
+        Some(out)
+    } else {
+        let mut cut: String = out.chars().take(max_chars.saturating_sub(1)).collect();
+        cut.push('…');
+        Some(cut)
+    }
 }
 
 /// The answer to a permission request: the first option of `kind`, or a
@@ -553,6 +703,110 @@ mod tests {
         assert_eq!(tool_call_id(&params["toolCall"]), Some("call_1"));
         assert_eq!(tool_call_id(&json!({"toolCallId": ""})), None);
         assert_eq!(tool_call_id(&json!({"kind": "read"})), None);
+    }
+
+    #[test]
+    fn formats_clean_tool_progress_summaries() {
+        // Prefers toolSummary over raw CommandLine/title.
+        let params = agy_permission();
+        assert_eq!(
+            tool_progress(&params["toolCall"]).as_deref(),
+            Some("Check the version")
+        );
+
+        // Execute without toolSummary extracts only the program basename.
+        assert_eq!(
+            tool_progress(&json!({
+                "sessionUpdate": "tool_call",
+                "kind": "execute",
+                "title": "hyprctl version"
+            }))
+            .as_deref(),
+            Some("Running hyprctl…")
+        );
+        assert_eq!(
+            tool_progress(&json!({
+                "sessionUpdate": "tool_call",
+                "kind": "execute",
+                "rawInput": {"CommandLine": "FOO=1 /nix/store/abc/bin/curl -H 'Auth: secret' https://example.org"}
+            }))
+            .as_deref(),
+            Some("Running curl…")
+        );
+        for shell in ["bash -lc 'echo hi'", "env sh -c 'date'"] {
+            assert_eq!(
+                tool_progress(&json!({
+                    "sessionUpdate": "tool_call",
+                    "kind": "execute",
+                    "rawInput": {"CommandLine": shell}
+                }))
+                .as_deref(),
+                Some("Running command…"),
+                "{shell}"
+            );
+        }
+
+        // Non-execute kinds use title or fall back to friendly labels.
+        assert_eq!(
+            tool_progress(
+                &json!({"sessionUpdate": "tool_call", "kind": "edit", "title": "Edit notes.md"})
+            )
+            .as_deref(),
+            Some("Edit notes.md")
+        );
+        assert_eq!(
+            tool_progress(&json!({"sessionUpdate": "tool_call", "kind": "read"})).as_deref(),
+            Some("Reading file…")
+        );
+        assert_eq!(
+            tool_progress(&json!({"sessionUpdate": "tool_call", "kind": "search"})).as_deref(),
+            Some("Searching…")
+        );
+        assert_eq!(
+            tool_progress(&json!({"sessionUpdate": "tool_call", "kind": "think"})),
+            None
+        );
+
+        // Collapses whitespace/control chars and truncates at 80 chars.
+        let noisy = format!("Check\t\n\u{7}{}", "ä".repeat(90));
+        let cleaned = tool_progress(&json!({
+            "sessionUpdate": "tool_call",
+            "kind": "read",
+            "rawInput": {"toolSummary": noisy}
+        }))
+        .unwrap();
+        assert_eq!(cleaned.chars().count(), PROGRESS_STATUS_CHARS);
+        assert!(cleaned.starts_with("Check ä"), "{cleaned}");
+        assert!(cleaned.ends_with('…'), "{cleaned}");
+
+        // tool_call_update ignores terminal statuses and bare in_progress pings.
+        assert_eq!(
+            tool_progress(&json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "completed",
+                "title": "Done"
+            })),
+            None
+        );
+        assert_eq!(
+            tool_progress(&json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "in_progress"
+            })),
+            None
+        );
+        assert_eq!(
+            tool_progress(&json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "in_progress",
+                "rawInput": {"toolSummary": "Fetch forecast"}
+            }))
+            .as_deref(),
+            Some("Fetch forecast")
+        );
     }
 
     #[test]

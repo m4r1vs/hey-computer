@@ -69,6 +69,16 @@ pub enum Step {
     /// cancelled, it ends the turn with no text, as agy does.
     Permission {
         command: String,
+        #[serde(default)]
+        summary: Option<String>,
+    },
+    /// A non-permission tool call (`tool_call` followed by completed `tool_call_update`).
+    ToolCall {
+        kind: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        summary: Option<String>,
     },
     /// "turn N in SESSION", for follow-up tests.
     TurnInfo,
@@ -366,17 +376,21 @@ impl Mock {
                     cancel.notified().await;
                     return cancelled();
                 }
-                Step::Permission { command } => {
+                Step::Permission { command, summary } => {
                     let call = format!("call_{}", self.next_request.load(Ordering::Relaxed));
+                    let mut input = json!({"CommandLine": command, "WaitMsBeforeAsync": 5000});
+                    if let Some(summary) = &summary {
+                        input["toolSummary"] = json!(summary);
+                    }
                     let tool = json!({
                         "sessionUpdate": "tool_call",
                         "toolCallId": call,
                         "name": "run_command",
-                        "args": {"CommandLine": command, "WaitMsBeforeAsync": 5000},
+                        "args": input,
                         "status": "pending",
                         "kind": "execute",
                         "title": command,
-                        "rawInput": {"CommandLine": command, "WaitMsBeforeAsync": 5000},
+                        "rawInput": input,
                     });
                     self.update(&session, tool.clone());
                     let request = self
@@ -425,6 +439,32 @@ impl Mock {
                         self.respond(&id, json!({"stopReason": "end_turn"}));
                         return;
                     }
+                }
+                Step::ToolCall {
+                    kind,
+                    title,
+                    summary,
+                } => {
+                    let call =
+                        format!("call_{}", self.next_request.fetch_add(1, Ordering::Relaxed));
+                    let mut tool = json!({
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": call,
+                        "status": "in_progress",
+                        "kind": kind,
+                    });
+                    if let Some(title) = title {
+                        tool["title"] = json!(title);
+                    }
+                    if let Some(summary) = summary {
+                        tool["rawInput"] = json!({"toolSummary": summary});
+                        tool["args"] = json!({"toolSummary": summary});
+                    }
+                    self.update(&session, tool);
+                    self.update(
+                        &session,
+                        json!({"sessionUpdate": "tool_call_update", "toolCallId": call, "status": "completed"}),
+                    );
                 }
                 Step::Exit(code) => {
                     self.log.line(&format!("exit {code}"));

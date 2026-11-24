@@ -32,6 +32,8 @@ const PROGRESS_EXPIRE_MS: u32 = 120_000;
 const CANCELLED_EXPIRE_MS: u32 = 2_000;
 /// The request echoed in the progress popup is cut here.
 const REQUEST_PREVIEW_CHARS: usize = 160;
+/// Minimum interval between live progress notification replacements.
+const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 /// A viewer that exits with an error within this long is reported as
 /// failed; one that is still running then has its window up.
 const VIEWER_GRACE: Duration = Duration::from_millis(1500);
@@ -42,6 +44,8 @@ const VIEWER_STDERR_KEPT: usize = 400;
 pub enum Presentation {
     /// A request has started.
     Progress { id: u64, request: String },
+    /// Mid-turn status update for an in-flight request (e.g. a tool call).
+    ProgressUpdate { id: u64, status: String },
     Answer {
         id: u64,
         text: String,
@@ -829,24 +833,67 @@ pub struct Desktop {
 
 impl Desktop {
     pub fn spawn(config: &PresentConfig, answers_dir: PathBuf) -> Arc<Self> {
-        Self::spawn_with_grace(config, answers_dir, VIEWER_GRACE)
+        Self::spawn_with_options(config, answers_dir, VIEWER_GRACE, PROGRESS_UPDATE_INTERVAL)
     }
 
-    fn spawn_with_grace(
+    fn spawn_with_options(
         config: &PresentConfig,
         answers_dir: PathBuf,
         viewer_grace: Duration,
+        progress_interval: Duration,
     ) -> Arc<Self> {
         let (queue, mut items) = mpsc::unbounded_channel();
         let mut worker = Worker {
             config: config.clone(),
             answers_dir,
             progress: None,
+            pending: None,
             watchers: JoinSet::new(),
             viewer_grace,
+            progress_interval,
         };
         let task = tokio::spawn(async move {
-            while let Some(item) = items.recv().await {
+            let mut deferred: Option<Presentation> = None;
+            loop {
+                let next = if let Some(item) = deferred.take() {
+                    Some(item)
+                } else {
+                    tokio::select! {
+                        biased;
+                        item = items.recv() => item,
+                        () = sleep_until_due(worker.pending_due()) => {
+                            worker.flush_pending().await;
+                            continue;
+                        }
+                    }
+                };
+                let Some(item) = next else {
+                    break;
+                };
+
+                if let Presentation::ProgressUpdate { id, status } = item {
+                    let mut latest = Some((id, status));
+                    loop {
+                        match items.try_recv() {
+                            Ok(Presentation::ProgressUpdate { id, status }) => {
+                                latest = Some((id, status));
+                            }
+                            Ok(other) => {
+                                // A queued Answer, Failure, or newer Progress
+                                // preempts any still-queued ProgressUpdate at once.
+                                deferred = Some(other);
+                                latest = None;
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if let Some((id, status)) = latest {
+                        worker.progress_update(id, status).await;
+                    }
+                    continue;
+                }
+
                 worker.show(item).await;
             }
             // Let any viewer started in the last VIEWER_GRACE finish its
@@ -880,14 +927,54 @@ impl Presenter for Desktop {
     }
 }
 
+enum ProgressSlot {
+    /// Active "Thinking…" popup belonging to `request_id`.
+    Active {
+        request_id: u64,
+        notif_id: u32,
+        /// Already truncated & Pango-escaped request preview.
+        request_body: String,
+        last_status: Option<String>,
+        last_sent: Option<Instant>,
+    },
+    /// "Request replaced" popup id kept from a `Superseded` turn; only the
+    /// next `Progress` may reuse it (never a `ProgressUpdate`).
+    Reusable(u32),
+}
+
+struct PendingUpdate {
+    request_id: u64,
+    status: String,
+    due: Instant,
+}
+
+async fn sleep_until_due(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn format_progress_body(request_body: &str, status: &str) -> String {
+    let status = escape_markup(status);
+    if request_body.is_empty() {
+        format!("<b>{status}</b>")
+    } else {
+        format!("{request_body}\n<b>{status}</b>")
+    }
+}
+
 struct Worker {
     config: PresentConfig,
     answers_dir: PathBuf,
     /// The "Thinking…" popup on screen, which the next popup replaces.
-    progress: Option<u32>,
+    progress: Option<ProgressSlot>,
+    /// Throttled trailing-edge progress update waiting for its interval.
+    pending: Option<PendingUpdate>,
     /// Bounded early-exit watchers for recently launched viewers.
     watchers: JoinSet<()>,
     viewer_grace: Duration,
+    progress_interval: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -897,25 +984,50 @@ pub enum Urgency {
 }
 
 impl Worker {
+    fn pending_due(&self) -> Option<Instant> {
+        self.pending.as_ref().map(|p| p.due)
+    }
+
+    fn take_progress_id(&mut self) -> Option<u32> {
+        match self.progress.take() {
+            Some(ProgressSlot::Active { notif_id, .. })
+            | Some(ProgressSlot::Reusable(notif_id)) => Some(notif_id),
+            None => None,
+        }
+    }
+
     async fn show(&mut self, item: Presentation) {
         while self.watchers.try_join_next().is_some() {}
+        self.pending = None;
         match item {
-            Presentation::Progress { request, .. } => {
+            Presentation::Progress { id, request } => {
                 if !self.config.progress {
                     return;
                 }
-                let body = escape_markup(&truncate(request.trim(), REQUEST_PREVIEW_CHARS));
+                let request_body = escape_markup(&truncate(request.trim(), REQUEST_PREVIEW_CHARS));
                 // A superseded request's popup is reused for the next one.
-                let replaces = self.progress.take();
-                self.progress = self
+                let replaces = self.take_progress_id();
+                if let Some(notif_id) = self
                     .notify(
                         "Thinking…",
-                        &body,
+                        &request_body,
                         Urgency::Low,
                         PROGRESS_EXPIRE_MS,
                         replaces,
                     )
-                    .await;
+                    .await
+                {
+                    self.progress = Some(ProgressSlot::Active {
+                        request_id: id,
+                        notif_id,
+                        request_body,
+                        last_status: None,
+                        last_sent: None,
+                    });
+                }
+            }
+            Presentation::ProgressUpdate { id, status } => {
+                self.progress_update(id, status).await;
             }
             Presentation::Answer { id, text, denied } => self.answer(id, &text, &denied).await,
             Presentation::Failure {
@@ -926,7 +1038,7 @@ impl Worker {
                 // request shows none (one asked with `wait`). A superseded
                 // request's popup id is kept for the next progress popup,
                 // which then replaces this one in place.
-                if let Some(replaces) = self.progress.take() {
+                if let Some(replaces) = self.take_progress_id() {
                     let shown = self
                         .notify(
                             reason.headline(),
@@ -937,14 +1049,14 @@ impl Worker {
                         )
                         .await;
                     if reason == FailReason::Superseded {
-                        self.progress = shown;
+                        self.progress = shown.map(ProgressSlot::Reusable);
                     }
                 }
             }
             Presentation::Failure {
                 reason, message, ..
             } => {
-                let replaces = self.progress.take();
+                let replaces = self.take_progress_id();
                 self.notify(
                     reason.headline(),
                     &escape_markup(&message),
@@ -957,8 +1069,104 @@ impl Worker {
         }
     }
 
+    async fn progress_update(&mut self, id: u64, status: String) {
+        if !self.config.progress || status.is_empty() {
+            return;
+        }
+        let Some(ProgressSlot::Active {
+            request_id,
+            last_status,
+            last_sent,
+            ..
+        }) = &self.progress
+        else {
+            return;
+        };
+        if *request_id != id {
+            return;
+        }
+        if last_status.as_deref() == Some(status.as_str()) {
+            self.pending = None;
+            return;
+        }
+        if let Some(last) = *last_sent {
+            let due = last + self.progress_interval;
+            if Instant::now() < due {
+                self.pending = Some(PendingUpdate {
+                    request_id: id,
+                    status,
+                    due,
+                });
+                return;
+            }
+        }
+        self.pending = None;
+        self.send_progress_update(id, status).await;
+    }
+
+    async fn flush_pending(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        let matches_active = matches!(
+            &self.progress,
+            Some(ProgressSlot::Active {
+                request_id,
+                last_status,
+                ..
+            }) if *request_id == pending.request_id
+                && last_status.as_deref() != Some(pending.status.as_str())
+        );
+        if matches_active {
+            self.send_progress_update(pending.request_id, pending.status)
+                .await;
+        }
+    }
+
+    async fn send_progress_update(&mut self, id: u64, status: String) {
+        let Some(ProgressSlot::Active {
+            request_id,
+            notif_id,
+            request_body,
+            ..
+        }) = &self.progress
+        else {
+            return;
+        };
+        if *request_id != id {
+            return;
+        }
+        let replaces = *notif_id;
+        let body = format_progress_body(request_body, &status);
+        let shown = self
+            .notify(
+                "Thinking…",
+                &body,
+                Urgency::Low,
+                PROGRESS_EXPIRE_MS,
+                Some(replaces),
+            )
+            .await;
+        let now = Instant::now();
+        if let Some(ProgressSlot::Active {
+            request_id,
+            notif_id,
+            last_status,
+            last_sent,
+            ..
+        }) = &mut self.progress
+            && *request_id == id
+        {
+            *last_sent = Some(now);
+            if let Some(new_id) = shown {
+                *notif_id = new_id;
+                *last_status = Some(status);
+            }
+        }
+    }
+
     async fn answer(&mut self, id: u64, text: &str, denied: &[String]) {
-        let replaces = self.progress.take();
+        let replaces = self.take_progress_id();
         let refused = if denied.is_empty() {
             String::new()
         } else {
@@ -1726,8 +1934,12 @@ mod tests {
             &calls,
             &["/bin/sh", "-c", "sleep 0.35; echo late >&2; exit 2", "sh"],
         );
-        let desktop =
-            Desktop::spawn_with_grace(&config, dir.join("answers"), Duration::from_millis(150));
+        let desktop = Desktop::spawn_with_options(
+            &config,
+            dir.join("answers"),
+            Duration::from_millis(150),
+            PROGRESS_UPDATE_INTERVAL,
+        );
         desktop.present(Presentation::Answer {
             id: 1,
             text: "# Heading\n\nbody".to_string(),
@@ -1932,5 +2144,285 @@ mod tests {
             disarm_html("`![x](data:image/svg+xml,x)` and `![ref]`\n\n[ref]: https://x/a.png\n"),
             "`![x](data:image/svg+xml,x)` and `![ref]`\n\n[ref]: https://x/a.png\n"
         );
+    }
+
+    #[tokio::test]
+    async fn progress_updates_replace_in_place_and_escape_markup() {
+        let dir = std::env::temp_dir().join(format!("hc-prog-basic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let config = recording_config(&calls, &[]);
+        let desktop = Desktop::spawn_with_options(
+            &config,
+            dir.join("answers"),
+            VIEWER_GRACE,
+            Duration::from_millis(120),
+        );
+        desktop.present(Presentation::Progress {
+            id: 1,
+            request: "check <lights>".to_string(),
+        });
+        desktop.present(Presentation::ProgressUpdate {
+            id: 1,
+            status: "Check <a&b>".to_string(),
+        });
+        // Let the immediate update run before sending Answer.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .contains("Check &lt;a&amp;b&gt;")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        desktop.present(Presentation::Answer {
+            id: 1,
+            text: "Done.".to_string(),
+            denied: vec![],
+        });
+        desktop.finish().await;
+        let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(recorded.contains("--urgency=low"), "{recorded}");
+        assert!(recorded.contains("--replace-id=7"), "{recorded}");
+        assert!(
+            recorded.contains("check &lt;lights&gt;\n<b>Check &lt;a&amp;b&gt;</b>"),
+            "{recorded}"
+        );
+        assert!(recorded.contains("Answer Done."), "{recorded}");
+    }
+
+    #[tokio::test]
+    async fn progress_updates_are_throttled_and_coalesced() {
+        let dir = std::env::temp_dir().join(format!("hc-prog-throttle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let config = recording_config(&calls, &[]);
+        let desktop = Desktop::spawn_with_options(
+            &config,
+            dir.join("answers"),
+            VIEWER_GRACE,
+            Duration::from_millis(150),
+        );
+        desktop.present(Presentation::Progress {
+            id: 1,
+            request: "work".to_string(),
+        });
+        desktop.present(Presentation::ProgressUpdate {
+            id: 1,
+            status: "step 1".to_string(),
+        });
+        // Wait for step 1 to be sent immediately.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .contains("step 1")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Burst within the throttle window: only the last status should flush.
+        desktop.present(Presentation::ProgressUpdate {
+            id: 1,
+            status: "step 2".to_string(),
+        });
+        desktop.present(Presentation::ProgressUpdate {
+            id: 1,
+            status: "step 3".to_string(),
+        });
+        desktop.present(Presentation::ProgressUpdate {
+            id: 1,
+            status: "step 4".to_string(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .contains("step 4")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        desktop.finish().await;
+        let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(recorded.contains("<b>step 1</b>"), "{recorded}");
+        assert!(!recorded.contains("step 2"), "{recorded}");
+        assert!(!recorded.contains("step 3"), "{recorded}");
+        assert!(recorded.contains("<b>step 4</b>"), "{recorded}");
+    }
+
+    #[tokio::test]
+    async fn progress_updates_never_overwrite_terminal_or_resurrect() {
+        let dir = std::env::temp_dir().join(format!("hc-prog-safe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let config = recording_config(&calls, &[]);
+        let desktop = Desktop::spawn_with_options(
+            &config,
+            dir.join("answers"),
+            VIEWER_GRACE,
+            Duration::from_millis(200),
+        );
+        desktop.present(Presentation::Progress {
+            id: 1,
+            request: "first".to_string(),
+        });
+        desktop.present(Presentation::ProgressUpdate {
+            id: 1,
+            status: "step 1".to_string(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .contains("step 1")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Schedule a throttled update, then preempt with Answer and a late update.
+        desktop.present(Presentation::ProgressUpdate {
+            id: 1,
+            status: "should be dropped".to_string(),
+        });
+        desktop.present(Presentation::Answer {
+            id: 1,
+            text: "Finished.".to_string(),
+            denied: vec![],
+        });
+        desktop.present(Presentation::ProgressUpdate {
+            id: 1,
+            status: "late zombie".to_string(),
+        });
+        // Superseded keeps Reusable(id), which must NOT accept ProgressUpdate.
+        desktop.present(Presentation::Progress {
+            id: 2,
+            request: "second".to_string(),
+        });
+        desktop.present(Presentation::Failure {
+            id: 2,
+            reason: FailReason::Superseded,
+            message: "replaced".to_string(),
+        });
+        desktop.present(Presentation::ProgressUpdate {
+            id: 2,
+            status: "after superseded".to_string(),
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        desktop.finish().await;
+        let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(recorded.contains("Finished."), "{recorded}");
+        assert!(!recorded.contains("should be dropped"), "{recorded}");
+        assert!(!recorded.contains("late zombie"), "{recorded}");
+        assert!(!recorded.contains("after superseded"), "{recorded}");
+    }
+
+    #[tokio::test]
+    async fn progress_updates_respect_missing_print_id_and_transient_errors() {
+        // Without --print-id output, progress updates must not spam new popups.
+        let dir = std::env::temp_dir().join(format!("hc-prog-noid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let config = PresentConfig {
+            notifier: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("echo \"$*\" >> '{}'", calls.display()),
+                "sh".to_string(),
+            ],
+            ..PresentConfig::default()
+        };
+        let desktop = Desktop::spawn_with_options(
+            &config,
+            dir.join("answers"),
+            VIEWER_GRACE,
+            Duration::from_millis(50),
+        );
+        desktop.present(Presentation::Progress {
+            id: 1,
+            request: "hi".to_string(),
+        });
+        desktop.present(Presentation::ProgressUpdate {
+            id: 1,
+            status: "Reading file…".to_string(),
+        });
+        desktop.present(Presentation::Answer {
+            id: 1,
+            text: "ok".to_string(),
+            denied: vec![],
+        });
+        desktop.finish().await;
+        let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+        assert!(!recorded.contains("Reading file…"), "{recorded}");
+        assert!(recorded.contains("Thinking…"), "{recorded}");
+        assert!(recorded.contains("Answer ok"), "{recorded}");
+
+        // A transient notifier failure on ProgressUpdate must keep notif_id for Answer.
+        let calls2 = dir.join("notify2.log");
+        let count_file = dir.join("count");
+        let config2 = PresentConfig {
+            notifier: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "n=$(cat '{}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{}'; echo \"$*\" >> '{}'; if [ \"$n\" -eq 2 ]; then exit 1; fi; echo 7",
+                    count_file.display(),
+                    count_file.display(),
+                    calls2.display()
+                ),
+                "sh".to_string(),
+            ],
+            ..PresentConfig::default()
+        };
+        let desktop2 = Desktop::spawn_with_options(
+            &config2,
+            dir.join("answers2"),
+            VIEWER_GRACE,
+            Duration::from_millis(50),
+        );
+        desktop2.present(Presentation::Progress {
+            id: 1,
+            request: "hi".to_string(),
+        });
+        desktop2.present(Presentation::ProgressUpdate {
+            id: 1,
+            status: "Running curl…".to_string(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if std::fs::read_to_string(&calls2)
+                .unwrap_or_default()
+                .contains("Running curl…")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        desktop2.present(Presentation::Answer {
+            id: 1,
+            text: "ok".to_string(),
+            denied: vec![],
+        });
+        desktop2.finish().await;
+        let recorded2 = std::fs::read_to_string(&calls2).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let last = recorded2.lines().last().unwrap_or("");
+        assert!(last.contains("Answer ok"), "{recorded2}");
+        assert!(last.contains("--replace-id=7"), "{recorded2}");
     }
 }

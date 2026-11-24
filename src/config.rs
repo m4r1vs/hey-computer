@@ -117,8 +117,8 @@ impl Default for Instructions {
 pub struct Present {
     /// Master switch for every notification, errors included.
     pub notifications: bool,
-    /// A "Thinking…" notification while a request runs, replaced in place by
-    /// the answer.
+    /// A "Thinking…" notification while a request runs (updated with tool
+    /// progress), replaced in place by the answer.
     pub progress: bool,
     /// An answer longer than this many characters goes to the viewer.
     pub max_chars: usize,

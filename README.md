@@ -42,10 +42,10 @@ ends, the answer is shown:
   `$XDG_RUNTIME_DIR/hey-computer/` (the newest 20 are kept), the viewer is
   started with it, and a one-line notification names it.
 
-While a request runs, a low-urgency "Thinking…" notification is shown and
-then replaced in place by the answer. Failures (agent down, timeout, a refused
-privileged command, an empty answer) are a notification that says what
-happened.
+While a request runs, a low-urgency "Thinking…" notification is shown, updated
+in place with throttled summaries of tool calls as the agent works, and then
+replaced by the answer. Failures (agent down, timeout, a refused privileged
+command, an empty answer) are a notification that says what happened.
 
 **Conversations.** A request within 90 s of the previous answer continues the
 same conversation, so "and the day after?" works; a later one starts afresh.
@@ -246,7 +246,7 @@ memory_max_chars = 4000             # character cap for memory_file (1..=32768)
 
 [present]
 notifications = true                # every notification, errors included
-progress = true                     # "Thinking…" while a request runs
+progress = true                     # "Thinking…" while a request runs (with live tool progress)
 max_chars = 230                     # longer answers go to the viewer
 max_lines = 4                       # so do answers with more lines
 notifier = ["notify-send"]          # called with notify-send's options

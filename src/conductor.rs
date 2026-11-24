@@ -335,6 +335,13 @@ struct Budgets {
     max_tool_calls: Option<usize>,
 }
 
+struct TurnContext<'a> {
+    policy: &'a Policy,
+    budgets: Budgets,
+    progress: Option<&'a Arc<dyn Presenter>>,
+    id: u64,
+}
+
 enum TurnAbort {
     Quiet,
     TurnTimeout(Duration),
@@ -732,16 +739,13 @@ impl Conductor {
             max_tool_calls: (self.config.agent.max_tool_calls > 0)
                 .then_some(self.config.agent.max_tool_calls),
         };
-        let end = turn(
-            &mut live,
-            &session,
-            &ask.text,
-            interrupts,
-            &self.policy,
+        let ctx = TurnContext {
+            policy: &self.policy,
             budgets,
-            ask.id,
-        )
-        .await;
+            progress: matches!(ask.sink, Sink::Present).then_some(&self.presenter),
+            id: ask.id,
+        };
+        let end = turn(&mut live, &session, &ask.text, interrupts, &ctx).await;
 
         if end.alive {
             self.live = Some(live);
@@ -1065,10 +1069,11 @@ async fn turn(
     session: &str,
     text: &str,
     interrupts: Interrupts<'_>,
-    policy: &Policy,
-    budgets: Budgets,
-    id: u64,
+    ctx: &TurnContext<'_>,
 ) -> TurnEnd {
+    let policy = ctx.policy;
+    let budgets = ctx.budgets;
+    let id = ctx.id;
     let started = Instant::now();
     let mut response = live.conn.start_call(
         "session/prompt",
@@ -1078,12 +1083,23 @@ async fn turn(
     let mut denied: Vec<String> = Vec::new();
     let mut tools: Vec<String> = Vec::new();
     let mut tracker = ToolTracker::default();
+    let mut last_progress: Option<String> = None;
     let mut first_text: Option<Duration> = None;
     let mut deadline = Instant::now() + budgets.inactivity;
     let turn_deadline = budgets.max_turn.and_then(|d| started.checked_add(d));
     let turn_sleep = sleep_until(turn_deadline);
     tokio::pin!(turn_sleep);
     let at = || started.elapsed().as_secs_f64();
+    let emit_progress = |last: &mut Option<String>, status: Option<String>| {
+        let (Some(presenter), Some(status)) = (ctx.progress, status) else {
+            return;
+        };
+        if last.as_deref() == Some(status.as_str()) {
+            return;
+        }
+        *last = Some(status.clone());
+        presenter.present(Presentation::ProgressUpdate { id, status });
+    };
 
     let ended = loop {
         // Events first: the reader queues every update before it hands over
@@ -1126,22 +1142,38 @@ async fn turn(
                 if let Some(chunk) = acp::chunk_text(&update) {
                     first_text.get_or_insert_with(|| started.elapsed());
                     answer.push_str(chunk);
-                } else if update.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call")
-                    && tracker.record_update(acp::tool_call_id(&update))
-                {
-                    let kind = update
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .unwrap_or("other")
-                        .to_string();
-                    tracing::info!("request {id}: +{:.2} s tool call ({kind})", at());
-                    let title = update.get("title").and_then(Value::as_str).unwrap_or("");
-                    tracing::debug!("request {id}: tool call {title}");
-                    tools.push(kind);
-                    if let Some(limit) = budgets.max_tool_calls
-                        && tracker.count() > limit
-                    {
-                        break Err(TurnAbort::ToolLimit(limit));
+                } else {
+                    match update.get("sessionUpdate").and_then(Value::as_str) {
+                        Some("tool_call") => {
+                            if tracker.record_update(acp::tool_call_id(&update)) {
+                                let kind = update
+                                    .get("kind")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("other")
+                                    .to_string();
+                                tracing::info!("request {id}: +{:.2} s tool call ({kind})", at());
+                                let title =
+                                    update.get("title").and_then(Value::as_str).unwrap_or("");
+                                tracing::debug!("request {id}: tool call {title}");
+                                tools.push(kind);
+                                if let Some(limit) = budgets.max_tool_calls
+                                    && tracker.count() > limit
+                                {
+                                    break Err(TurnAbort::ToolLimit(limit));
+                                }
+                            }
+                            let will_deny = acp::tool_command(&update)
+                                .as_deref()
+                                .and_then(|c| policy.denied_word(c))
+                                .is_some();
+                            if !will_deny {
+                                emit_progress(&mut last_progress, acp::tool_progress(&update));
+                            }
+                        }
+                        Some("tool_call_update") => {
+                            emit_progress(&mut last_progress, acp::tool_progress(&update));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1181,6 +1213,10 @@ async fn turn(
                     if let Some(command) = &command {
                         tracing::debug!("request {id}: allowed {command:?}");
                     }
+                    emit_progress(
+                        &mut last_progress,
+                        params.get("toolCall").and_then(acp::tool_progress),
+                    );
                     acp::permission_outcome(&params, &["allow_once", "allow_always"])
                 };
                 live.conn.respond(request, outcome);

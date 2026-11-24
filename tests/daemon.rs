@@ -897,3 +897,82 @@ async fn zero_budgets_disable_turn_and_tool_call_limits() {
     assert_eq!(h.log_count("permission allow_once echo "), 3);
     h.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_wait_tool_calls_emit_progress_updates() {
+    let script = r##"{
+      "turns": [
+        {
+          "match": "check",
+          "steps": [
+            {"tool_call": {"kind": "read", "title": "Read today's note"}},
+            {"permission": {"command": "hyprctl version", "summary": "Check Hyprland version"}},
+            {"chunk": "All good."}
+          ]
+        }
+      ],
+      "default": ["echo"]
+    }"##;
+
+    let h = Harness::start(script, |_| {}).await;
+    h.wait_log("new mock-1").await;
+
+    let (id, _client) = ipc::ask(&h.socket, "check desktop", false, false)
+        .await
+        .unwrap();
+    let items = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|item| matches!(item, Presentation::Answer { .. }))
+        })
+        .await
+        .expect("answer presented");
+    assert_eq!(
+        items,
+        vec![
+            Presentation::Progress {
+                id,
+                request: "check desktop".to_string(),
+            },
+            Presentation::ProgressUpdate {
+                id,
+                status: "Read today's note".to_string(),
+            },
+            Presentation::ProgressUpdate {
+                id,
+                status: "Check Hyprland version".to_string(),
+            },
+            Presentation::Answer {
+                id,
+                text: "All good.".to_string(),
+                denied: vec![],
+            },
+        ]
+    );
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_wait_tool_calls_do_not_present_progress_updates() {
+    let script = r##"{
+      "turns": [
+        {
+          "match": "check",
+          "steps": [
+            {"tool_call": {"kind": "read", "title": "Read today's note"}},
+            {"permission": {"command": "hyprctl version", "summary": "Check Hyprland version"}},
+            {"chunk": "All good."}
+          ]
+        }
+      ],
+      "default": ["echo"]
+    }"##;
+
+    let h = Harness::start(script, |_| {}).await;
+    h.wait_log("new mock-1").await;
+    assert_eq!(answer(&h.ask("check desktop", false).await), "All good.");
+    assert!(h.recorder.items().is_empty());
+    h.stop().await;
+}
