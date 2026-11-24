@@ -90,28 +90,44 @@
 
   # Translate programs.hey-computer.mcp.servers into settings.mcp.<name>,
   # routing `{ file = "/abs/path"; }` entries into env_files / header_files so
-  # secrets never land in config.toml or /nix/store.
-  translateMcpKv = attrs: {
-    inline = lib.filterAttrs (_: v: builtins.isString v) attrs;
-    files = lib.mapAttrs (_: v: v.file) (lib.filterAttrs (_: v: builtins.isAttrs v && v ? file) attrs);
+  # secrets never land in config.toml or /nix/store. Tolerates explicit `null`
+  # fields emitted by Home Manager's `programs.mcp.servers.*` submodule.
+  translateMcpKv = attrs: let
+    entries =
+      if builtins.isAttrs attrs
+      then attrs
+      else {};
+  in {
+    inline = lib.filterAttrs (_: v: builtins.isString v) entries;
+    files = lib.mapAttrs (_: v: v.file) (
+      lib.filterAttrs (_: v: builtins.isAttrs v && v ? file && builtins.isString v.file) entries
+    );
   };
 
   translatedMcpServers =
     lib.mapAttrs (
       _: server: let
-        envSplit = translateMcpKv (server.env or {});
-        headerSplit = translateMcpKv (server.headers or {});
+        envSplit = translateMcpKv (server.env or null);
+        headerSplit = translateMcpKv (server.headers or null);
+        command = server.command or null;
+        args = server.args or null;
+        url = server.url or null;
+        transport = server.transport or null;
+        disabled = server.disabled or null;
+        enabledOpt = server.enabled or null;
         enabled =
-          if server ? disabled
-          then !server.disabled
-          else server.enabled or true;
+          if builtins.isBool disabled
+          then !disabled
+          else if builtins.isBool enabledOpt
+          then enabledOpt
+          else true;
       in
         {inherit enabled;}
-        // lib.optionalAttrs ((server.command or "") != "") {
-          inherit (server) command;
+        // lib.optionalAttrs (builtins.isString command && command != "") {
+          inherit command;
         }
-        // lib.optionalAttrs ((server.args or []) != []) {
-          inherit (server) args;
+        // lib.optionalAttrs (builtins.isList args && args != []) {
+          inherit args;
         }
         // lib.optionalAttrs (envSplit.inline != {}) {
           env = envSplit.inline;
@@ -119,11 +135,11 @@
         // lib.optionalAttrs (envSplit.files != {}) {
           env_files = envSplit.files;
         }
-        // lib.optionalAttrs ((server.url or "") != "") {
-          inherit (server) url;
+        // lib.optionalAttrs (builtins.isString url && url != "") {
+          inherit url;
         }
-        // lib.optionalAttrs ((server.transport or "") != "") {
-          inherit (server) transport;
+        // lib.optionalAttrs (builtins.isString transport && transport != "") {
+          inherit transport;
         }
         // lib.optionalAttrs (headerSplit.inline != {}) {
           headers = headerSplit.inline;

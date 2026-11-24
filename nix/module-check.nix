@@ -72,12 +72,25 @@
         desktop = true;
       };
     };
-    mcp.servers.demo = {
-      command = "/bin/true";
-      args = ["--stdio"];
-      env = {
-        PLAIN = "ok";
-        SECRET.file = "/run/secrets/nonexistent-in-sandbox";
+    mcp.servers = {
+      demo = {
+        command = "/bin/true";
+        args = ["--stdio"];
+        env = {
+          PLAIN = "ok";
+          SECRET.file = "/run/secrets/nonexistent-in-sandbox";
+        };
+      };
+      # Mirrors Home Manager's `programs.mcp.servers.*` submodule shape with explicit nulls.
+      hm_like = {
+        command = "/bin/true";
+        args = null;
+        env = null;
+        url = null;
+        headers = null;
+        transport = null;
+        disabled = null;
+        enabled = true;
       };
     };
   };
