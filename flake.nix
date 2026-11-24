@@ -62,7 +62,8 @@
 
         cargoLock.lockFile = ./Cargo.lock;
 
-        nativeBuildInputs = [pkgs.makeWrapper];
+        nativeBuildInputs = [pkgs.makeWrapper pkgs.pkg-config];
+        buildInputs = [pkgs.sqlite];
 
         postInstall = ''
           mkdir -p $out/share/hey-computer
@@ -136,6 +137,8 @@
       pkgs = pkgsFor system;
     in {
       default = pkgs.mkShell {
+        nativeBuildInputs = [pkgs.pkg-config];
+        buildInputs = [pkgs.sqlite];
         packages = with pkgs;
           [
             cargo

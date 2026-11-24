@@ -27,7 +27,7 @@ use crate::environment::{self, Paths};
 use crate::policy::Policy;
 use crate::present::{Presentation, Presenter};
 use crate::protocol::{AgentState, FailReason, Reply, Status};
-use crate::store::{self, LastAnswer};
+use crate::store::{self, Lane, NewTurn, Store, TurnStatus};
 
 /// initialize and session/new answer in about a second; this only catches an
 /// agent that hangs on start.
@@ -160,6 +160,7 @@ pub struct Handle {
     messages: mpsc::UnboundedSender<Message>,
     /// Set at shutdown; interrupts whatever the conductor is waiting on.
     stop: Arc<CancelToken>,
+    store: Option<Store>,
 }
 
 impl Handle {
@@ -192,6 +193,21 @@ impl Handle {
             }
             id
         };
+        if let Some(store) = &self.store {
+            store.create_turn(NewTurn {
+                id,
+                lane: Lane::Interactive,
+                status: TurnStatus::Queued,
+                profile: profile
+                    .as_deref()
+                    .filter(|p| *p != "default")
+                    .unwrap_or("")
+                    .to_string(),
+                created_at_ms: store::unix_timestamp_ms(),
+                request: text.clone(),
+                attachments: attachments.iter().map(LoadedAttachment::meta).collect(),
+            });
+        }
         let ask = Ask {
             id,
             text,
@@ -204,6 +220,14 @@ impl Handle {
         if let Err(mpsc::error::SendError(Message::Ask(ask))) =
             self.messages.send(Message::Ask(ask))
         {
+            if let Some(store) = &self.store {
+                store.finish_failed(
+                    id,
+                    FailReason::AgentDown,
+                    "the daemon is shutting down".to_string(),
+                    store::unix_timestamp_ms(),
+                );
+            }
             deliver(
                 None,
                 ask,
@@ -277,17 +301,22 @@ pub fn spawn_with_context(
     presenter: Arc<dyn Presenter>,
     context: Arc<dyn ContextProvider>,
 ) -> (Handle, JoinHandle<()>) {
-    spawn_inner(config, presenter, context, true)
+    spawn_with_store(config, presenter, context, None)
 }
 
-fn spawn_inner(
+/// Start the conductor task wired to a persistent SQLite [`Store`].
+pub fn spawn_with_store(
     config: Arc<Config>,
     presenter: Arc<dyn Presenter>,
     context: Arc<dyn ContextProvider>,
-    persist_last: bool,
+    store: Option<(Store, u64)>,
 ) -> (Handle, JoinHandle<()>) {
+    let (store, initial_last_id) = match store {
+        Some((s, id)) => (Some(s), id),
+        None => (None, 0),
+    };
     let shared = Arc::new(Mutex::new(Shared {
-        next_id: 0,
+        next_id: initial_last_id,
         latest: None,
         agent: AgentState::Down,
         running: None,
@@ -301,7 +330,7 @@ fn spawn_inner(
         config: Arc::clone(&config),
         presenter,
         context,
-        persist_last,
+        store: store.clone(),
         shared: Arc::clone(&shared),
         inbox,
         stop: Arc::clone(&stop),
@@ -319,6 +348,7 @@ fn spawn_inner(
             shared,
             messages,
             stop,
+            store,
         },
         task,
     )
@@ -346,6 +376,8 @@ struct Live {
 
 struct Conversation {
     session: String,
+    /// First turn id in this conversation (for threading in history.db).
+    conversation_id: u64,
     profile_name: Option<String>,
     model: String,
     thought_level: String,
@@ -358,7 +390,7 @@ struct Conductor {
     config: Arc<Config>,
     presenter: Arc<dyn Presenter>,
     context: Arc<dyn ContextProvider>,
-    persist_last: bool,
+    store: Option<Store>,
     policy: Policy,
     shared: Arc<Mutex<Shared>>,
     inbox: mpsc::UnboundedReceiver<Message>,
@@ -592,7 +624,7 @@ impl Conductor {
         // The agent is not running, so nothing it has open is deleted.
         environment::prune_history(&paths.agent_dir, self.config.agent.history_days);
         let argv = paths.agent_command(&self.config);
-        let (conn, incoming) = Connection::spawn(&argv, &paths.workspace)?;
+        let (conn, incoming) = Connection::spawn(&argv, &paths.workspace, &paths.state_dir)?;
         let init = conn
             .call(
                 "initialize",
@@ -748,24 +780,21 @@ impl Conductor {
             shared.running = None;
             shared.handled += 1;
         }
-        if self.persist_last
-            && let Outcome::Answer { text, denied } = &outcome
-        {
-            let record = LastAnswer {
-                version: store::SCHEMA_VERSION,
-                id: ask.id,
-                timestamp: store::unix_timestamp_secs(),
-                request: ask.text.clone(),
-                text: text.clone(),
-                denied: denied.clone(),
-                attachments: ask.attachments.iter().map(LoadedAttachment::meta).collect(),
-            };
-            if let Err(e) = self
-                .config
-                .state_dir()
-                .and_then(|dir| store::save_last(&dir, &record))
-            {
-                tracing::warn!("cannot save the last answer: {e:#}");
+        if let Some(store) = &self.store {
+            let now_ms = store::unix_timestamp_ms();
+            match &outcome {
+                Outcome::Answer { text, denied } => {
+                    store.finish_completed(ask.id, text.clone(), denied.clone(), now_ms);
+                }
+                Outcome::Failed {
+                    reason: reason @ (FailReason::Cancelled | FailReason::Superseded),
+                    message,
+                } => {
+                    store.finish_cancelled(ask.id, *reason, message.clone(), now_ms);
+                }
+                Outcome::Failed { reason, message } => {
+                    store.finish_failed(ask.id, *reason, message.clone(), now_ms);
+                }
             }
         }
         deliver(Some(&self.presenter), ask, outcome, profile);
@@ -830,7 +859,7 @@ impl Conductor {
             }
 
             let result = tokio::select! {
-                result = self.session_for(ask.new, ask.profile.as_deref()) => result,
+                result = self.session_for(ask.id, ask.new, ask.profile.as_deref()) => result,
                 reason = interrupts.wait() => return (cancelled(reason), fallback_profile),
             };
             match result {
@@ -858,6 +887,16 @@ impl Conductor {
             }
         };
         let used_profile = resolved.name.clone();
+        if let Some(store) = &self.store {
+            let conv_id = self.conversation.as_ref().map(|c| c.conversation_id);
+            store.mark_running(
+                ask.id,
+                session.clone(),
+                conv_id,
+                used_profile.clone().unwrap_or_default(),
+                store::unix_timestamp_ms(),
+            );
+        }
 
         let header = if self.config.context.is_enabled() {
             tokio::select! {
@@ -955,6 +994,7 @@ impl Conductor {
     /// switch applied), or a new one.
     async fn session_for(
         &mut self,
+        turn_id: u64,
         new: bool,
         requested: Option<&str>,
     ) -> Result<(String, ResolvedProfile), Outcome> {
@@ -1051,6 +1091,7 @@ impl Conductor {
         tracing::info!("new conversation");
         self.conversation = Some(Conversation {
             session: session.clone(),
+            conversation_id: turn_id,
             profile_name: resolved.name.clone(),
             model: resolved.model.clone(),
             thought_level: resolved.thought_level.clone(),
@@ -1724,7 +1765,8 @@ pub async fn ask_once(
     let mut config = config;
     config.agent.warm_start = false;
     let presenter: Arc<dyn Presenter> = crate::present::Recorder::new();
-    let (handle, task) = spawn_inner(Arc::new(config), presenter, Arc::new(SystemContext), false);
+    let (handle, task) =
+        spawn_with_store(Arc::new(config), presenter, Arc::new(SystemContext), None);
     let (tx, rx) = oneshot::channel();
     let id = handle.ask(text, true, profile, loaded, Sink::Client(tx));
     let reply = rx.await.context("the conductor stopped")?;

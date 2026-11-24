@@ -24,7 +24,31 @@ pub struct Config {
     pub permissions: Permissions,
     pub instructions: Instructions,
     pub context: Context,
+    pub history: History,
     pub present: Present,
+}
+
+/// Retention settings for the local SQLite history database (`history.db`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct History {
+    /// Delete terminal turns older than this many days. Zero disables age pruning.
+    pub retention_days: f64,
+    /// Maximum terminal turns retained in `history.db`. Zero disables the cap.
+    pub max_entries: usize,
+    /// Delete suppressed (e.g. `HEARTBEAT_OK`) turns older than this many days.
+    /// Zero disables separate suppressed pruning.
+    pub suppressed_days: f64,
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            retention_days: 90.0,
+            max_entries: 10_000,
+            suppressed_days: 7.0,
+        }
+    }
 }
 
 /// Named profile overriding `[agent]` settings on a per-request basis.
@@ -320,6 +344,14 @@ impl Config {
         if !days.is_finite() || !(0.0..=3650.0).contains(&days) {
             bail!("agent.history_days must be between 0 and 3650, not {days}");
         }
+        for (key, value) in [
+            ("history.retention_days", self.history.retention_days),
+            ("history.suppressed_days", self.history.suppressed_days),
+        ] {
+            if !value.is_finite() || !(0.0..=3650.0).contains(&value) {
+                bail!("{key} must be between 0 and 3650, not {value}");
+            }
+        }
         if self.agent.restart_delay_secs > MAX_RESTART_DELAY_SECS {
             bail!(
                 "agent.restart_delay_secs must be at most {MAX_RESTART_DELAY_SECS}, the longest the back-off waits"
@@ -444,14 +476,17 @@ impl Config {
         })
     }
 
-    /// `state_dir`, or `$XDG_STATE_HOME/hey-computer`.
+    /// `state_dir`, or `$HEY_COMPUTER_STATE_DIR`, or `$XDG_STATE_HOME/hey-computer`.
     pub fn state_dir(&self) -> Result<PathBuf> {
         if !self.state_dir.as_os_str().is_empty() {
             return Ok(self.state_dir.clone());
         }
+        if let Some(dir) = std::env::var_os("HEY_COMPUTER_STATE_DIR").filter(|d| !d.is_empty()) {
+            return Ok(PathBuf::from(dir));
+        }
         dirs::state_dir()
             .map(|d| d.join("hey-computer"))
-            .context("no state directory: set state_dir or XDG_STATE_HOME")
+            .context("no state directory: set state_dir, HEY_COMPUTER_STATE_DIR or XDG_STATE_HOME")
     }
 }
 

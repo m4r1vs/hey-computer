@@ -18,6 +18,7 @@ use crate::context::{ContextProvider, SystemContext};
 use crate::lines::{self, Line};
 use crate::present::{Desktop, Presenter};
 use crate::protocol::{self, FailReason, MAX_REQUEST_LINE, Reply, Request};
+use crate::store::Store;
 use crate::{environment, ipc};
 
 /// A client gets this long to send its request line.
@@ -78,11 +79,22 @@ pub async fn serve_with_context(
             return Err(e.context("preparing the agent's directory"));
         }
     };
+    let (store, initial_last_id) = match Store::open(&paths.state_dir, &config.history) {
+        Ok(opened) => opened,
+        Err(e) => {
+            let _ = std::fs::remove_file(socket);
+            return Err(e.context("opening the history database"));
+        }
+    };
     tracing::info!("agent directory {}", paths.agent_dir.display());
     tracing::info!("listening on {}", socket.display());
 
-    let (handle, mut conductor) =
-        conductor::spawn_with_context(Arc::new(config), presenter, context);
+    let (handle, mut conductor) = conductor::spawn_with_store(
+        Arc::new(config),
+        presenter,
+        context,
+        Some((store.clone(), initial_last_id)),
+    );
     tokio::pin!(shutdown);
     let mut connections = tokio::task::JoinSet::new();
     loop {
@@ -128,6 +140,7 @@ pub async fn serve_with_context(
     // waiting for the turn would hold up a restart until systemd kills us.
     handle.shutdown();
     let _ = conductor.await;
+    store.shutdown().await;
     // Every request has its outcome now; let the clients waiting for one
     // get it before the process ends. A client that never sent a line is
     // not waited for.

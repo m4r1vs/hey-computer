@@ -79,6 +79,12 @@ enum Command {
         /// Open the last answer in the Markdown viewer instead of printing it.
         #[arg(long, conflicts_with = "copy")]
         open: bool,
+        /// Which lane to read from (`interactive` by default).
+        #[arg(long, value_enum, default_value_t = LaneFilter::Interactive)]
+        lane: LaneFilter,
+        /// Print the record as JSON.
+        #[arg(long, conflicts_with_all = ["copy", "open"])]
+        json: bool,
     },
     /// Check one part of the program on its own.
     #[command(hide = true)]
@@ -86,6 +92,23 @@ enum Command {
         #[command(subcommand)]
         what: DebugCommand,
     },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum LaneFilter {
+    Interactive,
+    Background,
+    All,
+}
+
+impl LaneFilter {
+    fn into_lane(self) -> Option<store::Lane> {
+        match self {
+            Self::Interactive => Some(store::Lane::Interactive),
+            Self::Background => Some(store::Lane::Background),
+            Self::All => None,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -217,7 +240,12 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
                 other => unexpected(other),
             }
         }
-        Command::Last { copy, open } => last(&config, copy, open).await,
+        Command::Last {
+            copy,
+            open,
+            lane,
+            json,
+        } => last(&config, copy, open, lane.into_lane(), json).await,
         Command::Debug { what } => {
             let ok = match what {
                 DebugCommand::Config => {
@@ -280,9 +308,15 @@ fn unexpected(reply: Reply) -> Result<ExitCode> {
     Ok(ExitCode::FAILURE)
 }
 
-async fn last(config: &Config, copy: bool, open: bool) -> Result<ExitCode> {
+async fn last(
+    config: &Config,
+    copy: bool,
+    open: bool,
+    lane: Option<store::Lane>,
+    json: bool,
+) -> Result<ExitCode> {
     let state_dir = config.state_dir()?;
-    let Some(answer) = store::load_last(&state_dir)? else {
+    let Some(answer) = store::load_last_for_lane(&state_dir, lane)? else {
         eprintln!("hey-computer: no answer recorded yet");
         if copy || open {
             present::notify(
@@ -310,6 +344,8 @@ async fn last(config: &Config, copy: bool, open: bool) -> Result<ExitCode> {
             &answer.denied,
         )
         .await?;
+    } else if json {
+        println!("{}", serde_json::to_string(&answer)?);
     } else {
         println!("{}", answer.text);
     }

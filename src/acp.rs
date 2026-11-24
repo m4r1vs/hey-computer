@@ -121,11 +121,16 @@ pub struct Connection {
 
 impl Connection {
     /// Start the agent and the tasks that read and write its stdio.
-    pub fn spawn(argv: &[String], cwd: &Path) -> Result<(Self, mpsc::UnboundedReceiver<Incoming>)> {
+    pub fn spawn(
+        argv: &[String],
+        cwd: &Path,
+        state_dir: &Path,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Incoming>)> {
         let (program, args) = argv.split_first().context("the agent command is empty")?;
         let mut child = Command::new(program)
             .args(args)
             .current_dir(cwd)
+            .env("HEY_COMPUTER_STATE_DIR", state_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

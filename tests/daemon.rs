@@ -1160,7 +1160,7 @@ async fn the_last_successful_answer_is_persisted_and_failures_do_not_overwrite_i
     let state_dir = h.dir.join("state");
     assert_eq!(hey_computer::store::load_last(&state_dir).unwrap(), None);
 
-    // Desktop ask (wait: false) persists last.json with 0600 permissions.
+    // Desktop ask (wait: false) persists history.db with 0600 permissions.
     ipc::ask(&h.socket, "plain", false, false).await.unwrap();
     h.recorder
         .wait_for(Duration::from_secs(10), |items| {
@@ -1170,12 +1170,19 @@ async fn the_last_successful_answer_is_persisted_and_failures_do_not_overwrite_i
         })
         .await
         .expect("answer presented");
+    h.eventually("history.db persisted", || {
+        hey_computer::store::load_last(&state_dir)
+            .ok()
+            .flatten()
+            .is_some()
+    })
+    .await;
     let first = hey_computer::store::load_last(&state_dir)
         .unwrap()
-        .expect("last.json saved");
+        .expect("history.db saved");
     assert_eq!(first.request, "plain");
     assert_eq!(first.text, "Hello from the mock.");
-    let mode = std::fs::metadata(state_dir.join(hey_computer::store::LAST_FILE))
+    let mode = std::fs::metadata(state_dir.join(hey_computer::store::DB_FILE))
         .unwrap()
         .permissions()
         .mode()
@@ -1197,13 +1204,13 @@ async fn the_last_successful_answer_is_persisted_and_failures_do_not_overwrite_i
         "Hello from the mock."
     );
 
-    // Waiting ask (wait: true) updates last.json too, and it survives daemon shutdown.
+    // Waiting ask (wait: true) updates history.db too, and it survives daemon shutdown.
     let reply = h.ask("long", false).await;
     assert!(answer(&reply).starts_with("# Title"));
     let _ = h.shut_down().await;
     let saved = hey_computer::store::load_last(&state_dir)
         .unwrap()
-        .expect("last.json survives shutdown");
+        .expect("history.db survives shutdown");
     assert_eq!(saved.request, "long");
     assert!(saved.text.starts_with("# Title"));
 
@@ -1469,7 +1476,14 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
     assert!(got.contains("text/markdown:len=11"), "{got}");
     assert!(got.contains("image:image/png:b64=16"), "{got}");
 
-    // Metadata (never raw bytes) is persisted on last.json.
+    // Metadata (never raw bytes) is persisted in history.db.
+    h.eventually("attachment metadata persisted", || {
+        hey_computer::store::load_last(&h.dir.join("state"))
+            .ok()
+            .flatten()
+            .is_some()
+    })
+    .await;
     let saved = hey_computer::store::load_last(&h.dir.join("state"))
         .unwrap()
         .expect("saved");
