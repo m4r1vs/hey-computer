@@ -35,68 +35,13 @@ future UI labels (viewer, notification actions, etc.), use **"Ask Computer"**
 
 All Phase 1 items (#1–#7) are implemented and listed under [Done](#done).
 
-## Phase 2: Small upstream hardening & everyday latency/UX fixes
+## Phase 2: Small upstream hardening & everyday latency/UX fixes — Implemented
 
-Surgical changes while `conductor.rs` is still single-lane. All `[Important]`
-items (#8, #9, #12, #13, #14) are implemented and listed under [Done](#done);
-only the two `[Lower priority]` cleanups remain below.
+All Phase 2 items (#8–#14) are implemented and listed under [Done](#done).
 
-10. `[Lower priority]` `[Upstream]` **Timed-out turns still extend the follow-up
-    window.** On `FailReason::Timeout`, `turn()` returns `broken: false`
-    (`src/conductor.rs`), so `run_request()` increments `conversation.turns`
-    and extends `follow_up_until`. Marking timed-out turns `broken: true`
-    avoids reusing a half-completed or wedged session on the next request.
-11. `[Lower priority]` `[Upstream]` **Hardcoded "would become root" denial
-    message.** In `src/conductor.rs`, a denied command always reports
-    *"which would become root"*, even though `nix/home-manager.nix` suggests
-    adding non-root commands like `"shutdown"` to `permissions.deny`. Make the
-    refusal message generic (naming the refused command and deny list).
+## Phase 3: Core delegation primitives (protocol, sessions, lanes) — Implemented
 
-## Phase 3: Core delegation primitives (protocol, sessions, lanes)
-
-The architectural foundations that the remaining roadmap builds on. Finalize the
-`$XDG_STATE_HOME` answer/task record format once in #17 so `last` (#14), FTS5
-recall (#18), `tasks` (#17), and the future viewer (#23) all read the same
-schema.
-
-15. `[Important]` `[Upstream]` **Model and effort profiles (`--profile` /
-    `--deep`).** `model` and `thought_level` are fixed globally. Supporting
-    named profiles in `config.toml` and `ask --profile deep` (or voice prefix
-    routing) keeps routine commands fast/cheap (`low`) while allowing on-demand
-    escalation for derivations, debugging, or research without restarting the
-    daemon, and lets background tasks (#17) pick a profile per job. *Spike while
-    here:* check whether `agy acp` accepts `session/set_config_option`
-    mid-conversation (needed for follow-up escalation in #22).
-16. `[Important]` `[Upstream]` **Attachments (`ask --file`, `ask --image`).**
-    The prompt is text-only (`src/conductor.rs:1005`). Probing `agy acp` 1.5.13
-    confirmed `promptCapabilities: { "image": true, "audio": false,
-    "embeddedContext": true }`, so both image input and embedded context blocks
-    are supported. Interactive screen capture already works via the
-    `desktop-context` skill + `read_file`, while `--file`/`--image` lets CLI
-    and scripted callers attach files or images directly to `ask`.
-17. `[Important]` `[Upstream]` **Background tasks and scheduled-check support**
-    (the core delegation feature). An `ask --background` flag or a `task`
-    request type that is not superseded by a newer ask, runs in its own ACP
-    session (serialized cleanly per lane, with per-lane permission profile hooks
-    for #28), persists its result under `$XDG_STATE_HOME`, notifies on
-    completion with an "Open" action, and is listed by `hey-computer tasks`.
-    This also makes scheduled workflows safe: a systemd timer running
-    `ask --print --new "…"` (e.g. a morning job writing weather and calendar
-    into today's note) currently cancels whatever was asked by voice at that
-    moment. Pair this with an optional `--suppress-token HEARTBEAT_OK` flag so
-    systemd timers can run OpenClaw-style periodic checks silently unless
-    something actually requires attention.
-18. `[Important]` `[Upstream]` **Local recall index (SQLite FTS5).** A
-    lightweight local SQLite FTS5 index of recent `(timestamp, request, answer)`
-    turns built on the `$XDG_STATE_HOME` store from #17, exposed via a small
-    `SKILL.md` so *"what was that command you gave me yesterday?"* works without
-    vector-DB overhead.
-19. `[Important]` `[Upstream]` **MCP passthrough.** `mcpServers` is hardcoded to
-    `[]` (`src/conductor.rs:781`). Expose configured MCP servers (e.g.
-    `mcp-nixos`, calendar, work tools) without extra permission prompts. *Spike
-    first:* `agy acp` 1.5.13 omits `mcpCapabilities` from `initialize`, so
-    verify stdio `mcpServers` handling directly in `session/new` before
-    committing Phase 4 integrations to MCP versus local CLIs.
+All Phase 3 items (#15–#19) are implemented and listed under [Done](#done).
 
 ## Phase 4: Integrations & smart routing
 
@@ -290,6 +235,48 @@ tooling are mature.
 
 ## Done
 
+- `[Lower priority]` `[Upstream]` `[Done: 3c7390b]` **Timed-out turns & generic
+  deny-list message (#10, #11).** Marked `TurnAbort::Quiet` as `broken: true`
+  so timed-out sessions are closed instead of extending `follow_up_until`,
+  replaced the hardcoded *"which would become root"* message with a generic
+  deny-list refusal, scoped `acp::tool_command()` to shell execution calls, and
+  added outbound trace redaction for attachment/MCP payloads.
+- `[Important]` `[Upstream]` `[Done: f359999]` **Model and effort profiles
+  (`--profile`) (#15).** Added `[profiles.<name>]` (`model`, `thought_level`,
+  `max_turn_secs`, `max_tool_calls`, `mcp_servers`) and `ask -p/--profile`,
+  follow-up profile inheritance, in-place mid-conversation
+  `session/set_config_option` switching (verified live on `agy` 1.5.13), warm
+  spare preservation for non-default profiles, and profile-tagged progress and
+  answer notifications.
+- `[Important]` `[Upstream]` `[Done: 22cc456]` **Attachments (`ask --file`,
+  `ask --image`) (#16).** Added `src/attachments.rs` (zero extra deps: RFC 4648
+  base64, magic-byte MIME detection for PNG/JPEG/WebP/GIF, UTF-8 text checks,
+  `O_NONBLOCK | O_NOCTTY` regular-file validation, and size caps) plus
+  `-f/--file` and `-i/--image` on `ask` and `debug prompt`, embedded as ACP
+  `resource` (`TextResourceContents`) and `image` blocks.
+- `[Important]` `[Upstream]` `[Done: 521caf5, 47ceada]` **Unified SQLite WAL
+  store, multi-lane background tasks, and scheduled-check support (#17).**
+  Replaced `last.json` with a private `0600` SQLite WAL + FTS5 database
+  (`<state_dir>/history.db`, `PRAGMA secure_delete = ON`, one-time `last.json`
+  migration, `[history]` retention pruning), refactored `src/acp.rs` for
+  per-`sessionId` multiplexing on the shared warm `agy acp` process (verified
+  live on `agy` 1.5.13), added a bounded FIFO background lane (`[tasks]`,
+  `ask -b/--background`, `--suppress-token`, `cancel --id`, `tasks
+  [list|show|open|copy|cancel]`, `last --lane`), completion notifications with
+  non-blocking **Open** actions, and `LanePolicy` hooks for #28.
+- `[Important]` `[Upstream]` `[Done: 4b718d0]` **Local recall index (SQLite
+  FTS5) (#18).** Added `hey-computer recall` (safe FTS5 query sanitization,
+  BM25 + recency ranking, `--since`/`--until` relative/calendar filters,
+  `<untrusted_recall>` framing) and the bundled `skills/recall/SKILL.md`
+  enabled by default via `programs.hey-computer.recall.enable` in the Home
+  Manager module.
+- `[Important]` `[Upstream]` `[Done: d0b7732]` **MCP passthrough (#19).**
+  Verified live on `agy` 1.5.13 that `session/new` `mcpServers` supports
+  `stdio`, `http`, and `sse` transports (with `env` and `headers`). Added
+  `src/mcp.rs`, `[mcp.<name>]` (`env_files` / `header_files` loaded at runtime
+  so secrets stay out of `config.toml` and `/nix/store`), per-profile
+  `mcp_servers` selection, and `programs.hey-computer.mcp.servers` in
+  `nix/home-manager.nix`.
 - `[Important]` `[Upstream]` `[Done: 3e3b6e1]` **Bounded, frozen-snapshot memory
   and fail-loudly prompt rule (#8).** Added `instructions.memory_file` /
   `instructions.memory_max_chars` (default `4000`, Home Manager `memory.file`

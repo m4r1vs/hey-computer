@@ -27,15 +27,17 @@ One binary, two roles:
   for it, restarted with back-off when it dies, and listens on
   `$XDG_RUNTIME_DIR/hey-computer.sock`.
 - `hey-computer ask | cancel | status` are clients that talk to the daemon over
-  that socket and exit. `hey-computer last [--copy | --open]` reads the last
-  persisted answer directly from `$XDG_STATE_HOME/hey-computer/last.json`, so it
-  works even when the daemon is stopped.
+  that socket and exit. `hey-computer last`, `hey-computer tasks`, and
+  `hey-computer recall` read directly from the SQLite history store at
+  `$XDG_STATE_HOME/hey-computer/history.db`, so they work even when the daemon
+  is stopped.
 
 For each request the daemon opens an ACP session (or continues the last one,
-see below), sets the model and thinking effort, sends the text and collects
-the streamed answer. Every permission request from the agent is answered by
-the daemon at once (see [permission model](#permission-model)). When the turn
-ends, the answer is shown:
+see below), sets the model and thinking effort (globally or from a named
+profile), attaches any `--file` or `--image` inputs, sends the text and
+collects the streamed answer. Every permission request from the agent is
+answered by the daemon at once (see [permission model](#permission-model)).
+When the turn ends, the answer is persisted to `history.db` and shown:
 
 - **short and plain** (by default at most 230 characters and 4 lines, and no
   heading, table, code block or LaTeX math): a notification. The text is
@@ -44,21 +46,34 @@ ends, the answer is shown:
   `$XDG_RUNTIME_DIR/hey-computer/` (the newest 20 are kept), the viewer is
   started with it, and a one-line notification names it.
 
-While a request runs, a low-urgency "Thinking…" notification is shown, updated
-in place with throttled summaries of tool calls as the agent works, and then
-replaced by the answer. Failures (agent down, timeout, a refused privileged
-command, an empty answer) are a notification that says what happened.
+While an interactive request runs, a low-urgency "Thinking…" notification is
+shown (tagged with the profile name when non-default), updated in place with
+throttled summaries of tool calls as the agent works, and then replaced by the
+answer. Failures (agent down, timeout, a refused privileged command, an empty
+answer) are a notification that says what happened.
 
-**Conversations.** A request within 90 s of the previous answer continues the
-same conversation, so "and the day after?" works; a later one starts afresh.
-`ask --new` always starts afresh. A request that arrives while another is
-running cancels the running one, which is how "no, I meant…" works.
+**Conversations and profiles.** A request within 90 s of the previous answer
+continues the same conversation, so "and the day after?" works; a later one
+starts afresh. `ask --new` always starts afresh. A follow-up without
+`--profile` inherits the active conversation's profile; passing `--profile`
+mid-conversation switches model and effort in place (or `--profile default` to
+revert). A new interactive request that arrives while another is running
+cancels the running one, which is how "no, I meant…" works.
+
+**Background tasks and scheduled checks.** `ask --background` (or `-b`) runs in
+a separate bounded FIFO lane on the same warm `agy acp` process. Background
+tasks are never superseded by newer interactive asks, never overwrite the
+interactive follow-up session, print their task ID to stdout on submission, and
+finish with a notification offering an **Open** action (or silently when the
+answer matches `--suppress-token`, e.g. `HEARTBEAT_OK` for systemd timers).
+Inspect or manage them with `hey-computer tasks`.
 
 **Timeouts and budgets.** A request is cancelled if the agent sends nothing for
 45 s (`agent.inactivity_timeout_secs`). To stop runaway retry loops even while
 updates keep arriving, each turn also has generous hard caps of 300 s wall-clock
 time (`agent.max_turn_secs`) and 20 distinct tool calls (`agent.max_tool_calls`);
-set either to 0 to disable it.
+set either to 0 to disable it. Profiles can override `max_turn_secs` and
+`max_tool_calls`.
 
 ### The agent's own directory
 
@@ -73,7 +88,7 @@ $XDG_STATE_HOME/hey-computer/          (default ~/.local/state/hey-computer)
     config/skills/<name>/…             links to the configured skills
   workspace/                           every session's working directory
     AGENTS.md                          the instructions, generated
-  last.json                            the last answer, mode 0600
+  history.db                           SQLite WAL + FTS5 history store, mode 0600
 ```
 
 `settings.json` puts agy in its default mode (every tool call that needs
@@ -116,22 +131,28 @@ hey-computer [--config FILE] [--socket PATH] [-v|-vv] COMMAND
 | Command | What it does |
 |---|---|
 | `daemon` | Run the daemon. |
-| `ask [--print] [--new] [--] [TEXT...]` | Hand the daemon a request: the arguments joined by spaces, or stdin when there are none (up to 256 KiB, the most the daemon takes). Without `--print` it exits 0 as soon as the daemon has accepted the request, and the daemon shows the answer. With `--print` it waits, prints the answer on stdout and exits 0, or prints the failure on stderr and exits 1; the daemon shows nothing. `--new` starts a new conversation. Ctrl-C while waiting cancels the request. |
-| `cancel` | Cancel the running request: `cancelled request N` or `nothing to cancel`. |
-| `status [--json]` | For example `agent ready, idle, follow-ups for 78 s, 7 handled`. |
-| `last [--copy \| --open]` | Retrieve the last successful answer: print it to stdout, copy it to the clipboard (`present.clipboard`), or open it in the Markdown viewer (`present.viewer`). Works even when the daemon is stopped. |
+| `ask [--print] [--new] [-b\|--background] [--suppress-token TOKEN] [-p\|--profile NAME] [-f\|--file PATH]... [-i\|--image PATH]... [--] [TEXT...]` | Hand the daemon a request: the arguments joined by spaces, or stdin when there are none (up to 256 KiB; skipped if stdin is a TTY and attachments were passed). Without `--print` it exits 0 as soon as accepted; background tasks print their task ID to stdout with no submission popup. With `--print` it waits, prints the answer on stdout and exits 0 (silently when matched by `--suppress-token`), or prints the failure on stderr and exits 1; the daemon shows nothing. `--new` starts a new conversation; `-p`/`--profile` picks a `[profiles.<name>]` (or `default`); `-f`/`--file` attaches UTF-8 text files; `-i`/`--image` attaches PNG/JPEG/WebP/GIF images. Ctrl-C while waiting cancels the request. |
+| `cancel [--id ID]` | Cancel the running interactive request, or a specific running/queued task with `--id`: `cancelled request N` or `nothing to cancel`. |
+| `status [--json]` | For example `agent ready, idle, follow-ups for 78 s, 7 handled` (plus active profile and background running/queued counts when non-zero). |
+| `last [--copy \| --open] [--lane interactive\|background\|all] [--json]` | Retrieve the last successful answer (defaults to the `interactive` lane): print it, output JSON, copy to the clipboard (`present.clipboard`), or open in the Markdown viewer (`present.viewer`). Works even when the daemon is stopped. |
+| `tasks [list \| show ID \| open ID \| copy ID \| cancel ID]` | List recent tasks (`--lane`, `--status`, `--all`, `--limit`, `--json`; defaults to the `background` lane), inspect one task, open it in the viewer, copy its answer, or cancel a running/queued task. `list`, `show`, `open`, and `copy` work even when the daemon is stopped. |
+| `recall [--since SPEC] [--until SPEC] [-n\|--limit N] [--lane ...] [--sort relevance\|recent] [--any] [--full] [--max-chars N] [--raw-fts] [--json] [--plain] [QUERY...]` | Full-text search (SQLite FTS5) over past completed answers, wrapped in `<untrusted_recall>` by default (for agent skill use; `--plain` or `--json` for direct terminal/script use). Time specs accept relative (`24h`, `7d`, `2w`) and calendar (`today`, `yesterday`, `YYYY-MM-DD`) forms. Works even when the daemon is stopped. |
 
-- An empty or whitespace-only request is reported on stderr and exits 2.
+- An empty or whitespace-only request (with no attachments) is reported on stderr and exits 2.
 - When the daemon is not running, `ask` says so on stderr, sends a
   notification "The assistant is not running" (a voice command has nobody
   watching stderr), and exits 1. Without `--print`, any other refusal (a
-  request too long for the daemon, a daemon that does not answer) is a
-  notification too.
+  request too long for the daemon, an unknown profile, a bad attachment, a
+  daemon that does not answer) is a notification too.
 - The socket is `--socket`, else `$HEY_COMPUTER_SOCKET`, else
   `$XDG_RUNTIME_DIR/hey-computer.sock`. Without `XDG_RUNTIME_DIR`,
   `/tmp/hey-computer-UID` is used, and only if it is a directory of your
   own that nobody else can enter. The daemon replaces a stale socket at that
   path but refuses to start when something else is there.
+- The state directory is `state_dir` in `config.toml`, else
+  `$HEY_COMPUTER_STATE_DIR`, else `$XDG_STATE_HOME/hey-computer`. The daemon
+  exports `HEY_COMPUTER_STATE_DIR` to the spawned agent so the bundled `recall`
+  skill queries the same database.
 
 Hidden commands for checking one part at a time:
 `hey-computer debug config` (check the configuration and print it with every
@@ -155,21 +176,26 @@ reply lines until the daemon closes the connection.
 **ask**
 
 ```json
-{"type":"ask","text":"how warm is it outside","wait":false,"new":false}
+{"type":"ask","text":"how warm is it outside","wait":false,"new":false,"profile":"deep","background":false,"suppress_token":null,"attachments":[{"kind":"file","path":"/abs/path/to/file.txt"}]}
 ```
 
-`wait` and `new` are optional (default false). The reply is
+Only `type` and `text` (or at least one attachment) are required; `wait`,
+`new`, `background` default to `false`, `profile` and `suppress_token` default
+to `null`, and `attachments` defaults to `[]` (`kind` is `"file"` or `"image"`,
+`path` must be an existing regular file; up to 8 attachments, 512 KiB per text
+file, 10 MiB per image, 16 MiB total raw bytes). The reply is
 `{"type":"accepted","id":7}`. With `"wait": false` that is all: the daemon
-shows the answer. With `"wait": true` exactly one more line follows and the
-daemon shows nothing:
+shows the answer (or completion notification for background tasks). With
+`"wait": true` exactly one more line follows and the daemon shows nothing:
 
 ```json
-{"type":"answer","id":7,"text":"It is 12 °C and cloudy.","denied":["sudo"]}
+{"type":"answer","id":7,"text":"It is 12 °C and cloudy.","denied":["sudo"],"suppressed":false}
 {"type":"failed","id":7,"reason":"timeout","message":"The assistant sent nothing for 45 s and was stopped."}
 ```
 
 `denied` (commands the agent asked for and was refused) is left out when
-empty. `reason` is one of:
+empty; `suppressed` is omitted when false and `true` when the answer matched
+`suppress_token`. `reason` is one of:
 
 | reason | meaning |
 |---|---|
@@ -186,17 +212,21 @@ A waiting client that closes the connection, or shuts down only its writing
 side (as `socat` and `nc -N` do at the end of their input), cancels its
 request. Keep the writing side open until the answer has arrived.
 
-**cancel** `{"type":"cancel"}` → `{"type":"cancelled","id":7}`, or
-`"id":null` when nothing was running.
+**cancel** `{"type":"cancel"}` (interactive lane) or `{"type":"cancel","id":7}`
+(a specific running or queued task) → `{"type":"cancelled","id":7}`, or
+`"id":null` when nothing matched.
 
 **status** `{"type":"status"}` →
 
 ```json
-{"type":"status","agent":"ready","running":null,"running_secs":null,"follow_up_secs":61.2,"handled":7}
+{"type":"status","agent":"ready","running":null,"running_secs":null,"running_profile":null,"follow_up_secs":61.2,"handled":7,"background_running":0,"background_queued":0}
 ```
 
-`agent` is `down`, `starting` or `ready`; `follow_up_secs` is how long a new
-request would still continue the current conversation.
+`agent` is `down`, `starting` or `ready`; `running` / `running_secs` /
+`running_profile` reflect the interactive lane; `follow_up_secs` is how long a
+new interactive request would still continue the current conversation;
+`background_running` and `background_queued` count active and waiting tasks in
+the background lane.
 
 **Errors.** A line the daemon cannot use (not JSON, an unknown type or field,
 an empty ask, not UTF-8, longer than 256 KiB) gets
@@ -262,6 +292,39 @@ notifier = ["notify-send"]          # called with notify-send's options
 viewer = []                         # e.g. ["marker", "--preview", "{file}"]; empty: a notification with the path
 clipboard = ["wl-copy"]             # fed the raw answer on stdin by `hey-computer last --copy`
 keep_answers = 20                   # answer files kept in $XDG_RUNTIME_DIR/hey-computer
+
+[tasks]
+max_concurrent = 1                  # concurrent turns in the background lane (1..=8)
+max_queued = 32                     # queued background tasks before rejecting new ones (1..=256)
+# profile = "deep"                  # optional default profile for `ask --background`
+
+[history]
+retention_days = 90                 # prune completed/failed/cancelled turns older than this; 0 = keep
+max_entries = 10000                 # maximum rows kept in history.db; 0 = unlimited
+suppressed_days = 7                 # prune suppressed heartbeat turns older than this; 0 = keep
+
+# Named model/effort/budget/MCP profiles selected via `ask -p <name>`.
+# "default" is reserved and selects the top-level [agent] settings.
+# [profiles.deep]
+# model = "gemini-4-neon"
+# thought_level = "high"
+# max_turn_secs = 600
+# max_tool_calls = 40
+# mcp_servers = ["nixos"]           # omit to inherit all enabled [mcp.*] servers; [] passes none
+
+# MCP servers passed to `agy acp` in `session/new` (`mcpServers`).
+# Stdio servers set `command` (+ optional `args`, `env`, `env_files`);
+# remote servers set `url` (+ optional `transport` = "http"|"sse", `headers`, `header_files`).
+# Secret files in `env_files` / `header_files` are read at runtime (trimmed, max 16 KiB)
+# so tokens never enter config.toml or /nix/store.
+# [mcp.nixos]
+# enabled = true
+# command = "mcp-nixos"
+# [mcp.example_remote]
+# enabled = true
+# url = "https://mcp.example.com/mcp"
+# transport = "http"
+# header_files = { Authorization = "/run/secrets/mcp-auth-header" }
 ```
 
 The deny list matches command words, also behind `env`, `timeout`, `nice`,
@@ -345,7 +408,9 @@ told about Obsidian.
 | `obsidian.package` | `pkgs.obsidian` (unfree) | whose `bin/obsidian-cli` the shim runs |
 | `openhue.enable` | false | puts `openhue` on the agent's PATH and links the bundled `openhue` skill |
 | `openhue.package` | `pkgs.openhue-cli` | the openhue CLI package |
-| `skills.enable` | true | the bundled `hyprland-desktop` skill, plus the Obsidian and `openhue` skills when enabled |
+| `recall.enable` | true | links the bundled `recall` skill (uses `hey-computer recall` from the agent's PATH) |
+| `mcp.servers` | `{}` | MCP server definitions passed into `settings.mcp.<name>`; `{ file = "/abs/path"; }` entries in `env` or `headers` are automatically lowered into `env_files` / `header_files` so secrets stay out of `/nix/store` |
+| `skills.enable` | true | the bundled `hyprland-desktop` skill, plus `recall`, Obsidian, and `openhue` skills when enabled |
 | `skills.extra` | `[]` | more skill directories |
 | `viewer.package` | `pkgs.marker` | installed |
 | `viewer.command` | `env DBUS_SESSION_BUS_ADDRESS=disabled: marker --name=hey-computer.answer --preview {file}` | |
@@ -498,17 +563,22 @@ application for you also lets it start a command outside the service.
 
 - **The daemon's log** (the journal, under systemd) has request numbers,
   sizes, timings and tool kinds at the default level. Request and answer
-  text, commands, memory file contents and the agent's last words before a
-  crash appear only with `-v` (debug level; memory contents are never logged).
+  text, commands, attachment contents, recall queries/answers, and the agent's
+  last words before a crash appear only with `-v` (debug level; memory
+  contents, base64 attachment payloads, and MCP secret values are never
+  logged even at `trace`).
 - **User memory** (`instructions.memory_file`, `~/.config/hey-computer/memory.md`
   under the Home Manager module) is read-only to the daemon and kept outside the
   untrusted vault; a capped snapshot is written into `workspace/AGENTS.md` when
   the agent starts.
 - **Long answers** are files in `$XDG_RUNTIME_DIR/hey-computer/` (memory,
   gone at logout); the newest `present.keep_answers` are kept.
-- **The last answer** is saved atomically to
-  `$XDG_STATE_HOME/hey-computer/last.json` (mode `0600`) for `hey-computer last`
-  and overwritten on each successful answer.
+- **History and tasks** are stored in
+  `$XDG_STATE_HOME/hey-computer/history.db` (SQLite WAL + FTS5, mode `0600`
+  including `-wal`/`-shm` sidecars, `PRAGMA secure_delete = ON`) for
+  `hey-computer last`, `tasks`, and `recall`, pruned according to `[history]`
+  (`retention_days`, `max_entries`, `suppressed_days`). A legacy `last.json`
+  from earlier versions is imported on first open.
 - **agy keeps everything that was said**, as any agy session does: per
   conversation a database under `agy/antigravity-cli/conversations/`, full
   transcripts under `agy/antigravity-cli/brain/`, a log per agent process

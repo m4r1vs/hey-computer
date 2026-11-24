@@ -45,41 +45,67 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
 - `daemon`: binds `$XDG_RUNTIME_DIR/hey-computer.sock` (0600) **before** preparing the agent
   directory, so a second daemon is refused without touching the first one's files; then
   serves clients and hands requests to the conductor.
-- `conductor`: one task that owns the agent child and runs one request at a time. Everything
-  that can interrupt a request (newer request, `cancel`, hang-up, agent death, inactivity)
-  meets in one `select!`. The `Handle` numbers requests and cancels the previous one as it
-  queues the next. Follow-ups reuse the session inside `conversation.follow_up_secs`. A spare
-  session is opened at warm start because only the first `session/new` is slow.
-- `acp`: hand-written ACP client (newline-delimited JSON-RPC, protocol 1) over the child's
-  stdio. Hand-written on purpose: agy sends fields outside the specification, and the
-  official crate's interoperability with it was unproven.
+- `conductor`: coordinates the shared warm `agy acp` process across one
+  interactive lane (1 active request, newer asks supersede, follow-ups reuse
+  the session inside `conversation.follow_up_secs` and inherit the active
+  profile, in-place `session/set_config_option` switching) and a bounded FIFO
+  background lane (`[tasks]`, concurrent sessions on the same `agy` process,
+  never superseded by interactive asks, `--suppress-token` silent checks). A
+  spare session is opened at warm start for the default profile because only
+  the first `session/new` is slow; non-default profiles preserve it.
+- `acp`: hand-written ACP client (newline-delimited JSON-RPC, protocol 1) over
+  the child's stdio, split into `Connection` (process lifecycle) + cloneable
+  `Client` + per-`sessionId` RAII `SessionSubscription` demuxed inside
+  `read_loop`. Outbound trace logging redacts attachment payloads, file bodies,
+  and `mcpServers` secrets. `tool_command()` is scoped to `execute` /
+  `run_command` so MCP tool calls with a `command` argument are not misparsed
+  as shell commands. Hand-written on purpose: agy sends fields outside the
+  specification, and the official crate's interoperability with it was unproven.
+- `attachments`: zero-dependency loader for `--file` (UTF-8 embedded
+  `TextResourceContents`) and `--image` (magic-byte verified PNG/JPEG/WebP/GIF
+  with RFC 4648 base64 encoding), enforcing `O_NONBLOCK | O_NOCTTY` regular-file
+  checks and size caps (`8` files, `512 KiB` text, `10 MiB` image, `16 MiB`
+  total raw bytes).
+- `mcp`: resolves `[mcp.<name>]` stdio/HTTP/SSE definitions into ACP
+  `session/new` `mcpServers` payloads, loading `env_files` / `header_files` at
+  runtime (trimmed, `16 KiB` cap, skipping servers with missing secret files
+  without logging secret values).
 - `environment`: the agent's private `--gemini-dir` (settings.json, linked skills) and the
   workspace with the generated `AGENTS.md`. Rewritten before every agent start.
 - `context`: opt-in per-turn ambient time (`localtime_r`) and Hyprland active window/workspace
   header prepended to user prompts inside `<untrusted_desktop_context>` delimiters.
-- `store`: atomic `0600` persistence of the last successful answer in `<state_dir>/last.json`
-  for `hey-computer last [--copy | --open]`.
-- `policy`: the deny list, matched as command words through wrappers, `sh -c`, pipes and
-  `$(…)`, and behind `systemd-run`. A courtesy, not a boundary.
+- `store`: private `0600` SQLite WAL + FTS5 database at
+  `<state_dir>/history.db` (`PRAGMA secure_delete = ON`, dedicated `hc-store`
+  actor thread with `wal_checkpoint(TRUNCATE)` on shutdown, crash recovery,
+  monotonic ID seeding from `sqlite_sequence`, legacy `last.json` migration,
+  safe FTS5 query sanitizer + BM25/recency ranking, `<untrusted_recall>`
+  formatter) backing `last`, `tasks`, and `recall`.
+- `policy`: `LanePolicy` (`standard` and Phase 6-ready `restricted`) + deny
+  list matched as command words through wrappers, `sh -c`, pipes and `$(…)`,
+  and behind `systemd-run`. A courtesy, not a boundary.
 - `present`: `Presenter` trait; `Desktop` runs the notifier (an argument vector,
-  notify-send by default, so tests and hand runs can swap in a recording script) and the
-  viewer; `Recorder` for tests. `is_short`/`is_rich` decide notification versus viewer.
-  `to_markup` cuts code spans out before pairing `**`, so the Pango markup always nests.
-  `disarm_html` rewrites every `<` outside code (`&lt;` in text, `\lt` in math) and turns
-  remote images into links (Marker fetched them at once) before the
-  answer file is written: Marker renders in a web view. "Answer opened" is
-  sent once the viewer spawns; a viewer that fails within 1.5 s replaces it
-  with an error notification.
+  notify-send by default, so tests and hand runs can swap in a recording script)
+  and the viewer, including profile-tagged progress/answer headers and bounded
+  non-blocking `notify-send --action=open=Open` waiters for background task
+  completions; `Recorder` for tests. `is_short`/`is_rich` decide notification
+  versus viewer. `to_markup` cuts code spans out before pairing `**`, so the
+  Pango markup always nests. `disarm_html` rewrites every `<` outside code
+  (`&lt;` in text, `\lt` in math) and turns remote images into links (Marker
+  fetched them at once) before the answer file is written: Marker renders in a
+  web view. "Answer opened" is sent once the viewer spawns; a viewer that fails
+  within 1.5 s replaces it with an error notification.
 - `mock`: a scripted ACP agent, run as the hidden `debug mock-agent SCRIPT`, so the package
   installs one binary. Script format and log lines are documented at the top of `mock.rs`.
 - `debug`: hidden commands that check one part at a time (`config`, `instructions`, `context`,
   `prepare`, `classify`, `present`, `prompt`, `mock-agent`).
-- `nix/home-manager.nix`: the module (agent PATH, obsidian shim, skills, viewer launched via
+- `nix/home-manager.nix`: the module (agent PATH including `cfg.package`,
+  obsidian shim, `recall.enable`, `mcp.servers` lowering `{ file = ...; }` to
+  `env_files`/`header_files`, skills, viewer launched via
   `systemd-run --user --scope`, service with `NoNewPrivileges`). `nix/module-check.nix`
   evaluates it in a minimal Home Manager configuration (`checks.module`).
-- `skills/hyprland-desktop`: the bundled skill, installed to
-  `$out/share/hey-computer/skills`. Write only what has been checked against a real
-  Hyprland; say so where something comes from `--help` alone.
+- `skills/{hyprland-desktop,openhue,recall}`: bundled skills installed to
+  `$out/share/hey-computer/skills`. Write only what has been checked against a
+  real system; say so where something comes from `--help` alone.
 
 ## Facts the code depends on (agy 1.5.13, measured)
 
@@ -129,6 +155,21 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   agent), and turns the error into a message naming `agy acp --login`.
 - agy's conversations, transcripts and logs (`agy/antigravity-cli/{conversations,brain,log}`)
   are pruned to `agent.history_days` before each agent start, never while agy runs.
+- Multi-session concurrency (measured on agy 1.5.13): default single-process `agy acp`
+  executes concurrent `session/prompt` calls across distinct sessions with accurate
+  `sessionId` routing on `session/update` and `session/request_permission` and isolated
+  `session/cancel`. Passing `--process-per-session` regressed second-session creation from
+  0.02 s to 1.06 s, so single-process mode is kept.
+- Mid-conversation `session/set_config_option` (measured): works for both `model` and
+  `thought_level` while preserving earlier turn context.
+- Attachments (measured): `type: "image"` (including 6 MiB raw / 8 MiB base64 PNG) and
+  `type: "resource"` (`TextResourceContents`) work; PDF `BlobResourceContents` is ignored
+  by agy 1.5.13.
+- MCP passthrough (measured): `session/new` `mcpServers` supports `stdio`, `http`, and `sse`
+  (including `env` and `headers`), while `settings.json` `mcpServers` is ignored in ACP mode.
+  MCP tool calls arrive with `kind: "other"` and `name: "mcp_<server>_<tool>"`. Stdio MCP
+  children persist across `session/close` until `agy` exits (cleaned up by `Connection`'s
+  process-group kill).
 
 ## Testing
 
@@ -159,10 +200,12 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
 
 ## Never logged above debug
 
-Request text, answer text, memory file contents, ambient desktop context (window titles), tool call arguments and the agent's stderr when it dies
-mid-request (it can quote the request). `info` carries ids, sizes, timings and tool kinds
-(`tool call (execute)`, `refused a sudo command`). Keep it that way: requests are spoken
-words and answers can quote the user's notes.
+Request text, answer text, memory file contents, ambient desktop context (window titles),
+tool call arguments, attachment contents/base64, recall queries/answers, MCP secret values,
+and the agent's stderr when it dies mid-request (it can quote the request). `info` carries
+ids, sizes, timings and tool kinds (`tool call (execute)`, `refused a sudo command`). Keep it
+that way: requests are spoken words and answers can quote the user's notes; base64 payloads,
+memory contents, and MCP secrets are never logged even at `trace`.
 
 ## Conventions
 
