@@ -243,10 +243,11 @@ tooling are mature.
 
 - `[Important]` `[Config]` `[Done: NixConfig 89ccf19]` **Google Calendar & Gmail
   MCP (#20, #21).** Packaged `taylorwilsdon/google_workspace_mcp` (`v1.30.1`,
-  MIT) in `nixpkgs.nix` and wired `programs.configured.mcp.googleWorkspace`
-  (`--transport stdio --single-user --tool-tier extended --tools gmail calendar`,
-  keeping OAuth credentials in a `0700` state dir outside `/nix/store` and model
-  context) plus `mcp(google-workspace/*)` in `antigravity-cli.nix`.
+  MIT) in `nixpkgs.nix` and wired `programs.configured.hey-computer.googleWorkspace`
+  exclusively into `hey-computer.nix` (`--transport stdio --single-user
+  --tool-tier extended --tools gmail calendar`, keeping OAuth credentials in a
+  `0700` state dir outside `/nix/store`, model context, and the global coding-CLI
+  `mcp.nix` set).
 - `[Important]` `[Config]` `[Done: NixConfig 89ccf19]` **Context7 MCP (`deep`),
   `yt-dlp` / `gh` CLI skills, & built-in `agy` `/browser` (#22).** Wired
   `pkgs.context7-mcp` (`programs.configured.mcp.context7`, excluded from
