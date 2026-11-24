@@ -45,11 +45,39 @@
         max_tool_calls = 15;
         max_turn_secs = 180;
       };
+      profiles.deep = {
+        model = "gemini-4-neon";
+        thought_level = "high";
+        max_tool_calls = 40;
+        mcp_servers = ["demo"];
+      };
+      profiles.lean = {
+        thought_level = "low";
+        mcp_servers = [];
+      };
+      tasks = {
+        max_concurrent = 1;
+        max_queued = 16;
+        profile = "deep";
+      };
+      history = {
+        retention_days = 90;
+        max_entries = 5000;
+        suppressed_days = 7;
+      };
       conversation.follow_up_secs = 60;
       instructions.extra = "Prefer metric units.";
       context = {
         time = true;
         desktop = true;
+      };
+    };
+    mcp.servers.demo = {
+      command = "/bin/true";
+      args = ["--stdio"];
+      env = {
+        PLAIN = "ok";
+        SECRET.file = "/run/secrets/nonexistent-in-sandbox";
       };
     };
   };

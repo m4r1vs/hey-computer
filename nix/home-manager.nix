@@ -88,6 +88,52 @@
     "--"
   ];
 
+  # Translate programs.hey-computer.mcp.servers into settings.mcp.<name>,
+  # routing `{ file = "/abs/path"; }` entries into env_files / header_files so
+  # secrets never land in config.toml or /nix/store.
+  translateMcpKv = attrs: {
+    inline = lib.filterAttrs (_: v: builtins.isString v) attrs;
+    files = lib.mapAttrs (_: v: v.file) (lib.filterAttrs (_: v: builtins.isAttrs v && v ? file) attrs);
+  };
+
+  translatedMcpServers =
+    lib.mapAttrs (
+      _: server: let
+        envSplit = translateMcpKv (server.env or {});
+        headerSplit = translateMcpKv (server.headers or {});
+        enabled =
+          if server ? disabled
+          then !server.disabled
+          else server.enabled or true;
+      in
+        {inherit enabled;}
+        // lib.optionalAttrs ((server.command or "") != "") {
+          inherit (server) command;
+        }
+        // lib.optionalAttrs ((server.args or []) != []) {
+          inherit (server) args;
+        }
+        // lib.optionalAttrs (envSplit.inline != {}) {
+          env = envSplit.inline;
+        }
+        // lib.optionalAttrs (envSplit.files != {}) {
+          env_files = envSplit.files;
+        }
+        // lib.optionalAttrs ((server.url or "") != "") {
+          inherit (server) url;
+        }
+        // lib.optionalAttrs ((server.transport or "") != "") {
+          inherit (server) transport;
+        }
+        // lib.optionalAttrs (headerSplit.inline != {}) {
+          headers = headerSplit.inline;
+        }
+        // lib.optionalAttrs (headerSplit.files != {}) {
+          header_files = headerSplit.files;
+        }
+    )
+    cfg.mcp.servers;
+
   # Refused at build time when the program would refuse it at start.
   checkedConfig = settings: let
     toml = tomlFormat.generate "hey-computer-config.toml" settings;
@@ -249,6 +295,28 @@ in {
       '';
     };
 
+    mcp.servers = mkOption {
+      type = types.attrsOf (types.attrsOf types.anything);
+      default = {};
+      example = literalExpression ''
+        {
+          nixos.command = lib.getExe pkgs.mcp-nixos;
+          slack = {
+            command = lib.getExe pkgs.slack-mcp-server;
+            args = ["--transport" "stdio"];
+            env.SLACK_MCP_XOXC_TOKEN.file = "/home/alice/.local/state/slack-mcp/xoxc";
+          };
+        }
+      '';
+      description = ''
+        MCP servers passed to ACP sessions via `session/new` `mcpServers`.
+        Accepts the same `env` / `headers` `{ file = "/abs/path"; }` form as
+        Home Manager's `programs.mcp.servers` and lowers secret file entries to
+        `settings.mcp.<name>.env_files` / `header_files` so credentials never
+        enter the Nix store.
+      '';
+    };
+
     skills = {
       enable = mkOption {
         type = types.bool;
@@ -318,6 +386,7 @@ in {
     home.packages = [cfg.package] ++ lib.optional (cfg.viewer.package != null) cfg.viewer.package;
 
     programs.hey-computer.settings = {
+      mcp = mkIf (translatedMcpServers != {}) (mkDefault translatedMcpServers);
       instructions = {
         vault = mkIf (cfg.vault != null) (mkDefault cfg.vault);
         memory_file = mkIf (cfg.memory.file != null) (mkDefault cfg.memory.file);

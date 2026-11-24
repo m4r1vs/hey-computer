@@ -20,6 +20,9 @@ pub struct Config {
     /// Named model/effort/budget profiles selectable with `ask --profile <name>`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, Profile>,
+    /// MCP servers passed to ACP sessions via `session/new` `mcpServers`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpServer>,
     pub conversation: Conversation,
     pub tasks: Tasks,
     pub permissions: Permissions,
@@ -71,10 +74,61 @@ pub struct Profile {
     /// Overrides `agent.max_tool_calls` when set (0 disables the cap).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_calls: Option<usize>,
+    /// Restricts which configured `[mcp.<name>]` servers this profile attaches
+    /// on `session/new`. `None` attaches all enabled servers; `Some([])` attaches none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Vec<String>>,
 }
 
-/// Effective model, effort and turn budgets after applying a profile (if any)
-/// on top of `[agent]`.
+/// Configuration for one MCP server passed to `session/new` `mcpServers`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServer {
+    /// Disable a configured server without removing its section.
+    pub enabled: bool,
+    /// Stdio transport: program path or name on the agent's PATH.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Non-secret environment variables for stdio servers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Runtime-loaded secret environment variables (`KEY = "/abs/path"`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_files: BTreeMap<String, PathBuf>,
+    /// HTTP/SSE transport endpoint (`https://…` or loopback `http://…`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// `"http"` (default when `url` is set) or `"sse"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub transport: String,
+    /// Non-secret HTTP headers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Runtime-loaded secret HTTP headers (`Header = "/abs/path"`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub header_files: BTreeMap<String, PathBuf>,
+}
+
+impl Default for McpServer {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            env_files: BTreeMap::new(),
+            url: String::new(),
+            transport: String::new(),
+            headers: BTreeMap::new(),
+            header_files: BTreeMap::new(),
+        }
+    }
+}
+
+/// Effective model, effort, budgets, and MCP server set after applying a
+/// profile (if any) on top of `[agent]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProfile {
     /// Profile name, or `None` for base `[agent]` (`"default"`).
@@ -84,6 +138,8 @@ pub struct ResolvedProfile {
     pub inactivity: Duration,
     pub max_turn: Option<Duration>,
     pub max_tool_calls: Option<usize>,
+    /// Sorted list of enabled `[mcp.<name>]` servers to attach on `session/new`.
+    pub mcp_servers: Vec<String>,
 }
 
 /// Maximum length of a profile name in `[profiles.<name>]`.
@@ -448,6 +504,80 @@ impl Config {
                     "profiles.{name}.max_turn_secs must be between 0 and {MAX_SECS} seconds, not {v}"
                 );
             }
+            if let Some(servers) = &profile.mcp_servers {
+                for server in servers {
+                    if !self.mcp.contains_key(server) {
+                        bail!(
+                            "profiles.{name}.mcp_servers references unknown MCP server `{server}`"
+                        );
+                    }
+                }
+            }
+        }
+        for (name, server) in &self.mcp {
+            if name.is_empty()
+                || name.len() > MAX_PROFILE_NAME_LEN
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            {
+                bail!(
+                    "mcp.{name}: server names must be 1..={MAX_PROFILE_NAME_LEN} ASCII letters, digits, '-' or '_'"
+                );
+            }
+            let has_cmd = !server.command.is_empty();
+            let has_url = !server.url.is_empty();
+            if has_cmd == has_url {
+                bail!("mcp.{name}: set exactly one of `command` (stdio) or `url` (http/sse)");
+            }
+            if has_cmd {
+                if !server.transport.is_empty()
+                    || !server.headers.is_empty()
+                    || !server.header_files.is_empty()
+                {
+                    bail!(
+                        "mcp.{name}: `transport`, `headers`, and `header_files` only apply to `url` servers"
+                    );
+                }
+            } else {
+                if !server.args.is_empty() || !server.env.is_empty() || !server.env_files.is_empty()
+                {
+                    bail!(
+                        "mcp.{name}: `args`, `env`, and `env_files` only apply to `command` servers"
+                    );
+                }
+                if !matches!(server.transport.as_str(), "" | "http" | "sse") {
+                    bail!(
+                        "mcp.{name}.transport must be \"http\" or \"sse\", not {:?}",
+                        server.transport
+                    );
+                }
+                let ok_url = server.url.starts_with("https://")
+                    || server.url.starts_with("http://127.0.0.1")
+                    || server.url.starts_with("http://localhost")
+                    || server.url.starts_with("http://[::1]");
+                if !ok_url {
+                    bail!(
+                        "mcp.{name}.url must use https:// or loopback http:// (127.0.0.1, localhost, [::1])"
+                    );
+                }
+            }
+            for (k, path) in &server.env_files {
+                if server.env.contains_key(k) {
+                    bail!("mcp.{name}: `{k}` cannot be set in both `env` and `env_files`");
+                }
+                if !path.is_absolute() {
+                    bail!("mcp.{name}.env_files.{k} must be an absolute path");
+                }
+            }
+            for (k, path) in &server.header_files {
+                if server.headers.contains_key(k) {
+                    bail!("mcp.{name}: `{k}` cannot be set in both `headers` and `header_files`");
+                }
+                if !path.is_absolute() {
+                    bail!("mcp.{name}.header_files.{k} must be an absolute path");
+                }
+            }
         }
         if !(1..=8).contains(&self.tasks.max_concurrent) {
             bail!(
@@ -476,6 +606,12 @@ impl Config {
     ) -> std::result::Result<ResolvedProfile, String> {
         let base_inactivity =
             secs(self.agent.inactivity_timeout_secs).unwrap_or(Duration::from_secs(45));
+        let all_enabled_mcp: Vec<String> = self
+            .mcp
+            .iter()
+            .filter(|(_, s)| s.enabled)
+            .map(|(k, _)| k.clone())
+            .collect();
         let Some(name) = name else {
             return Ok(ResolvedProfile {
                 name: None,
@@ -485,6 +621,7 @@ impl Config {
                 max_turn: secs(self.agent.max_turn_secs),
                 max_tool_calls: (self.agent.max_tool_calls > 0)
                     .then_some(self.agent.max_tool_calls),
+                mcp_servers: all_enabled_mcp,
             });
         };
         if name == "default" {
@@ -499,6 +636,19 @@ impl Config {
             return Err(format!("unknown profile `{name}` (available: {available})"));
         };
         let max_tool_calls = profile.max_tool_calls.unwrap_or(self.agent.max_tool_calls);
+        let mcp_servers = match &profile.mcp_servers {
+            None => all_enabled_mcp,
+            Some(list) => {
+                let mut chosen: Vec<String> = list
+                    .iter()
+                    .filter(|s| self.mcp.get(*s).is_some_and(|m| m.enabled))
+                    .cloned()
+                    .collect();
+                chosen.sort();
+                chosen.dedup();
+                chosen
+            }
+        };
         Ok(ResolvedProfile {
             name: Some(name.to_string()),
             model: profile
@@ -515,6 +665,7 @@ impl Config {
                 .unwrap_or(base_inactivity),
             max_turn: secs(profile.max_turn_secs.unwrap_or(self.agent.max_turn_secs)),
             max_tool_calls: (max_tool_calls > 0).then_some(max_tool_calls),
+            mcp_servers,
         })
     }
 

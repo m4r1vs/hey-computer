@@ -18,6 +18,7 @@ pub mod debug;
 pub mod environment;
 pub mod ipc;
 pub mod lines;
+pub mod mcp;
 pub mod mock;
 pub mod policy;
 pub mod present;

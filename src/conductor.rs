@@ -450,11 +450,12 @@ pub fn spawn_with_store(
     )
 }
 
-/// A pre-opened session configured for a specific `(model, thought_level)`.
+/// A pre-opened session configured for a specific `(model, thought_level, mcp_servers)`.
 struct SpareSession {
     session: String,
     model: String,
     thought_level: String,
+    mcp_servers: Vec<String>,
 }
 
 /// A running agent process shared by concurrent lanes.
@@ -480,6 +481,7 @@ struct Conversation {
     profile_name: Option<String>,
     model: String,
     thought_level: String,
+    mcp_servers: Vec<String>,
     /// When the last turn ended; follow-ups are measured from here.
     last: Instant,
     turns: u32,
@@ -1290,13 +1292,17 @@ impl Conductor {
             .config
             .resolve_profile(None)
             .expect("base [agent] profile always resolves");
-        match self.new_session(&default_profile).await {
+        match self
+            .new_session(&default_profile, self.policy.allow_mcp)
+            .await
+        {
             Ok(session) => {
                 if let Some(live) = &mut self.live {
                     live.spare = Some(SpareSession {
                         session,
                         model: default_profile.model,
                         thought_level: default_profile.thought_level,
+                        mcp_servers: default_profile.mcp_servers,
                     });
                 }
             }
@@ -1440,7 +1446,7 @@ impl Conductor {
             .config
             .resolve_profile(requested)
             .map_err(|e| Outcome::failed(FailReason::AgentError, e))?;
-        let session = self.new_session(&resolved).await?;
+        let session = self.new_session(&resolved, self.policy.allow_mcp).await?;
         Ok((session, resolved))
     }
 
@@ -1473,39 +1479,44 @@ impl Conductor {
                 .config
                 .resolve_profile(requested)
                 .map_err(|e| Outcome::failed(FailReason::AgentError, e))?;
-            if resolved.model == conversation.model
-                && resolved.thought_level == conversation.thought_level
-            {
-                let session = conversation.session.clone();
-                let turns = conversation.turns + 1;
-                if let Some(conv) = &mut self.conversation {
-                    conv.profile_name = resolved.name.clone();
-                }
-                tracing::info!("continuing the conversation (turn {turns})");
-                return Ok((session, resolved));
-            }
-
-            let session = conversation.session.clone();
-            let prev_model = conversation.model.clone();
-            let prev_thought = conversation.thought_level.clone();
-            let turns = conversation.turns + 1;
-            match self
-                .apply_profile_switch(&session, &prev_model, &prev_thought, &resolved)
-                .await?
-            {
-                true => {
+            // MCP servers are fixed at session/new; a different MCP set needs a fresh session.
+            if resolved.mcp_servers == conversation.mcp_servers {
+                if resolved.model == conversation.model
+                    && resolved.thought_level == conversation.thought_level
+                {
+                    let session = conversation.session.clone();
+                    let turns = conversation.turns + 1;
                     if let Some(conv) = &mut self.conversation {
                         conv.profile_name = resolved.name.clone();
-                        conv.model = resolved.model.clone();
-                        conv.thought_level = resolved.thought_level.clone();
                     }
-                    tracing::info!("switched profile in place on the conversation (turn {turns})");
+                    tracing::info!("continuing the conversation (turn {turns})");
                     return Ok((session, resolved));
                 }
-                false => {
-                    tracing::warn!(
-                        "mid-conversation profile switch refused; starting a new session"
-                    );
+
+                let session = conversation.session.clone();
+                let prev_model = conversation.model.clone();
+                let prev_thought = conversation.thought_level.clone();
+                let turns = conversation.turns + 1;
+                match self
+                    .apply_profile_switch(&session, &prev_model, &prev_thought, &resolved)
+                    .await?
+                {
+                    true => {
+                        if let Some(conv) = &mut self.conversation {
+                            conv.profile_name = resolved.name.clone();
+                            conv.model = resolved.model.clone();
+                            conv.thought_level = resolved.thought_level.clone();
+                        }
+                        tracing::info!(
+                            "switched profile in place on the conversation (turn {turns})"
+                        );
+                        return Ok((session, resolved));
+                    }
+                    false => {
+                        tracing::warn!(
+                            "mid-conversation profile switch refused; starting a new session"
+                        );
+                    }
                 }
             }
         }
@@ -1530,7 +1541,9 @@ impl Conductor {
             .as_ref()
             .and_then(|live| live.spare.as_ref())
             .is_some_and(|spare| {
-                spare.model == resolved.model && spare.thought_level == resolved.thought_level
+                spare.model == resolved.model
+                    && spare.thought_level == resolved.thought_level
+                    && spare.mcp_servers == resolved.mcp_servers
             });
         let session = if spare_matches {
             self.live
@@ -1539,7 +1552,7 @@ impl Conductor {
                 .expect("checked above")
                 .session
         } else {
-            self.new_session(&resolved).await?
+            self.new_session(&resolved, self.policy.allow_mcp).await?
         };
         tracing::info!("new conversation");
         self.conversation = Some(Conversation {
@@ -1548,6 +1561,7 @@ impl Conductor {
             profile_name: resolved.name.clone(),
             model: resolved.model.clone(),
             thought_level: resolved.thought_level.clone(),
+            mcp_servers: resolved.mcp_servers.clone(),
             last: Instant::now(),
             turns: 0,
         });
@@ -1624,15 +1638,21 @@ impl Conductor {
         Ok(true)
     }
 
-    async fn new_session(&mut self, resolved: &ResolvedProfile) -> Result<String, Outcome> {
+    async fn new_session(
+        &mut self,
+        resolved: &ResolvedProfile,
+        allow_mcp: bool,
+    ) -> Result<String, Outcome> {
         let started = Instant::now();
+        let mcp_servers =
+            crate::mcp::resolve_acp_servers(&self.config, &resolved.mcp_servers, allow_mcp);
         let (Some(live), Some(paths)) = (&self.live, &self.paths) else {
             return Err(Outcome::failed(
                 FailReason::AgentDown,
                 "the assistant is not running",
             ));
         };
-        let params = json!({"cwd": paths.workspace, "mcpServers": []});
+        let params = json!({"cwd": paths.workspace, "mcpServers": mcp_servers});
         let result = live.conn.call("session/new", params, START_TIMEOUT).await;
         let result = match result {
             Ok(result) => result,

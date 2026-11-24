@@ -301,7 +301,21 @@ impl Mock {
                     .get("additionalDirectories")
                     .map(|d| format!(" dirs={d}"))
                     .unwrap_or_default();
-                self.log.line(&format!("new {session}{extra}"));
+                let mcp_names: Vec<&str> = params
+                    .get("mcpServers")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|s| s.get("name").and_then(Value::as_str))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mcp_tag = if mcp_names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" mcp=[{}]", mcp_names.join(","))
+                };
+                self.log.line(&format!("new {session}{extra}{mcp_tag}"));
                 self.respond(
                     id,
                     json!({

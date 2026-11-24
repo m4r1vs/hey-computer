@@ -1847,3 +1847,54 @@ async fn suppress_token_silences_heartbeats_and_notifies_on_alerts() {
     );
     h.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_servers_are_passed_per_profile_and_switch_session_when_mcp_set_changes() {
+    use hey_computer::config::{McpServer, Profile};
+
+    let h = Harness::start(SCRIPT, |c| {
+        c.mcp.insert(
+            "nixos".to_string(),
+            McpServer {
+                enabled: true,
+                command: "/bin/mcp-nixos".to_string(),
+                ..McpServer::default()
+            },
+        );
+        c.profiles.insert(
+            "lean".to_string(),
+            Profile {
+                mcp_servers: Some(vec![]),
+                ..Profile::default()
+            },
+        );
+    })
+    .await;
+    // Warm spare opens with all enabled MCP servers (`nixos`).
+    h.wait_log("new mock-1 mcp=[nixos]").await;
+
+    // Default ask consumes mock-1 with nixos attached.
+    assert_eq!(answer(&h.ask("turn", false).await), "turn 1 in mock-1");
+
+    // Follow-up switching to `lean` (different MCP set) must open a fresh session with no MCP servers.
+    let (_, mut client) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "turn".to_string(),
+            wait: true,
+            new: false,
+            profile: Some("lean".to_string()),
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let reply = client.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert_eq!(answer(&reply), "turn 1 in mock-2");
+    h.wait_log("close mock-1").await;
+    assert_eq!(h.log_count("new mock-2 mcp="), 0);
+    assert_eq!(h.log_count("new mock-2"), 1);
+    h.stop().await;
+}
