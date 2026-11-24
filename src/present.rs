@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::config::Present as PresentConfig;
@@ -46,21 +46,35 @@ const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 const VIEWER_GRACE: Duration = Duration::from_millis(1500);
 /// How much of a failed viewer's stderr goes into the message.
 const VIEWER_STDERR_KEPT: usize = 400;
+/// Maximum concurrent waiting action-notification tasks (`notify-send -A`).
+const MAX_ACTION_WAITERS: usize = 16;
+/// How long an unclicked "Open" action waiter lives before giving up.
+const ACTION_WAIT_TIMEOUT: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Presentation {
-    /// A request has started.
+    /// An interactive request has started.
     Progress {
         id: u64,
         request: String,
         profile: Option<String>,
     },
-    /// Mid-turn status update for an in-flight request (e.g. a tool call).
+    /// Mid-turn status update for an in-flight interactive request.
     ProgressUpdate { id: u64, status: String },
+    /// Quietly dismiss any active interactive progress popup (e.g. suppressed turn).
+    DismissProgress { id: u64 },
     Answer {
         id: u64,
         text: String,
         /// Commands the agent was refused on the way.
+        denied: Vec<String>,
+        profile: Option<String>,
+    },
+    /// A background task finished with a non-suppressed answer.
+    TaskComplete {
+        id: u64,
+        request: String,
+        text: String,
         denied: Vec<String>,
         profile: Option<String>,
     },
@@ -69,6 +83,7 @@ pub enum Presentation {
         reason: FailReason,
         message: String,
         profile: Option<String>,
+        background: bool,
     },
 }
 
@@ -855,15 +870,35 @@ impl Desktop {
         viewer_grace: Duration,
         progress_interval: Duration,
     ) -> Arc<Self> {
+        Self::spawn_full(
+            config,
+            answers_dir,
+            viewer_grace,
+            progress_interval,
+            ACTION_WAIT_TIMEOUT,
+        )
+    }
+
+    fn spawn_full(
+        config: &PresentConfig,
+        answers_dir: PathBuf,
+        viewer_grace: Duration,
+        progress_interval: Duration,
+        action_timeout: Duration,
+    ) -> Arc<Self> {
         let (queue, mut items) = mpsc::unbounded_channel();
+        let (action_cancel, _) = watch::channel(false);
         let mut worker = Worker {
             config: config.clone(),
             answers_dir,
             progress: None,
             pending: None,
             watchers: JoinSet::new(),
+            action_waiters: JoinSet::new(),
+            action_cancel,
             viewer_grace,
             progress_interval,
+            action_timeout,
         };
         let task = tokio::spawn(async move {
             let mut deferred: Option<Presentation> = None;
@@ -913,6 +948,10 @@ impl Desktop {
             // early-exit check before exit; long-running viewers are already
             // handed off to detached reapers.
             while worker.watchers.join_next().await.is_some() {}
+            // Never stall daemon shutdown on unclicked "Open" notifications.
+            let _ = worker.action_cancel.send(true);
+            worker.action_waiters.abort_all();
+            while worker.action_waiters.join_next().await.is_some() {}
         });
         Arc::new(Self {
             queue: Mutex::new(Some(queue)),
@@ -995,8 +1034,12 @@ struct Worker {
     pending: Option<PendingUpdate>,
     /// Bounded early-exit watchers for recently launched viewers.
     watchers: JoinSet<()>,
+    /// Detached `notify-send -A open=Open` waiters for completed background tasks.
+    action_waiters: JoinSet<()>,
+    action_cancel: watch::Sender<bool>,
     viewer_grace: Duration,
     progress_interval: Duration,
+    action_timeout: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -1020,7 +1063,17 @@ impl Worker {
 
     async fn show(&mut self, item: Presentation) {
         while self.watchers.try_join_next().is_some() {}
-        self.pending = None;
+        while self.action_waiters.try_join_next().is_some() {}
+        if !matches!(
+            item,
+            Presentation::TaskComplete { .. }
+                | Presentation::Failure {
+                    background: true,
+                    ..
+                }
+        ) {
+            self.pending = None;
+        }
         match item {
             Presentation::Progress {
                 id,
@@ -1057,14 +1110,57 @@ impl Worker {
             Presentation::ProgressUpdate { id, status } => {
                 self.progress_update(id, status).await;
             }
+            Presentation::DismissProgress { id } => {
+                let matches = matches!(
+                    &self.progress,
+                    Some(ProgressSlot::Active { request_id, .. }) if *request_id == id
+                );
+                if matches && let Some(replaces) = self.take_progress_id() {
+                    let _ = self
+                        .notify("Done", "", Urgency::Low, 1_000, Some(replaces))
+                        .await;
+                }
+            }
             Presentation::Answer {
                 id,
                 text,
                 denied,
                 profile,
             } => self.answer(id, &text, &denied, profile.as_deref()).await,
+            Presentation::TaskComplete {
+                id,
+                text,
+                denied,
+                profile,
+                ..
+            } => {
+                self.task_complete(id, &text, &denied, profile.as_deref())
+                    .await;
+            }
+            Presentation::Failure {
+                reason,
+                message,
+                profile,
+                background: true,
+                ..
+            } => {
+                if reason == FailReason::Cancelled {
+                    return;
+                }
+                let summary =
+                    with_profile(&format!("Task: {}", reason.headline()), profile.as_deref());
+                self.notify(
+                    &summary,
+                    &escape_markup(&message),
+                    Urgency::Normal,
+                    FAILURE_EXPIRE_MS,
+                    None,
+                )
+                .await;
+            }
             Presentation::Failure {
                 reason: reason @ (FailReason::Cancelled | FailReason::Superseded),
+                background: false,
                 ..
             } => {
                 // Short-lived, so a popup does not linger when the newer
@@ -1090,6 +1186,7 @@ impl Worker {
                 reason,
                 message,
                 profile,
+                background: false,
                 ..
             } => {
                 let replaces = self.take_progress_id();
@@ -1285,6 +1382,58 @@ impl Worker {
             .spawn(watch_viewer(config, viewer, file, opened_id, grace));
     }
 
+    async fn task_complete(
+        &mut self,
+        id: u64,
+        text: &str,
+        denied: &[String],
+        profile: Option<&str>,
+    ) {
+        if !self.config.notifications || self.config.notifier.is_empty() {
+            return;
+        }
+        let summary = with_profile("Task complete", profile);
+        let refused = if denied.is_empty() {
+            String::new()
+        } else {
+            format!("Refused: {}", denied.join(", "))
+        };
+        let mut body = if is_short(text, Limits::from(&self.config)) {
+            to_markup(text)
+        } else {
+            escape_markup(&format!("#{id} · {}", headline(text, 120)))
+        };
+        if !refused.is_empty() {
+            body.push_str("\n\n");
+            body.push_str(&escape_markup(&refused));
+        }
+
+        if self.config.viewer.is_empty() || self.action_waiters.len() >= MAX_ACTION_WAITERS {
+            self.notify(&summary, &body, Urgency::Normal, 0, None).await;
+            return;
+        }
+
+        let config = self.config.clone();
+        let answers_dir = self.answers_dir.clone();
+        let text = text.to_string();
+        let denied = denied.to_vec();
+        let viewer_grace = self.viewer_grace;
+        let action_timeout = self.action_timeout;
+        let cancel_rx = self.action_cancel.subscribe();
+        self.action_waiters.spawn(wait_action_notification(
+            config,
+            answers_dir,
+            id,
+            summary,
+            body,
+            text,
+            denied,
+            viewer_grace,
+            action_timeout,
+            cancel_rx,
+        ));
+    }
+
     /// Show one popup; returns its id so the next one can replace it.
     /// `expire_ms` zero leaves the expiry to the notification server.
     async fn notify(
@@ -1358,6 +1507,88 @@ pub async fn notify(
         }
         String::from_utf8_lossy(&output.stdout).trim().parse().ok()
     }
+}
+
+/// Show a background-task completion popup with an `"Open"` action without
+/// blocking the sequential presenter worker. Clicking `"Open"` launches the
+/// configured viewer on the HTML-disarmed Markdown document.
+#[allow(clippy::too_many_arguments)]
+async fn wait_action_notification(
+    config: PresentConfig,
+    answers_dir: PathBuf,
+    id: u64,
+    summary: String,
+    body: String,
+    text: String,
+    denied: Vec<String>,
+    viewer_grace: Duration,
+    action_timeout: Duration,
+    mut cancel_rx: watch::Receiver<bool>,
+) {
+    let mut command = Command::new(&config.notifier[0]);
+    command
+        .args(&config.notifier[1..])
+        .arg(format!("--app-name={APP_NAME}"))
+        .arg("--urgency=normal")
+        .arg("--action=open=Open")
+        .arg("--")
+        .arg(&summary)
+        .arg(&body)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!("cannot run the notifier {}: {e}", config.notifier[0]);
+            return;
+        }
+    };
+
+    let output = tokio::select! {
+        res = child.wait_with_output() => match res {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::debug!("action notifier wait failed: {e}");
+                return;
+            }
+        },
+        () = tokio::time::sleep(action_timeout) => return,
+        _ = cancel_rx.changed() => return,
+    };
+
+    if !output.status.success() {
+        tracing::debug!(
+            "action notifier exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return;
+    }
+
+    let chosen = String::from_utf8_lossy(&output.stdout);
+    if !chosen.lines().any(|l| l.trim() == "open") {
+        return;
+    }
+
+    let document = format_document(&text, &denied);
+    let file = match write_answer(&answers_dir, id, &document, config.keep_answers) {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::warn!("cannot write task answer file: {e:#}");
+            return;
+        }
+    };
+    let viewer = match spawn_viewer(&config.viewer, &file) {
+        Ok(viewer) => viewer,
+        Err(e) => {
+            report_viewer_failure(&config, &file, &format!("{e:#}"), None).await;
+            return;
+        }
+    };
+    watch_viewer(config, viewer, file, None, viewer_grace).await;
 }
 
 /// Format an answer as Markdown for the viewer, disarming raw HTML and remote
@@ -2604,6 +2835,7 @@ mod tests {
             reason: FailReason::Superseded,
             message: "replaced".to_string(),
             profile: None,
+            background: false,
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 2,
@@ -2842,5 +3074,113 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_complete_action_opens_viewer_without_blocking_interactive_popups() {
+        let dir = std::env::temp_dir().join(format!("hc-task-action-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let opened = dir.join("opened.md");
+
+        let notifier_script = format!(
+            "echo \"$*\" >> '{}'; case \"$*\" in *--action=open=Open*) sleep 0.25; echo open ;; *) echo 7 ;; esac",
+            calls.display()
+        );
+        let viewer_cmd = format!("cp \"$1\" '{}'", opened.display());
+        let config = PresentConfig {
+            notifier: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                notifier_script,
+                "sh".to_string(),
+            ],
+            viewer: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                viewer_cmd,
+                "sh".to_string(),
+                "{file}".to_string(),
+            ],
+            ..PresentConfig::default()
+        };
+
+        let desktop = Desktop::spawn_full(
+            &config,
+            dir.join("answers"),
+            Duration::from_millis(100),
+            PROGRESS_UPDATE_INTERVAL,
+            Duration::from_secs(5),
+        );
+        desktop.present(Presentation::Progress {
+            id: 1,
+            request: "foreground".to_string(),
+            profile: None,
+        });
+        desktop.present(Presentation::TaskComplete {
+            id: 2,
+            request: "bg job".to_string(),
+            text: "# Report\n\n<script>x</script>".to_string(),
+            denied: vec![],
+            profile: Some("deep".to_string()),
+        });
+        desktop.present(Presentation::Answer {
+            id: 1,
+            text: "Quick reply.".to_string(),
+            denied: vec![],
+            profile: None,
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !opened.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(opened.exists(), "clicking Open must launch viewer");
+        let content = std::fs::read_to_string(&opened).unwrap();
+        assert!(content.contains("&lt;script>x&lt;/script>"), "{content}");
+
+        // finish() must abort a hanging unclicked action waiter right away.
+        let hanging_script = "case \"$*\" in *--action=open=Open*) sleep 30 ;; *) echo 7 ;; esac";
+        let config2 = PresentConfig {
+            notifier: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                hanging_script.to_string(),
+                "sh".to_string(),
+            ],
+            viewer: vec!["/bin/true".to_string()],
+            ..PresentConfig::default()
+        };
+        let desktop2 = Desktop::spawn_full(
+            &config2,
+            dir.join("answers2"),
+            Duration::from_millis(50),
+            PROGRESS_UPDATE_INTERVAL,
+            Duration::from_secs(30),
+        );
+        desktop2.present(Presentation::TaskComplete {
+            id: 3,
+            request: "unclicked".to_string(),
+            text: "Short answer".to_string(),
+            denied: vec![],
+            profile: None,
+        });
+        let t0 = Instant::now();
+        desktop2.finish().await;
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "finish stalled on action waiter"
+        );
+
+        desktop.finish().await;
+        let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(recorded.contains("--action=open=Open"), "{recorded}");
+        assert!(recorded.contains("Task complete (deep)"), "{recorded}");
+        assert!(
+            recorded.contains("--replace-id=7 -- Answer Quick reply."),
+            "{recorded}"
+        );
     }
 }

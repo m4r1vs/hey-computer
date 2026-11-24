@@ -39,6 +39,10 @@ pub struct Attachment {
     pub path: PathBuf,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
@@ -54,11 +58,22 @@ pub enum Request {
         /// Optional named profile from `[profiles.<name>]` (or `"default"`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile: Option<String>,
+        /// Run in the background lane (not superseded by newer interactive asks).
+        #[serde(default, skip_serializing_if = "is_false")]
+        background: bool,
+        /// Suppress presentation/stdout when the trimmed answer equals this token.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suppress_token: Option<String>,
         /// Optional file or image attachments (absolute paths read by the daemon).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<Attachment>,
     },
-    Cancel,
+    Cancel {
+        /// When omitted, cancels the active interactive request; when set,
+        /// cancels the matching request/task id (including background tasks).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+    },
     Status,
 }
 
@@ -75,6 +90,9 @@ pub enum Reply {
         /// Commands the agent asked for and was refused.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         denied: Vec<String>,
+        /// True when the answer matched `suppress_token`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        suppressed: bool,
     },
     Failed {
         id: u64,
@@ -145,6 +163,12 @@ pub struct Status {
     pub follow_up_secs: Option<f64>,
     /// Requests answered or failed since the daemon started.
     pub handled: u64,
+    /// Background tasks currently executing.
+    #[serde(default)]
+    pub background_running: usize,
+    /// Background tasks waiting in the FIFO queue.
+    #[serde(default)]
+    pub background_queued: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +206,12 @@ impl std::fmt::Display for Status {
         if let Some(secs) = self.follow_up_secs {
             write!(f, ", follow-ups for {secs:.0} s")?;
         }
+        if self.background_running > 0 {
+            write!(f, ", {} background running", self.background_running)?;
+        }
+        if self.background_queued > 0 {
+            write!(f, ", {} queued", self.background_queued)?;
+        }
         write!(f, ", {} handled", self.handled)
     }
 }
@@ -211,9 +241,16 @@ mod tests {
                 wait: false,
                 new: false,
                 profile: None,
+                background: false,
+                suppress_token: None,
                 attachments: vec![],
             }
         );
+        let cancel: Request = serde_json::from_str(r#"{"type":"cancel"}"#).unwrap();
+        assert_eq!(cancel, Request::Cancel { id: None });
+        assert_eq!(encode(&cancel), r#"{"type":"cancel"}"#);
+        let cancel_id: Request = serde_json::from_str(r#"{"type":"cancel","id":5}"#).unwrap();
+        assert_eq!(cancel_id, Request::Cancel { id: Some(5) });
     }
 
     #[test]
@@ -224,12 +261,15 @@ mod tests {
                 wait: true,
                 new: true,
                 profile: Some("deep".to_string()),
+                background: true,
+                suppress_token: Some("HEARTBEAT_OK".to_string()),
                 attachments: vec![Attachment {
                     kind: AttachmentKind::Image,
                     path: PathBuf::from("/tmp/shot.png"),
                 }],
             },
-            Request::Cancel,
+            Request::Cancel { id: None },
+            Request::Cancel { id: Some(9) },
             Request::Status,
         ] {
             let line = encode(&request);
@@ -246,11 +286,13 @@ mod tests {
                 id: 3,
                 text: "line one\nline two".to_string(),
                 denied: vec![],
+                suppressed: false,
             },
             Reply::Answer {
                 id: 4,
                 text: String::new(),
                 denied: vec!["sudo true".to_string()],
+                suppressed: true,
             },
             Reply::Failed {
                 id: 5,
@@ -270,6 +312,8 @@ mod tests {
                 running_profile: Some("deep".to_string()),
                 follow_up_secs: None,
                 handled: 1,
+                background_running: 1,
+                background_queued: 2,
             }),
             Reply::Error {
                 message: "bad".to_string(),

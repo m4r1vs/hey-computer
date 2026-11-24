@@ -1,16 +1,12 @@
-//! The conductor: one task that owns the agent and runs one request at a time.
+//! The conductor: multi-lane coordinator that owns the ACP agent process and
+//! runs one interactive lane alongside a bounded FIFO background task lane.
 //!
-//! Everything that can interrupt a request (a newer request, `cancel`, a
-//! client that hangs up, the agent dying, the agent going quiet) meets in one
-//! `select!` here, so there is a single place that decides what happens to the
-//! request and to the agent.
-//!
-//! Requests reach the conductor through a [`Handle`]. The handle numbers them
-//! and cancels the one before as it queues the next, so the conductor only
-//! ever starts the newest; it answers older ones as superseded without running
-//! them.
+//! All concurrent turns share one warm `acp::Connection` through cloneable
+//! `acp::Client` handles and per-`sessionId` subscriptions, while lifecycle
+//! transitions (start, restart, idle stop, follow-up tracking, queueing, and
+//! shutdown) stay serialized inside `Conductor::run`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,12 +15,14 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::acp::{self, CallError, Connection, Incoming};
+use crate::acp::{
+    self, CallError, Client as AcpClient, Connection, SessionEvent, SessionSubscription,
+};
 use crate::attachments::{self, LoadedAttachment};
 use crate::config::{Config, MAX_RESTART_DELAY_SECS, ResolvedProfile, secs};
 use crate::context::{self, ContextProvider, SystemContext};
 use crate::environment::{self, Paths};
-use crate::policy::Policy;
+use crate::policy::{LanePolicy, PermissionDecision};
 use crate::present::{Presentation, Presenter};
 use crate::protocol::{AgentState, FailReason, Reply, Status};
 use crate::store::{self, Lane, NewTurn, Store, TurnStatus};
@@ -49,11 +47,28 @@ pub enum Sink {
     Client(oneshot::Sender<Reply>),
 }
 
+/// Parameters submitted to [`Handle::ask`].
+pub struct AskParams {
+    pub text: String,
+    pub new: bool,
+    pub profile: Option<String>,
+    pub background: bool,
+    pub suppress_token: Option<String>,
+    pub attachments: Vec<LoadedAttachment>,
+}
+
 /// What became of a request.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
-    Answer { text: String, denied: Vec<String> },
-    Failed { reason: FailReason, message: String },
+    Answer {
+        text: String,
+        denied: Vec<String>,
+        suppressed: bool,
+    },
+    Failed {
+        reason: FailReason,
+        message: String,
+    },
 }
 
 impl Outcome {
@@ -66,7 +81,16 @@ impl Outcome {
 
     pub fn into_reply(self, id: u64) -> Reply {
         match self {
-            Self::Answer { text, denied } => Reply::Answer { id, text, denied },
+            Self::Answer {
+                text,
+                denied,
+                suppressed,
+            } => Reply::Answer {
+                id,
+                text,
+                denied,
+                suppressed,
+            },
             Self::Failed { reason, message } => Reply::Failed {
                 id,
                 reason,
@@ -132,6 +156,8 @@ pub struct Ask {
     pub text: String,
     pub new: bool,
     pub profile: Option<String>,
+    pub background: bool,
+    pub suppress_token: Option<String>,
     pub attachments: Vec<LoadedAttachment>,
     pub sink: Sink,
     pub token: Arc<CancelToken>,
@@ -139,15 +165,22 @@ pub struct Ask {
 
 enum Message {
     Ask(Ask),
+    Wake,
     Shutdown,
 }
 
 /// What the socket handlers can see and do without waiting for the conductor.
 struct Shared {
     next_id: u64,
-    /// The newest request, which is the only one that may still run.
-    latest: Option<(u64, Arc<CancelToken>)>,
+    /// The newest interactive request, which is the only interactive one that
+    /// may still run.
+    fg_latest: Option<(u64, Arc<CancelToken>)>,
+    /// Active or queued background tasks indexed by task id.
+    bg_tasks: HashMap<u64, Arc<CancelToken>>,
+    bg_running: usize,
+    bg_queued: usize,
     agent: AgentState,
+    /// Currently running interactive request `(id, started, profile)`.
     running: Option<(u64, Instant, Option<String>)>,
     follow_up_until: Option<Instant>,
     handled: u64,
@@ -171,55 +204,87 @@ impl Handle {
         self.config.resolve_profile(profile).map(|_| ())
     }
 
-    /// Queue a request, superseding the one before. Returns its number.
-    pub fn ask(
-        &self,
-        text: String,
-        new: bool,
-        profile: Option<String>,
-        attachments: Vec<LoadedAttachment>,
-        sink: Sink,
-    ) -> u64 {
+    /// Queue an interactive or background request. Returns its monotonic id,
+    /// or an error if the background queue is full.
+    pub fn ask(&self, params: AskParams, sink: Sink) -> std::result::Result<u64, String> {
         let token = Arc::new(CancelToken::default());
+        let lane = if params.background {
+            Lane::Background
+        } else {
+            Lane::Interactive
+        };
         let id = {
             let mut shared = self
                 .shared
                 .lock()
                 .expect("the shared state is never poisoned");
-            shared.next_id += 1;
-            let id = shared.next_id;
-            if let Some((_, previous)) = shared.latest.replace((id, Arc::clone(&token))) {
-                previous.cancel(FailReason::Superseded);
+            if params.background {
+                if shared.bg_queued >= self.config.tasks.max_queued {
+                    return Err(format!(
+                        "too many background tasks queued (limit {})",
+                        self.config.tasks.max_queued
+                    ));
+                }
+                shared.next_id += 1;
+                let id = shared.next_id;
+                shared.bg_tasks.insert(id, Arc::clone(&token));
+                shared.bg_queued += 1;
+                id
+            } else {
+                shared.next_id += 1;
+                let id = shared.next_id;
+                if let Some((_, previous)) = shared.fg_latest.replace((id, Arc::clone(&token))) {
+                    previous.cancel(FailReason::Superseded);
+                }
+                id
             }
-            id
         };
+        let stored_profile = params
+            .profile
+            .as_deref()
+            .or(if params.background {
+                self.config.tasks.profile.as_deref()
+            } else {
+                None
+            })
+            .filter(|p| *p != "default")
+            .unwrap_or("")
+            .to_string();
         if let Some(store) = &self.store {
             store.create_turn(NewTurn {
                 id,
-                lane: Lane::Interactive,
+                lane,
                 status: TurnStatus::Queued,
-                profile: profile
-                    .as_deref()
-                    .filter(|p| *p != "default")
-                    .unwrap_or("")
-                    .to_string(),
+                profile: stored_profile,
                 created_at_ms: store::unix_timestamp_ms(),
-                request: text.clone(),
-                attachments: attachments.iter().map(LoadedAttachment::meta).collect(),
+                request: params.text.clone(),
+                attachments: params
+                    .attachments
+                    .iter()
+                    .map(LoadedAttachment::meta)
+                    .collect(),
             });
         }
         let ask = Ask {
             id,
-            text,
-            new,
-            profile,
-            attachments,
+            text: params.text,
+            new: params.new,
+            profile: params.profile,
+            background: params.background,
+            suppress_token: params.suppress_token,
+            attachments: params.attachments,
             sink,
             token,
         };
         if let Err(mpsc::error::SendError(Message::Ask(ask))) =
             self.messages.send(Message::Ask(ask))
         {
+            if let Ok(mut shared) = self.shared.lock()
+                && ask.background
+            {
+                shared.bg_tasks.remove(&ask.id);
+                shared.bg_queued = shared.bg_queued.saturating_sub(1);
+            }
             if let Some(store) = &self.store {
                 store.finish_failed(
                     id,
@@ -235,18 +300,36 @@ impl Handle {
                 None,
             );
         }
-        id
+        Ok(id)
     }
 
-    /// Cancel the newest request if it has not finished, or only request
-    /// `only` if given. Returns the request that was cancelled.
+    /// Cancel the active interactive request (`only == None`), or a specific
+    /// interactive or background request (`only == Some(id)`).
     pub fn cancel(&self, only: Option<u64>, reason: FailReason) -> Option<u64> {
-        let shared = self.shared.lock().ok()?;
-        let (id, token) = shared.latest.as_ref()?;
-        if only.is_some_and(|only| only != *id) {
-            return None;
+        let cancelled = {
+            let shared = self.shared.lock().ok()?;
+            match only {
+                None => {
+                    let (id, token) = shared.fg_latest.as_ref()?;
+                    token.cancel(reason).then_some(*id)
+                }
+                Some(target) => {
+                    if let Some((id, token)) = shared.fg_latest.as_ref()
+                        && *id == target
+                    {
+                        token.cancel(reason).then_some(*id)
+                    } else if let Some(token) = shared.bg_tasks.get(&target) {
+                        token.cancel(reason).then_some(target)
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+        if cancelled.is_some() {
+            let _ = self.messages.send(Message::Wake);
         }
-        token.cancel(reason).then_some(*id)
+        cancelled
     }
 
     pub fn status(&self) -> Status {
@@ -256,7 +339,7 @@ impl Handle {
             .expect("the shared state is never poisoned");
         let now = Instant::now();
         let waiting = shared
-            .latest
+            .fg_latest
             .as_ref()
             .filter(|(_, token)| {
                 token.reason().is_none() && !token.state.lock().map(|s| s.finished).unwrap_or(true)
@@ -280,6 +363,8 @@ impl Handle {
                 .filter(|until| *until > now)
                 .map(|until| (until - now).as_secs_f64()),
             handled: shared.handled,
+            background_running: shared.bg_running,
+            background_queued: shared.bg_queued,
         }
     }
 
@@ -317,29 +402,40 @@ pub fn spawn_with_store(
     };
     let shared = Arc::new(Mutex::new(Shared {
         next_id: initial_last_id,
-        latest: None,
+        fg_latest: None,
+        bg_tasks: HashMap::new(),
+        bg_running: 0,
+        bg_queued: 0,
         agent: AgentState::Down,
         running: None,
         follow_up_until: None,
         handled: 0,
     }));
     let (messages, inbox) = mpsc::unbounded_channel();
+    let (done_tx, done_rx) = mpsc::unbounded_channel();
     let stop = Arc::new(CancelToken::default());
     let conductor = Conductor {
-        policy: Policy::new(&config.permissions.deny),
+        policy: Arc::new(LanePolicy::standard(&config.permissions.deny)),
         config: Arc::clone(&config),
         presenter,
         context,
         store: store.clone(),
         shared: Arc::clone(&shared),
         inbox,
+        done_tx,
+        done_rx,
         stop: Arc::clone(&stop),
         live: None,
         paths: None,
         conversation: None,
+        fg_active: None,
+        fg_pending: None,
+        bg_active: HashSet::new(),
+        bg_queue: VecDeque::new(),
         failures: 0,
         restart_at: None,
         last_used: Instant::now(),
+        last_death_detail: None,
     };
     let task = tokio::spawn(conductor.run());
     (
@@ -361,17 +457,20 @@ struct SpareSession {
     thought_level: String,
 }
 
-/// A running agent.
+/// A running agent process shared by concurrent lanes.
 struct Live {
     conn: Connection,
-    incoming: mpsc::UnboundedReceiver<Incoming>,
+    exited: Option<oneshot::Receiver<()>>,
     started: Instant,
-    /// A session made ahead of time: the first session/new of an agent
-    /// process takes about a second, later ones about 20 ms.
+    /// A session made ahead of time for the default interactive profile.
     spare: Option<SpareSession>,
-    /// Initial `(model, thought_level)` reported by the agent's first
-    /// `session/new`, used when switching back to an empty config value.
+    /// Initial `(model, thought_level)` reported by the agent's first `session/new`.
     agent_defaults: (String, String),
+    /// Set when one session wedged on cancel while sibling lanes are still active;
+    /// stop and restart the agent once active turns drain.
+    draining: bool,
+    /// Set on `auth_required`; stop the agent (without auto-restart) once idle.
+    auth_failed: bool,
 }
 
 struct Conversation {
@@ -386,29 +485,48 @@ struct Conversation {
     turns: u32,
 }
 
+struct TurnFinished {
+    ask: Ask,
+    session: String,
+    used_profile: Option<String>,
+    started: Instant,
+    end: TurnEnd,
+}
+
 struct Conductor {
     config: Arc<Config>,
     presenter: Arc<dyn Presenter>,
     context: Arc<dyn ContextProvider>,
     store: Option<Store>,
-    policy: Policy,
+    policy: Arc<LanePolicy>,
     shared: Arc<Mutex<Shared>>,
     inbox: mpsc::UnboundedReceiver<Message>,
+    done_tx: mpsc::UnboundedSender<TurnFinished>,
+    done_rx: mpsc::UnboundedReceiver<TurnFinished>,
     stop: Arc<CancelToken>,
     live: Option<Live>,
     paths: Option<Paths>,
     conversation: Option<Conversation>,
+    fg_active: Option<u64>,
+    fg_pending: Option<Ask>,
+    bg_active: HashSet<u64>,
+    bg_queue: VecDeque<Ask>,
     /// Agent deaths in a row, for the restart back-off.
     failures: u32,
     restart_at: Option<Instant>,
     last_used: Instant,
+    /// Last reaped exit detail from `agent_died`, shared across any turns that
+    /// failed on the same agent crash.
+    last_death_detail: Option<String>,
 }
 
 /// How one turn ended.
 struct TurnEnd {
     outcome: Outcome,
-    /// False when the agent died or had to be killed.
+    /// False when the agent stdout closed mid-turn.
     alive: bool,
+    /// True when `session/cancel` timed out and the session is wedged.
+    wedged: bool,
     /// The session should not be continued (for example, the agent refused
     /// the prompt, timed out, or hit a per-turn budget).
     broken: bool,
@@ -419,7 +537,7 @@ struct TurnEnd {
 
 enum Step {
     Responded(Result<Result<Value, CallError>, oneshot::error::RecvError>),
-    Event(Option<Incoming>),
+    Event(Option<SessionEvent>),
     Quiet,
     TurnTimeout,
     Cancelled(FailReason),
@@ -433,7 +551,7 @@ struct Budgets {
 }
 
 struct TurnContext<'a> {
-    policy: &'a Policy,
+    policy: &'a LanePolicy,
     budgets: Budgets,
     progress: Option<&'a Arc<dyn Presenter>>,
     id: u64,
@@ -488,6 +606,40 @@ impl ToolTracker {
     }
 }
 
+/// Check whether a completed answer matches `suppress_token` (e.g.
+/// `HEARTBEAT_OK`). Never suppresses when commands were refused.
+pub fn is_suppressed(text: &str, token: &str, denied: &[String]) -> bool {
+    if !denied.is_empty() {
+        return false;
+    }
+    let target = token.trim();
+    if target.is_empty() {
+        return false;
+    }
+    let mut candidate = text.trim();
+    if let Some(inner) = candidate
+        .strip_prefix("```")
+        .and_then(|rest| rest.strip_suffix("```"))
+    {
+        candidate = match inner.find('\n') {
+            Some(nl) => inner[nl + 1..].trim(),
+            None => inner.trim(),
+        };
+    } else if let Some(inner) = candidate
+        .strip_prefix("**")
+        .and_then(|rest| rest.strip_suffix("**"))
+    {
+        candidate = inner.trim();
+    } else if let Some(inner) = candidate
+        .strip_prefix('`')
+        .and_then(|rest| rest.strip_suffix('`'))
+    {
+        candidate = inner.trim();
+    }
+    candidate = candidate.trim_end_matches(['.', '!']).trim();
+    candidate == target
+}
+
 impl Conductor {
     async fn run(mut self) {
         let stop = Arc::clone(&self.stop);
@@ -506,22 +658,39 @@ impl Conductor {
                 break;
             }
             tokio::select! {
-                // A queued request goes first; whatever the agent sent in the
-                // meantime is read by `drain_stale` before the request runs.
-                // In a fixed order, a late update of a cancelled turn is
-                // handled the same way every time.
+                // Keep a deterministic biased order: completions, then inbox,
+                // then agent exit, then timers.
                 biased;
+                finished = self.done_rx.recv() => {
+                    if let Some(finished) = finished {
+                        self.handle_finished(finished).await;
+                        self.dispatch_ready().await;
+                    }
+                }
                 message = self.inbox.recv() => match message {
-                    Some(Message::Ask(ask)) => self.take(ask).await,
+                    Some(Message::Ask(ask)) => {
+                        self.enqueue(ask);
+                        self.dispatch_ready().await;
+                    }
+                    Some(Message::Wake) => {
+                        self.evict_cancelled_queued();
+                        self.dispatch_ready().await;
+                    }
                     Some(Message::Shutdown) | None => break,
                 },
-                event = next_event(&mut self.live) => self.between_turns(event).await,
+                () = wait_exited(&mut self.live) => {
+                    if let Some(live) = self.live.take() {
+                        let detail = self.agent_died(live).await;
+                        self.last_death_detail = Some(detail);
+                    }
+                }
                 () = sleep_until(restart_at) => {
                     self.restart_at = None;
                     tokio::select! {
                         () = self.start_warm() => {}
                         _ = stop.cancelled() => {}
                     }
+                    self.dispatch_ready().await;
                 }
                 () = sleep_until(idle_at) => {
                     tracing::info!("stopping the idle agent");
@@ -529,21 +698,555 @@ impl Conductor {
                 }
             }
         }
-        // Whatever is still queued gets an answer.
+
+        // Let active turns complete their cancel_turn and report outcomes.
+        let shutdown_deadline = tokio::time::Instant::now() + CANCEL_GRACE;
+        while self.has_active_turns() {
+            tokio::select! {
+                finished = self.done_rx.recv() => match finished {
+                    Some(finished) => self.handle_finished(finished).await,
+                    None => break,
+                },
+                () = tokio::time::sleep_until(shutdown_deadline) => break,
+            }
+        }
+
+        // Drain anything still waiting in queues or the inbox.
+        if let Some(ask) = self.fg_pending.take() {
+            let profile = self.effective_display_profile(&ask);
+            self.finish_request(ask, cancelled(FailReason::AgentDown), profile, false);
+        }
+        while let Some(ask) = self.bg_queue.pop_front() {
+            let profile = self.effective_display_profile(&ask);
+            self.finish_request(ask, cancelled(FailReason::AgentDown), profile, true);
+        }
         while let Ok(message) = self.inbox.try_recv() {
             if let Message::Ask(ask) = message {
                 let profile = self.effective_display_profile(&ask);
-                self.finish(ask, cancelled(FailReason::AgentDown), profile);
+                let was_queued_bg = ask.background;
+                self.finish_request(
+                    ask,
+                    cancelled(FailReason::AgentDown),
+                    profile,
+                    was_queued_bg,
+                );
             }
         }
         self.stop_agent().await;
     }
 
+    fn has_active_turns(&self) -> bool {
+        self.fg_active.is_some() || !self.bg_active.is_empty()
+    }
+
+    fn enqueue(&mut self, ask: Ask) {
+        if ask.background {
+            self.bg_queue.push_back(ask);
+        } else {
+            if let Some(old) = self.fg_pending.replace(ask) {
+                let reason = old.token.reason().unwrap_or(FailReason::Superseded);
+                let profile = self.effective_display_profile(&old);
+                self.finish_request(old, cancelled(reason), profile, false);
+            }
+        }
+    }
+
+    fn evict_cancelled_queued(&mut self) {
+        if let Some(pending) = &self.fg_pending
+            && let Some(reason) = pending.token.reason()
+        {
+            let ask = self.fg_pending.take().expect("checked");
+            let profile = self.effective_display_profile(&ask);
+            self.finish_request(ask, cancelled(reason), profile, false);
+        }
+        let mut remaining = VecDeque::with_capacity(self.bg_queue.len());
+        while let Some(ask) = self.bg_queue.pop_front() {
+            if let Some(reason) = ask.token.reason() {
+                let profile = self.effective_display_profile(&ask);
+                self.finish_request(ask, cancelled(reason), profile, true);
+            } else {
+                remaining.push_back(ask);
+            }
+        }
+        self.bg_queue = remaining;
+    }
+
+    async fn dispatch_ready(&mut self) {
+        self.evict_cancelled_queued();
+        if self.stop.reason().is_some() {
+            return;
+        }
+        // Finish draining a wedged or unauthenticated agent once all sibling
+        // turns have completed.
+        if let Some(live) = &self.live
+            && (live.draining || live.auth_failed)
+        {
+            if self.has_active_turns() {
+                return;
+            }
+            let auth_failed = live.auth_failed;
+            self.stop_agent().await;
+            if !auth_failed {
+                self.schedule_restart_if_warm();
+            }
+        }
+
+        loop {
+            self.evict_cancelled_queued();
+            if self.stop.reason().is_some() {
+                return;
+            }
+            let can_fg = self.fg_active.is_none() && self.fg_pending.is_some();
+            let can_bg = self.bg_active.len() < self.config.tasks.max_concurrent
+                && !self.bg_queue.is_empty();
+            if !can_fg && !can_bg {
+                return;
+            }
+
+            if can_fg {
+                let ask = self.fg_pending.take().expect("checked");
+                self.launch_ask(ask).await;
+            } else if can_bg {
+                let ask = self.bg_queue.pop_front().expect("checked");
+                if let Ok(mut shared) = self.shared.lock() {
+                    shared.bg_queued = shared.bg_queued.saturating_sub(1);
+                }
+                self.launch_ask(ask).await;
+            }
+
+            // If a turn aborted early or drained the agent, re-evaluate loop condition.
+            if self
+                .live
+                .as_ref()
+                .is_some_and(|l| l.draining || l.auth_failed)
+            {
+                return;
+            }
+        }
+    }
+
+    async fn launch_ask(&mut self, ask: Ask) {
+        let display_profile = self.effective_display_profile(&ask);
+        if let Some(reason) = ask.token.reason() {
+            self.finish_request(ask, cancelled(reason), display_profile, false);
+            return;
+        }
+
+        if !ask.background {
+            if let Ok(mut shared) = self.shared.lock() {
+                shared.running = Some((ask.id, Instant::now(), display_profile.clone()));
+            }
+            if matches!(ask.sink, Sink::Present) {
+                self.presenter.present(Presentation::Progress {
+                    id: ask.id,
+                    request: attachments::progress_label(&ask.text, &ask.attachments),
+                    profile: display_profile.clone(),
+                });
+            }
+        }
+
+        let started = Instant::now();
+        let attach_summary = if ask.attachments.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", attachments::summary_for_log(&ask.attachments))
+        };
+        tracing::info!(
+            "{} {}: {} characters{}{}",
+            if ask.background { "task" } else { "request" },
+            ask.id,
+            ask.text.chars().count(),
+            display_profile
+                .as_deref()
+                .map(|p| format!(", profile {p}"))
+                .unwrap_or_default(),
+            attach_summary,
+        );
+        tracing::debug!("request {}: {:?}", ask.id, ask.text);
+
+        let token = Arc::clone(&ask.token);
+        let stop = Arc::clone(&self.stop);
+        let interrupts = Interrupts {
+            request: &token,
+            stop: &stop,
+        };
+
+        let mut retried_auth = false;
+        let (session, resolved, conv_id) = loop {
+            let was_live = self.live.is_some();
+            if !was_live {
+                self.restart_at = None;
+                // Only a shutdown interrupts cold start; a superseding request
+                // needs the same agent process.
+                let start = tokio::select! {
+                    result = self.start_agent() => result,
+                    reason = stop.cancelled() => {
+                        self.set_agent(AgentState::Down);
+                        self.finish_request(ask, cancelled(reason), display_profile, false);
+                        return;
+                    }
+                };
+                if let Err(e) = start {
+                    self.schedule_restart_if_warm();
+                    self.finish_request(
+                        ask,
+                        Outcome::failed(
+                            FailReason::AgentDown,
+                            format!("Cannot start the assistant: {e:#}"),
+                        ),
+                        display_profile,
+                        false,
+                    );
+                    return;
+                }
+                if let Some(reason) = token.reason() {
+                    self.finish_request(ask, cancelled(reason), display_profile, false);
+                    return;
+                }
+            }
+
+            let session_result = if ask.background {
+                let effective_req = ask
+                    .profile
+                    .clone()
+                    .or_else(|| self.config.tasks.profile.clone());
+                tokio::select! {
+                    res = self.new_background_session(effective_req.as_deref()) => res.map(|(s, r)| (s, r, None)),
+                    reason = interrupts.wait() => {
+                        self.finish_request(ask, cancelled(reason), display_profile, false);
+                        return;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    res = self.session_for(ask.id, ask.new, ask.profile.as_deref()) => res.map(|(s, r)| {
+                        let cid = self.conversation.as_ref().map(|c| c.conversation_id);
+                        (s, r, cid)
+                    }),
+                    reason = interrupts.wait() => {
+                        self.finish_request(ask, cancelled(reason), display_profile, false);
+                        return;
+                    }
+                }
+            };
+
+            match session_result {
+                Ok(triple) => break triple,
+                Err(outcome) => {
+                    if was_live
+                        && !retried_auth
+                        && self.live.is_none()
+                        && matches!(
+                            outcome,
+                            Outcome::Failed {
+                                reason: FailReason::AgentError,
+                                ..
+                            }
+                        )
+                    {
+                        retried_auth = true;
+                        continue;
+                    }
+                    self.finish_request(ask, outcome, display_profile, false);
+                    return;
+                }
+            }
+        };
+
+        let Some(live) = &self.live else {
+            self.finish_request(
+                ask,
+                Outcome::failed(FailReason::AgentDown, "the assistant exited"),
+                resolved.name,
+                false,
+            );
+            return;
+        };
+
+        let used_profile = resolved.name.clone();
+        if let Some(store) = &self.store {
+            store.mark_running(
+                ask.id,
+                session.clone(),
+                conv_id,
+                used_profile.clone().unwrap_or_default(),
+                store::unix_timestamp_ms(),
+            );
+        }
+
+        let client = live.conn.client();
+        let subscription = client.subscribe(&session);
+
+        if ask.background {
+            self.bg_active.insert(ask.id);
+            if let Ok(mut shared) = self.shared.lock() {
+                shared.bg_running = self.bg_active.len();
+            }
+        } else {
+            self.fg_active = Some(ask.id);
+            if let Ok(mut shared) = self.shared.lock() {
+                shared.running = Some((ask.id, started, used_profile.clone()));
+            }
+        }
+
+        let budgets = Budgets {
+            inactivity: resolved.inactivity,
+            max_turn: resolved.max_turn,
+            max_tool_calls: resolved.max_tool_calls,
+        };
+        let config = Arc::clone(&self.config);
+        let context_provider = Arc::clone(&self.context);
+        let policy = Arc::clone(&self.policy);
+        let presenter = (!ask.background && matches!(ask.sink, Sink::Present))
+            .then(|| Arc::clone(&self.presenter));
+        let done_tx = self.done_tx.clone();
+        let stop = Arc::clone(&self.stop);
+
+        tokio::spawn(async move {
+            let token = Arc::clone(&ask.token);
+            let interrupts = Interrupts {
+                request: &token,
+                stop: &stop,
+            };
+            let header = if config.context.is_enabled() {
+                tokio::select! {
+                    header = context_provider.gather(&config.context) => header,
+                    reason = interrupts.wait() => {
+                        let _ = done_tx.send(TurnFinished {
+                            ask,
+                            session,
+                            used_profile,
+                            started,
+                            end: TurnEnd {
+                                outcome: cancelled(reason),
+                                alive: true,
+                                wedged: false,
+                                broken: false,
+                                auth_required: false,
+                            },
+                        });
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(header) = &header {
+                tracing::debug!("request {}: ambient context: {:?}", ask.id, header);
+            }
+            let effective_text = if ask.text.trim().is_empty() && !ask.attachments.is_empty() {
+                attachments::default_prompt(&ask.attachments)
+            } else {
+                &ask.text
+            };
+            let prompt = context::prepend(header.as_deref(), effective_text);
+            let blocks = attachments::build_prompt_blocks(&prompt, &ask.attachments);
+            let ctx = TurnContext {
+                policy: &policy,
+                budgets,
+                progress: presenter.as_ref(),
+                id: ask.id,
+            };
+            let end = turn(&client, subscription, &session, blocks, interrupts, &ctx).await;
+            let _ = done_tx.send(TurnFinished {
+                ask,
+                session,
+                used_profile,
+                started,
+                end,
+            });
+        });
+    }
+
+    async fn handle_finished(&mut self, finished: TurnFinished) {
+        let TurnFinished {
+            ask,
+            session,
+            used_profile,
+            started,
+            mut end,
+        } = finished;
+
+        if ask.background {
+            self.bg_active.remove(&ask.id);
+            if let Ok(mut shared) = self.shared.lock() {
+                shared.bg_running = self.bg_active.len();
+            }
+        } else if self.fg_active == Some(ask.id) {
+            self.fg_active = None;
+        }
+
+        // Apply --suppress-token check before updating follow-up window or persistence.
+        if let Some(token) = ask.suppress_token.as_deref()
+            && let Outcome::Answer {
+                text,
+                denied,
+                suppressed,
+            } = &mut end.outcome
+            && is_suppressed(text, token, denied)
+        {
+            *suppressed = true;
+            tracing::info!(
+                "{} {}: suppressed (matched token)",
+                if ask.background { "task" } else { "request" },
+                ask.id
+            );
+        }
+
+        if end.alive {
+            if end.auth_required {
+                if !self.has_active_turns() {
+                    self.stop_agent().await;
+                } else if let Some(live) = &mut self.live {
+                    live.auth_failed = true;
+                }
+            } else if end.wedged {
+                if let Some(live) = &self.live {
+                    drop(
+                        live.conn
+                            .start_call("session/close", json!({"sessionId": session})),
+                    );
+                }
+                if !ask.background
+                    && self
+                        .conversation
+                        .as_ref()
+                        .is_some_and(|c| c.session == session)
+                {
+                    self.conversation = None;
+                    self.set_follow_up(None);
+                }
+                if !self.has_active_turns() {
+                    self.stop_agent().await;
+                    self.schedule_restart_if_warm();
+                } else if let Some(live) = &mut self.live {
+                    live.draining = true;
+                }
+            } else if ask.background {
+                if let Some(live) = &self.live {
+                    drop(
+                        live.conn
+                            .start_call("session/close", json!({"sessionId": session})),
+                    );
+                }
+            } else if end.broken {
+                if let Some(old) = self.conversation.take()
+                    && let Some(live) = &self.live
+                {
+                    drop(
+                        live.conn
+                            .start_call("session/close", json!({"sessionId": old.session})),
+                    );
+                }
+                self.set_follow_up(None);
+            } else if let Some(conversation) = &mut self.conversation
+                && conversation.session == session
+            {
+                let suppressed = matches!(
+                    end.outcome,
+                    Outcome::Answer {
+                        suppressed: true,
+                        ..
+                    }
+                );
+                if !suppressed {
+                    conversation.last = Instant::now();
+                    conversation.turns += 1;
+                    let until = secs(self.config.conversation.follow_up_secs)
+                        .and_then(|window| conversation.last.checked_add(window));
+                    self.set_follow_up(until);
+                }
+            }
+        } else {
+            let detail = match self.live.take() {
+                Some(live) => {
+                    let detail = self.agent_died(live).await;
+                    self.last_death_detail = Some(detail.clone());
+                    detail
+                }
+                None => self.last_death_detail.clone().unwrap_or_default(),
+            };
+            if let Outcome::Failed {
+                reason: FailReason::AgentDown,
+                message,
+            } = &end.outcome
+                && !detail.is_empty()
+            {
+                end.outcome =
+                    Outcome::failed(FailReason::AgentDown, format!("{message} ({detail})"));
+            }
+        }
+
+        if matches!(end.outcome, Outcome::Answer { .. }) {
+            self.failures = 0;
+        }
+        self.last_used = Instant::now();
+        log_outcome(ask.id, &end.outcome, started);
+        self.finish_request(ask, end.outcome, used_profile, false);
+    }
+
+    fn finish_request(
+        &mut self,
+        ask: Ask,
+        outcome: Outcome,
+        profile: Option<String>,
+        was_queued_bg: bool,
+    ) {
+        ask.token.finish();
+        if let Ok(mut shared) = self.shared.lock() {
+            if ask.background {
+                shared.bg_tasks.remove(&ask.id);
+                if was_queued_bg {
+                    shared.bg_queued = shared.bg_queued.saturating_sub(1);
+                }
+            } else if shared
+                .running
+                .as_ref()
+                .is_some_and(|(id, _, _)| *id == ask.id)
+            {
+                shared.running = None;
+            }
+            shared.handled += 1;
+        }
+        if let Some(store) = &self.store {
+            let now_ms = store::unix_timestamp_ms();
+            match &outcome {
+                Outcome::Answer {
+                    suppressed: true, ..
+                } => {
+                    store.finish_suppressed(
+                        ask.id,
+                        ask.suppress_token.clone().unwrap_or_default(),
+                        now_ms,
+                    );
+                }
+                Outcome::Answer { text, denied, .. } => {
+                    store.finish_completed(ask.id, text.clone(), denied.clone(), now_ms);
+                }
+                Outcome::Failed {
+                    reason: reason @ (FailReason::Cancelled | FailReason::Superseded),
+                    message,
+                } => {
+                    store.finish_cancelled(ask.id, *reason, message.clone(), now_ms);
+                }
+                Outcome::Failed { reason, message } => {
+                    store.finish_failed(ask.id, *reason, message.clone(), now_ms);
+                }
+            }
+        }
+        deliver(Some(&self.presenter), ask, outcome, profile);
+    }
+
     fn effective_display_profile(&self, ask: &Ask) -> Option<String> {
-        match ask.profile.as_deref() {
+        let raw = ask.profile.as_deref().or(if ask.background {
+            self.config.tasks.profile.as_deref()
+        } else {
+            None
+        });
+        match raw {
             Some("default") => None,
             Some(name) => Some(name.to_string()),
-            None => {
+            None if !ask.background => {
                 let window = secs(self.config.conversation.follow_up_secs);
                 if !ask.new
                     && let Some(conv) = &self.conversation
@@ -554,12 +1257,16 @@ impl Conductor {
                     None
                 }
             }
+            None => None,
         }
     }
 
     fn idle_deadline(&self) -> Option<Instant> {
         let idle = secs(self.config.agent.idle_stop_secs)?;
         self.live.as_ref()?;
+        if self.has_active_turns() || self.fg_pending.is_some() || !self.bg_queue.is_empty() {
+            return None;
+        }
         self.last_used.checked_add(idle)
     }
 
@@ -593,8 +1300,6 @@ impl Conductor {
                     });
                 }
             }
-            // An expired login shows up here; call_failed has stopped the
-            // unauthenticated agent so the next request starts fresh.
             Err(Outcome::Failed { message, .. }) => {
                 if self.live.is_some() {
                     tracing::warn!("the agent is up but cannot open a session: {message}");
@@ -624,7 +1329,7 @@ impl Conductor {
         // The agent is not running, so nothing it has open is deleted.
         environment::prune_history(&paths.agent_dir, self.config.agent.history_days);
         let argv = paths.agent_command(&self.config);
-        let (conn, incoming) = Connection::spawn(&argv, &paths.workspace, &paths.state_dir)?;
+        let (conn, exited) = Connection::spawn(&argv, &paths.workspace, &paths.state_dir)?;
         let init = conn
             .call(
                 "initialize",
@@ -642,8 +1347,6 @@ impl Conductor {
         let result = match init {
             Ok(result) => result,
             Err(e) => {
-                // Nothing has been asked yet, so its stderr can only be about
-                // starting up (a missing login, say) and may be logged.
                 let ended = conn.reap().await;
                 return Err(anyhow!(
                     "the agent did not initialize ({e}); it ended with {ended}"
@@ -666,13 +1369,16 @@ impl Conductor {
             "{agent} {agent_version} started in {:.2} s",
             started.elapsed().as_secs_f64()
         );
+        self.last_death_detail = None;
         self.paths = Some(paths);
         self.live = Some(Live {
             conn,
-            incoming,
+            exited: Some(exited),
             started: Instant::now(),
             spare: None,
             agent_defaults: (String::new(), String::new()),
+            draining: false,
+            auth_failed: false,
         });
         Ok(())
     }
@@ -689,11 +1395,16 @@ impl Conductor {
     fn schedule_restart(&mut self) {
         let base = self.config.agent.restart_delay_secs.max(0.05);
         let factor = 2f64.powi(self.failures.min(10) as i32);
-        // Capped before it becomes a Duration, which panics on huge values.
         let delay = Duration::from_secs_f64((base * factor).min(MAX_RESTART_DELAY.as_secs_f64()));
         self.failures += 1;
         self.restart_at = Some(Instant::now() + delay);
         tracing::info!("restarting the agent in {:.1} s", delay.as_secs_f64());
+    }
+
+    fn schedule_restart_if_warm(&mut self) {
+        if self.config.agent.warm_start {
+            self.schedule_restart();
+        }
     }
 
     /// The agent is gone: say why, forget its session, and restart it if it
@@ -701,7 +1412,6 @@ impl Conductor {
     async fn agent_died(&mut self, live: Live) -> String {
         let lived = live.started.elapsed();
         let ended = live.conn.reap().await;
-        // Its last words may quote a request, so they stay at debug.
         tracing::warn!("the agent exited: {}", ended.status);
         tracing::debug!("the agent's last stderr: {}", ended.tail);
         self.conversation = None;
@@ -716,282 +1426,26 @@ impl Conductor {
         ended.to_string()
     }
 
-    /// Read what the agent sent since the last turn ended: an update of a
-    /// cancelled turn that came after its answer, a permission request that
-    /// nothing waits for, or its exit. Without this, a follow-up in the same
-    /// session would begin with the cancelled turn's last words.
-    async fn drain_stale(&mut self) {
-        loop {
-            let event = match self.live.as_mut().map(|live| live.incoming.try_recv()) {
-                Some(Ok(event)) => Some(event),
-                Some(Err(mpsc::error::TryRecvError::Empty)) | None => return,
-                Some(Err(mpsc::error::TryRecvError::Disconnected)) => None,
-            };
-            let ended = matches!(event, None | Some(Incoming::Exited));
-            self.between_turns(event).await;
-            if ended {
-                return;
-            }
-        }
-    }
-
-    async fn between_turns(&mut self, event: Option<Incoming>) {
-        match event {
-            None | Some(Incoming::Exited) => {
-                if let Some(live) = self.live.take() {
-                    self.agent_died(live).await;
-                }
-            }
-            Some(Incoming::Permission { id, .. }) => {
-                // Nothing is running that could have asked.
-                if let Some(live) = &self.live {
-                    live.conn
-                        .respond(id, json!({"outcome": {"outcome": "cancelled"}}));
-                }
-            }
-            Some(Incoming::Update { .. }) => {}
-        }
-    }
-
-    async fn take(&mut self, ask: Ask) {
-        let display_profile = self.effective_display_profile(&ask);
-        if let Some(reason) = ask.token.reason() {
-            self.finish(ask, cancelled(reason), display_profile);
-            return;
-        }
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.running = Some((ask.id, Instant::now(), display_profile.clone()));
-        }
-        if matches!(ask.sink, Sink::Present) {
-            self.presenter.present(Presentation::Progress {
-                id: ask.id,
-                request: attachments::progress_label(&ask.text, &ask.attachments),
-                profile: display_profile.clone(),
-            });
-        }
-        let (outcome, used_profile) = self.run_request(&ask).await;
-        self.last_used = Instant::now();
-        self.finish(ask, outcome, used_profile.or(display_profile));
-    }
-
-    fn finish(&mut self, ask: Ask, outcome: Outcome, profile: Option<String>) {
-        ask.token.finish();
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.running = None;
-            shared.handled += 1;
-        }
-        if let Some(store) = &self.store {
-            let now_ms = store::unix_timestamp_ms();
-            match &outcome {
-                Outcome::Answer { text, denied } => {
-                    store.finish_completed(ask.id, text.clone(), denied.clone(), now_ms);
-                }
-                Outcome::Failed {
-                    reason: reason @ (FailReason::Cancelled | FailReason::Superseded),
-                    message,
-                } => {
-                    store.finish_cancelled(ask.id, *reason, message.clone(), now_ms);
-                }
-                Outcome::Failed { reason, message } => {
-                    store.finish_failed(ask.id, *reason, message.clone(), now_ms);
-                }
-            }
-        }
-        deliver(Some(&self.presenter), ask, outcome, profile);
-    }
-
-    async fn run_request(&mut self, ask: &Ask) -> (Outcome, Option<String>) {
-        let started = Instant::now();
-        let token = Arc::clone(&ask.token);
-        let fallback_profile = self.effective_display_profile(ask);
-        let attach_summary = if ask.attachments.is_empty() {
-            String::new()
-        } else {
-            format!(", {}", attachments::summary_for_log(&ask.attachments))
-        };
-        tracing::info!(
-            "request {}: {} characters{}{}",
-            ask.id,
-            ask.text.chars().count(),
-            fallback_profile
-                .as_deref()
-                .map(|p| format!(", profile {p}"))
-                .unwrap_or_default(),
-            attach_summary,
-        );
-        tracing::debug!("request {}: {:?}", ask.id, ask.text);
-
-        self.drain_stale().await;
-        let stop = Arc::clone(&self.stop);
-        let interrupts = Interrupts {
-            request: &token,
-            stop: &stop,
-        };
-        let mut retried_auth = false;
-        let (session, resolved) = loop {
-            let was_live = self.live.is_some();
-            if !was_live {
-                self.restart_at = None;
-                // Only a shutdown interrupts the start. A newer request (a quick
-                // "no, I meant…") needs the same agent, so killing this one half
-                // started would only make it pay for a second start.
-                let start = tokio::select! {
-                    result = self.start_agent() => result,
-                    reason = stop.cancelled() => {
-                        // The half-started agent was dropped, which killed it.
-                        self.set_agent(AgentState::Down);
-                        return (cancelled(reason), fallback_profile);
-                    }
-                };
-                if let Err(e) = start {
-                    self.schedule_restart_if_warm();
-                    return (
-                        Outcome::failed(
-                            FailReason::AgentDown,
-                            format!("Cannot start the assistant: {e:#}"),
-                        ),
-                        fallback_profile,
-                    );
-                }
-                if let Some(reason) = token.reason() {
-                    return (cancelled(reason), fallback_profile);
-                }
-            }
-
-            let result = tokio::select! {
-                result = self.session_for(ask.id, ask.new, ask.profile.as_deref()) => result,
-                reason = interrupts.wait() => return (cancelled(reason), fallback_profile),
-            };
-            match result {
-                Ok(pair) => break pair,
-                Err(outcome) => {
-                    // If a pre-existing agent lost its login and was stopped
-                    // for it, retry once on a fresh agent in case the user
-                    // already signed in again.
-                    if was_live
-                        && !retried_auth
-                        && self.live.is_none()
-                        && matches!(
-                            outcome,
-                            Outcome::Failed {
-                                reason: FailReason::AgentError,
-                                ..
-                            }
-                        )
-                    {
-                        retried_auth = true;
-                        continue;
-                    }
-                    return (outcome, fallback_profile);
-                }
-            }
-        };
-        let used_profile = resolved.name.clone();
-        if let Some(store) = &self.store {
-            let conv_id = self.conversation.as_ref().map(|c| c.conversation_id);
-            store.mark_running(
-                ask.id,
-                session.clone(),
-                conv_id,
-                used_profile.clone().unwrap_or_default(),
-                store::unix_timestamp_ms(),
-            );
-        }
-
-        let header = if self.config.context.is_enabled() {
-            tokio::select! {
-                header = self.context.gather(&self.config.context) => header,
-                reason = interrupts.wait() => return (cancelled(reason), used_profile),
-            }
-        } else {
-            None
-        };
-        if let Some(header) = &header {
-            tracing::debug!("request {}: ambient context: {:?}", ask.id, header);
-        }
-        let effective_text = if ask.text.trim().is_empty() && !ask.attachments.is_empty() {
-            attachments::default_prompt(&ask.attachments)
-        } else {
-            &ask.text
-        };
-        let prompt = context::prepend(header.as_deref(), effective_text);
-        let blocks = attachments::build_prompt_blocks(&prompt, &ask.attachments);
-
-        let Some(mut live) = self.live.take() else {
-            return (
-                Outcome::failed(FailReason::AgentDown, "the assistant exited"),
-                used_profile,
-            );
-        };
-        let budgets = Budgets {
-            inactivity: resolved.inactivity,
-            max_turn: resolved.max_turn,
-            max_tool_calls: resolved.max_tool_calls,
-        };
-        let ctx = TurnContext {
-            policy: &self.policy,
-            budgets,
-            progress: matches!(ask.sink, Sink::Present).then_some(&self.presenter),
-            id: ask.id,
-        };
-        let end = turn(&mut live, &session, blocks, interrupts, &ctx).await;
-
-        if end.alive {
-            self.live = Some(live);
-            if end.auth_required {
-                self.stop_agent().await;
-            } else if end.broken {
-                if let Some(old) = self.conversation.take()
-                    && let Some(live) = &self.live
-                {
-                    drop(
-                        live.conn
-                            .start_call("session/close", json!({"sessionId": old.session})),
-                    );
-                }
-                self.set_follow_up(None);
-            } else if let Some(conversation) = &mut self.conversation {
-                conversation.last = Instant::now();
-                conversation.turns += 1;
-                let until = secs(self.config.conversation.follow_up_secs)
-                    .and_then(|window| conversation.last.checked_add(window));
-                self.set_follow_up(until);
-            }
-        } else {
-            let detail = self.agent_died(live).await;
-            if let Outcome::Failed {
-                reason: FailReason::AgentDown,
-                message,
-            } = &end.outcome
-            {
-                return (
-                    Outcome::failed(FailReason::AgentDown, format!("{message} ({detail})")),
-                    used_profile,
-                );
-            }
-        }
-
-        if matches!(end.outcome, Outcome::Answer { .. }) {
-            self.failures = 0;
-        }
-        log_outcome(ask.id, &end.outcome, started);
-        (end.outcome, used_profile)
-    }
-
-    fn schedule_restart_if_warm(&mut self) {
-        if self.config.agent.warm_start {
-            self.schedule_restart();
-        }
-    }
-
     fn set_follow_up(&self, until: Option<Instant>) {
         if let Ok(mut shared) = self.shared.lock() {
             shared.follow_up_until = until;
         }
     }
 
-    /// The session this request continues (with any mid-conversation profile
-    /// switch applied), or a new one.
+    async fn new_background_session(
+        &mut self,
+        requested: Option<&str>,
+    ) -> Result<(String, ResolvedProfile), Outcome> {
+        let resolved = self
+            .config
+            .resolve_profile(requested)
+            .map_err(|e| Outcome::failed(FailReason::AgentError, e))?;
+        let session = self.new_session(&resolved).await?;
+        Ok((session, resolved))
+    }
+
+    /// The session this interactive request continues (with any mid-conversation
+    /// profile switch applied), or a new one.
     async fn session_for(
         &mut self,
         turn_id: u64,
@@ -1064,7 +1518,6 @@ impl Conductor {
         if let Some(old) = self.conversation.take()
             && let Some(live) = &self.live
         {
-            // Let the agent free it; nobody waits for the answer.
             drop(
                 live.conn
                     .start_call("session/close", json!({"sessionId": old.session})),
@@ -1101,10 +1554,6 @@ impl Conductor {
         Ok((session, resolved))
     }
 
-    /// Apply changed `model` / `thought_level` options onto an existing session.
-    /// Returns `Ok(true)` if every change succeeded, `Ok(false)` if the agent
-    /// rejected the mid-session config change (caller should open a new session),
-    /// or `Err` if the connection itself died/timed out.
     async fn apply_profile_switch(
         &mut self,
         session: &str,
@@ -1183,13 +1632,6 @@ impl Conductor {
                 "the assistant is not running",
             ));
         };
-        // The vault is deliberately not passed as `additionalDirectories`:
-        // agy loads AGENTS.md, GEMINI.md and `.agents/` from every workspace
-        // directory as trusted instructions, so one file written into the
-        // vault (by a sync peer, a shared folder, or the agent itself after
-        // reading a hostile page) would steer every later request. Outside
-        // the workspace, the agent's reads and edits there arrive as
-        // permission requests, which the daemon allows.
         let params = json!({"cwd": paths.workspace, "mcpServers": []});
         let result = live.conn.call("session/new", params, START_TIMEOUT).await;
         let result = match result {
@@ -1221,8 +1663,6 @@ impl Conductor {
         if !resolved.thought_level.is_empty() {
             options.push(("thought_level", resolved.thought_level.clone()));
         }
-        // Default mode sends every tool call that needs approval to the
-        // daemon; agy's "auto" would let its own classifier decide.
         if let Some(mode) = config_option(&result, "mode")
             && mode != "default"
         {
@@ -1246,18 +1686,18 @@ impl Conductor {
         Ok(session)
     }
 
-    /// Turn a failed call into an outcome, dealing with a dead agent.
     async fn call_failed(&mut self, method: &str, error: CallError) -> Outcome {
         match error {
             CallError::Rpc(e) => {
                 if is_auth_required(&e) {
-                    // agy latches a failed silent sign-in for the life of the
-                    // process; stop it without scheduling a restart so the next
-                    // request spawns a fresh agent that re-reads the keyring.
                     tracing::warn!(
                         "{method} failed: {e}; stopping the agent so the next request starts fresh"
                     );
-                    self.stop_agent().await;
+                    if !self.has_active_turns() {
+                        self.stop_agent().await;
+                    } else if let Some(live) = &mut self.live {
+                        live.auth_failed = true;
+                    }
                 } else {
                     tracing::warn!("{method} failed: {e}");
                 }
@@ -1265,8 +1705,12 @@ impl Conductor {
             }
             CallError::Closed => {
                 let detail = match self.live.take() {
-                    Some(live) => self.agent_died(live).await,
-                    None => String::new(),
+                    Some(live) => {
+                        let d = self.agent_died(live).await;
+                        self.last_death_detail = Some(d.clone());
+                        d
+                    }
+                    None => self.last_death_detail.clone().unwrap_or_default(),
                 };
                 Outcome::failed(
                     FailReason::AgentDown,
@@ -1275,8 +1719,12 @@ impl Conductor {
             }
             CallError::Timeout(after) => {
                 tracing::warn!("{method} got no answer within {after:?}; restarting the agent");
-                self.stop_agent().await;
-                self.schedule_restart_if_warm();
+                if !self.has_active_turns() {
+                    self.stop_agent().await;
+                    self.schedule_restart_if_warm();
+                } else if let Some(live) = &mut self.live {
+                    live.draining = true;
+                }
                 Outcome::failed(
                     FailReason::AgentDown,
                     format!(
@@ -1298,27 +1746,48 @@ fn deliver(
 ) {
     match ask.sink {
         Sink::Client(reply) => {
-            // A client that left has already cancelled the request.
             let _ = reply.send(outcome.into_reply(ask.id));
         }
         Sink::Present => {
             let Some(presenter) = presenter else {
                 return;
             };
-            presenter.present(match outcome {
-                Outcome::Answer { text, denied } => Presentation::Answer {
-                    id: ask.id,
-                    text,
-                    denied,
-                    profile,
-                },
-                Outcome::Failed { reason, message } => Presentation::Failure {
-                    id: ask.id,
-                    reason,
-                    message,
-                    profile,
-                },
-            });
+            match outcome {
+                Outcome::Answer {
+                    suppressed: true, ..
+                } => {
+                    if !ask.background {
+                        presenter.present(Presentation::DismissProgress { id: ask.id });
+                    }
+                }
+                Outcome::Answer { text, denied, .. } => {
+                    if ask.background {
+                        presenter.present(Presentation::TaskComplete {
+                            id: ask.id,
+                            request: ask.text,
+                            text,
+                            denied,
+                            profile,
+                        });
+                    } else {
+                        presenter.present(Presentation::Answer {
+                            id: ask.id,
+                            text,
+                            denied,
+                            profile,
+                        });
+                    }
+                }
+                Outcome::Failed { reason, message } => {
+                    presenter.present(Presentation::Failure {
+                        id: ask.id,
+                        reason,
+                        message,
+                        profile,
+                        background: ask.background,
+                    });
+                }
+            }
         }
     }
 }
@@ -1327,9 +1796,6 @@ fn is_auth_required(error: &acp::RpcError) -> bool {
     error.code == AUTH_REQUIRED || error.message.contains("Authentication required")
 }
 
-/// What to tell the user when the agent refused a call. agy 1.5 answers
-/// `session/new` with `-32000 Authentication required` when it has no login
-/// (seen with the keyring out of reach); that alone does not say what to do.
 fn agent_error_message(error: &acp::RpcError) -> String {
     if is_auth_required(error) {
         format!(
@@ -1341,7 +1807,6 @@ fn agent_error_message(error: &acp::RpcError) -> String {
     }
 }
 
-/// ACP's error code for a missing or expired login.
 const AUTH_REQUIRED: i64 = -32000;
 
 fn cancelled(reason: FailReason) -> Outcome {
@@ -1351,14 +1816,11 @@ fn cancelled(reason: FailReason) -> Outcome {
 fn cancel_message(reason: FailReason) -> &'static str {
     match reason {
         FailReason::Superseded => "A newer request replaced this one.",
-        // Only the daemon's own shutdown cancels with this reason.
         FailReason::AgentDown => "The daemon is shutting down.",
         _ => "The request was cancelled.",
     }
 }
 
-/// What may end a request early: its own cancellation (a newer request,
-/// `cancel`, a client that left) or the daemon's shutdown.
 #[derive(Clone, Copy)]
 struct Interrupts<'a> {
     request: &'a CancelToken,
@@ -1377,9 +1839,18 @@ impl Interrupts<'_> {
 fn log_outcome(id: u64, outcome: &Outcome, started: Instant) {
     let elapsed = started.elapsed().as_secs_f64();
     match outcome {
-        Outcome::Answer { text, denied } => {
+        Outcome::Answer {
+            text,
+            denied,
+            suppressed,
+        } => {
             tracing::info!(
-                "request {id}: answered in {elapsed:.2} s, {} characters, {} refused",
+                "request {id}: {} in {elapsed:.2} s, {} characters, {} refused",
+                if *suppressed {
+                    "suppressed"
+                } else {
+                    "answered"
+                },
                 text.chars().count(),
                 denied.len()
             );
@@ -1392,7 +1863,6 @@ fn log_outcome(id: u64, outcome: &Outcome, started: Instant) {
     }
 }
 
-/// The current value of one of the session's config options.
 fn config_option(session: &Value, id: &str) -> Option<String> {
     session
         .get("configOptions")?
@@ -1404,9 +1874,14 @@ fn config_option(session: &Value, id: &str) -> Option<String> {
         .map(String::from)
 }
 
-async fn next_event(live: &mut Option<Live>) -> Option<Incoming> {
+async fn wait_exited(live: &mut Option<Live>) {
     match live {
-        Some(live) => live.incoming.recv().await,
+        Some(live) => match &mut live.exited {
+            Some(rx) => {
+                let _ = rx.await;
+            }
+            None => std::future::pending().await,
+        },
         None => std::future::pending().await,
     }
 }
@@ -1418,9 +1893,11 @@ async fn sleep_until(at: Option<Instant>) {
     }
 }
 
-/// One prompt, from session/prompt to its stop reason.
+/// One prompt, from `session/prompt` to its stop reason, isolated to one
+/// session via its [`SessionSubscription`].
 async fn turn(
-    live: &mut Live,
+    client: &AcpClient,
+    mut sub: SessionSubscription,
     session: &str,
     prompt_blocks: Vec<Value>,
     interrupts: Interrupts<'_>,
@@ -1430,7 +1907,7 @@ async fn turn(
     let budgets = ctx.budgets;
     let id = ctx.id;
     let started = Instant::now();
-    let mut response = live.conn.start_call(
+    let mut response = client.start_call(
         "session/prompt",
         json!({"sessionId": session, "prompt": prompt_blocks}),
     );
@@ -1457,12 +1934,11 @@ async fn turn(
     };
 
     let ended = loop {
-        // Events first: the reader queues every update before it hands over
-        // the response that follows them, so the last chunks would otherwise
-        // be lost to a response that is already waiting.
+        // Events first: read_loop queues every update before it hands over the
+        // response that follows them.
         let step = tokio::select! {
             biased;
-            event = live.incoming.recv() => Step::Event(event),
+            event = sub.recv() => Step::Event(event),
             result = &mut response => Step::Responded(result),
             () = tokio::time::sleep_until(deadline.into()) => Step::Quiet,
             () = &mut turn_sleep => Step::TurnTimeout,
@@ -1470,24 +1946,19 @@ async fn turn(
         };
         match step {
             Step::Responded(result) => break Ok(result),
-            Step::Event(None | Some(Incoming::Exited)) => {
+            Step::Event(None) => {
                 return TurnEnd {
                     outcome: Outcome::failed(
                         FailReason::AgentDown,
                         "The assistant exited in the middle of the request",
                     ),
                     alive: false,
+                    wedged: false,
                     broken: true,
                     auth_required: false,
                 };
             }
-            Step::Event(Some(Incoming::Update {
-                session: from,
-                update,
-            })) => {
-                if from != session {
-                    continue;
-                }
+            Step::Event(Some(SessionEvent::Update(update))) => {
                 if let Some(limit) = budgets.max_turn
                     && turn_deadline.is_some_and(|d| Instant::now() >= d)
                 {
@@ -1517,11 +1988,7 @@ async fn turn(
                                     break Err(TurnAbort::ToolLimit(limit));
                                 }
                             }
-                            let will_deny = acp::tool_command(&update)
-                                .as_deref()
-                                .and_then(|c| policy.denied_word(c))
-                                .is_some();
-                            if !will_deny {
+                            if !policy.will_deny_update(&update) {
                                 emit_progress(&mut last_progress, acp::tool_progress(&update));
                             }
                         }
@@ -1532,15 +1999,14 @@ async fn turn(
                     }
                 }
             }
-            Step::Event(Some(Incoming::Permission {
+            Step::Event(Some(SessionEvent::Permission {
                 id: request,
                 params,
             })) => {
                 if let Some(limit) = budgets.max_turn
                     && turn_deadline.is_some_and(|d| Instant::now() >= d)
                 {
-                    live.conn
-                        .respond(request, json!({"outcome": {"outcome": "cancelled"}}));
+                    client.respond(request, json!({"outcome": {"outcome": "cancelled"}}));
                     break Err(TurnAbort::TurnTimeout(limit));
                 }
                 deadline = Instant::now() + budgets.inactivity;
@@ -1549,32 +2015,32 @@ async fn turn(
                 if let Some(limit) = budgets.max_tool_calls
                     && tracker.count() > limit
                 {
-                    live.conn
-                        .respond(request, json!({"outcome": {"outcome": "cancelled"}}));
+                    client.respond(request, json!({"outcome": {"outcome": "cancelled"}}));
                     break Err(TurnAbort::ToolLimit(limit));
                 }
-                let command = acp::permission_command(&params);
-                let refused = command.as_deref().and_then(|c| policy.denied_word(c));
                 let kind = params
                     .pointer("/toolCall/kind")
                     .and_then(Value::as_str)
                     .unwrap_or("other");
-                let outcome = if let Some(word) = refused {
-                    tracing::info!("request {id}: +{:.2} s refused a {word} command", at());
-                    denied.push(command.unwrap_or_default());
-                    acp::permission_outcome(&params, &["reject_once", "reject_always"])
-                } else {
-                    tracing::info!("request {id}: +{:.2} s allowed a {kind} call", at());
-                    if let Some(command) = &command {
-                        tracing::debug!("request {id}: allowed {command:?}");
+                let outcome = match policy.evaluate_permission(&params) {
+                    PermissionDecision::Deny { tag, detail } => {
+                        tracing::info!("request {id}: +{:.2} s refused a {tag} call", at());
+                        denied.push(detail);
+                        acp::permission_outcome(&params, &["reject_once", "reject_always"])
                     }
-                    emit_progress(
-                        &mut last_progress,
-                        params.get("toolCall").and_then(acp::tool_progress),
-                    );
-                    acp::permission_outcome(&params, &["allow_once", "allow_always"])
+                    PermissionDecision::Allow => {
+                        tracing::info!("request {id}: +{:.2} s allowed a {kind} call", at());
+                        if let Some(command) = acp::permission_command(&params) {
+                            tracing::debug!("request {id}: allowed {command:?}");
+                        }
+                        emit_progress(
+                            &mut last_progress,
+                            params.get("toolCall").and_then(acp::tool_progress),
+                        );
+                        acp::permission_outcome(&params, &["allow_once", "allow_always"])
+                    }
                 };
-                live.conn.respond(request, outcome);
+                client.respond(request, outcome);
             }
             Step::Quiet => break Err(TurnAbort::Quiet),
             Step::TurnTimeout => {
@@ -1588,7 +2054,12 @@ async fn turn(
     let result = match ended {
         Ok(result) => result,
         Err(abort) => {
-            let alive = cancel_turn(live, session, &mut response).await;
+            let cancel_state = cancel_turn(client, &mut sub, session, &mut response).await;
+            let (alive, wedged) = match cancel_state {
+                CancelState::Stopped => (true, false),
+                CancelState::Wedged => (true, true),
+                CancelState::AgentDead => (false, false),
+            };
             let (reason, message, broken) = match abort {
                 TurnAbort::Quiet => (
                     FailReason::Timeout,
@@ -1636,7 +2107,8 @@ async fn turn(
             return TurnEnd {
                 outcome: Outcome::failed(reason, message),
                 alive,
-                broken,
+                wedged,
+                broken: broken || wedged,
                 auth_required: false,
             };
         }
@@ -1667,6 +2139,7 @@ async fn turn(
             return TurnEnd {
                 outcome: Outcome::failed(FailReason::AgentError, agent_error_message(&e)),
                 alive: true,
+                wedged: false,
                 broken: true,
                 auth_required,
             };
@@ -1678,6 +2151,7 @@ async fn turn(
                     "The assistant exited in the middle of the request",
                 ),
                 alive: false,
+                wedged: false,
                 broken: true,
                 auth_required: false,
             };
@@ -1690,9 +2164,8 @@ async fn turn(
         _ if !answer.is_empty() => Outcome::Answer {
             text: answer,
             denied,
+            suppressed: false,
         },
-        // A refused tool call ends agy's turn with no text at all, so the
-        // daemon has to say what happened.
         _ if !denied.is_empty() => {
             let verb = if denied.len() == 1 { "is" } else { "are" };
             Outcome::failed(
@@ -1712,39 +2185,46 @@ async fn turn(
     TurnEnd {
         outcome,
         alive: true,
+        wedged: false,
         broken: false,
         auth_required: false,
     }
 }
 
-/// Ask the agent to stop the turn and wait briefly for it to do so. Returns
-/// false when the agent died or would not stop.
+enum CancelState {
+    Stopped,
+    Wedged,
+    AgentDead,
+}
+
+/// Ask the agent to stop one session's turn and wait briefly for it to do so.
 async fn cancel_turn(
-    live: &mut Live,
+    client: &AcpClient,
+    sub: &mut SessionSubscription,
     session: &str,
     response: &mut oneshot::Receiver<Result<Value, CallError>>,
-) -> bool {
-    live.conn
-        .notify("session/cancel", json!({"sessionId": session}));
+) -> CancelState {
+    client.notify("session/cancel", json!({"sessionId": session}));
     let deadline = tokio::time::Instant::now() + CANCEL_GRACE;
     loop {
-        // Events first, as in `turn`: the old turn's last chunks must be read
-        // here, or a follow-up in the same session would start with them.
         tokio::select! {
             biased;
-            event = live.incoming.recv() => match event {
-                None | Some(Incoming::Exited) => return false,
-                Some(Incoming::Permission { id, .. }) => {
-                    live.conn.respond(id, json!({"outcome": {"outcome": "cancelled"}}));
+            event = sub.recv() => match event {
+                None => return CancelState::AgentDead,
+                Some(SessionEvent::Permission { id, .. }) => {
+                    client.respond(id, json!({"outcome": {"outcome": "cancelled"}}));
                 }
-                Some(Incoming::Update { .. }) => {}
+                Some(SessionEvent::Update(_)) => {}
             },
             result = &mut *response => {
-                return matches!(result, Ok(Ok(_)) | Ok(Err(CallError::Rpc(_))));
+                return match result {
+                    Ok(Ok(_)) | Ok(Err(CallError::Rpc(_))) => CancelState::Stopped,
+                    _ => CancelState::AgentDead,
+                };
             }
             () = tokio::time::sleep_until(deadline) => {
                 tracing::warn!("the agent did not stop the turn within {CANCEL_GRACE:?}");
-                return false;
+                return CancelState::Wedged;
             }
         }
     }
@@ -1768,12 +2248,33 @@ pub async fn ask_once(
     let (handle, task) =
         spawn_with_store(Arc::new(config), presenter, Arc::new(SystemContext), None);
     let (tx, rx) = oneshot::channel();
-    let id = handle.ask(text, true, profile, loaded, Sink::Client(tx));
+    let id = handle
+        .ask(
+            AskParams {
+                text,
+                new: true,
+                profile,
+                background: false,
+                suppress_token: None,
+                attachments: loaded,
+            },
+            Sink::Client(tx),
+        )
+        .map_err(|e| anyhow!(e))?;
     let reply = rx.await.context("the conductor stopped")?;
     handle.shutdown();
     let _ = task.await;
     Ok(match reply {
-        Reply::Answer { text, denied, .. } => Outcome::Answer { text, denied },
+        Reply::Answer {
+            text,
+            denied,
+            suppressed,
+            ..
+        } => Outcome::Answer {
+            text,
+            denied,
+            suppressed,
+        },
         Reply::Failed {
             reason, message, ..
         } => Outcome::Failed { reason, message },
@@ -1800,9 +2301,41 @@ mod tests {
         assert!(!tracker.record_update(Some("call_2")));
         assert_eq!(tracker.count(), 2);
 
-        // Updates without an id count once; a matching id-less permission does not double-count.
         assert!(tracker.record_update(None));
         assert!(!tracker.record_permission(None));
         assert_eq!(tracker.count(), 3);
+    }
+
+    #[test]
+    fn suppress_token_matching_handles_wrappers_and_rejects_alerts_or_denials() {
+        for matched in [
+            "HEARTBEAT_OK",
+            "  HEARTBEAT_OK\n",
+            "HEARTBEAT_OK.",
+            "HEARTBEAT_OK!",
+            "`HEARTBEAT_OK`",
+            "**HEARTBEAT_OK**",
+            "```\nHEARTBEAT_OK\n```",
+            "```text\nHEARTBEAT_OK.\n```",
+        ] {
+            assert!(is_suppressed(matched, "HEARTBEAT_OK", &[]), "{matched:?}");
+        }
+        for unmatched in [
+            "heartbeat_ok",
+            "HEARTBEAT_OK: disk 90% full",
+            "not HEARTBEAT_OK",
+            "",
+        ] {
+            assert!(
+                !is_suppressed(unmatched, "HEARTBEAT_OK", &[]),
+                "{unmatched:?}"
+            );
+        }
+        // Denied commands must never be suppressed silently.
+        assert!(!is_suppressed(
+            "HEARTBEAT_OK",
+            "HEARTBEAT_OK",
+            &["sudo id".to_string()]
+        ));
     }
 }

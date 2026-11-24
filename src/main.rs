@@ -50,6 +50,14 @@ enum Command {
         /// Start a new conversation, even right after the last answer.
         #[arg(long)]
         new: bool,
+        /// Run in the background lane (not superseded by newer asks); prints
+        /// the task ID to stdout when not using `--print`.
+        #[arg(short = 'b', long)]
+        background: bool,
+        /// Suppress notifications and stdout when the answer matches this exact
+        /// token (e.g. `HEARTBEAT_OK`), exiting 0 cleanly.
+        #[arg(long, value_name = "TOKEN")]
+        suppress_token: Option<String>,
         /// Use a named profile from `[profiles.<name>]` (or `default`).
         #[arg(short = 'p', long, value_name = "NAME")]
         profile: Option<String>,
@@ -63,8 +71,17 @@ enum Command {
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         text: Vec<String>,
     },
-    /// Cancel the running request.
-    Cancel,
+    /// Cancel the running interactive request (or a specific task ID).
+    Cancel {
+        /// Specific request or background task ID to cancel.
+        #[arg(long, value_name = "ID")]
+        id: Option<u64>,
+    },
+    /// Inspect and manage background tasks and recent turns.
+    Tasks {
+        #[command(subcommand)]
+        action: Option<TasksCommand>,
+    },
     /// Print what the daemon is doing.
     Status {
         /// Print the status as JSON.
@@ -109,6 +126,41 @@ impl LaneFilter {
             Self::All => None,
         }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum TasksCommand {
+    /// List recent tasks (background lane by default).
+    List {
+        /// Which lane to list.
+        #[arg(long, value_enum, default_value_t = LaneFilter::Background)]
+        lane: LaneFilter,
+        /// Filter by status (queued, running, completed, suppressed, failed, cancelled).
+        #[arg(long, value_name = "STATUS")]
+        status: Option<String>,
+        /// Include suppressed heartbeat turns.
+        #[arg(long)]
+        all: bool,
+        /// Maximum rows to display.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the full details and answer of one task.
+    Show {
+        id: u64,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open a task's answer in the Markdown viewer.
+    Open { id: u64 },
+    /// Copy a task's answer to the clipboard.
+    Copy { id: u64 },
+    /// Cancel a running or queued background task.
+    Cancel { id: u64 },
 }
 
 #[derive(Debug, Subcommand)]
@@ -204,27 +256,35 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Ask {
             print,
             new,
+            background,
+            suppress_token,
             profile,
             files,
             images,
             text,
         } => {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
-            ask(&config, &socket, text, print, new, profile, files, images).await
+            ask(
+                &config,
+                &socket,
+                text,
+                print,
+                new,
+                background,
+                suppress_token,
+                profile,
+                files,
+                images,
+            )
+            .await
         }
-        Command::Cancel => {
+        Command::Cancel { id } => {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
-            match ipc::request(&socket, &Request::Cancel).await? {
-                Reply::Cancelled { id: Some(id) } => {
-                    println!("cancelled request {id}");
-                    Ok(ExitCode::SUCCESS)
-                }
-                Reply::Cancelled { id: None } => {
-                    println!("nothing to cancel");
-                    Ok(ExitCode::SUCCESS)
-                }
-                other => unexpected(other),
-            }
+            cancel_id(&socket, id).await
+        }
+        Command::Tasks { action } => {
+            let socket = ipc::socket_path(cli.socket.as_deref())?;
+            tasks(&config, &socket, action).await
         }
         Command::Status { json } => {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
@@ -369,6 +429,147 @@ fn resolve_attachments(files: Vec<PathBuf>, images: Vec<PathBuf>) -> Result<Vec<
     Ok(out)
 }
 
+async fn cancel_id(socket: &Path, id: Option<u64>) -> Result<ExitCode> {
+    match ipc::request(socket, &Request::Cancel { id }).await? {
+        Reply::Cancelled { id: Some(id) } => {
+            println!("cancelled request {id}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Reply::Cancelled { id: None } => {
+            println!("nothing to cancel");
+            Ok(ExitCode::SUCCESS)
+        }
+        other => unexpected(other),
+    }
+}
+
+async fn tasks(config: &Config, socket: &Path, action: Option<TasksCommand>) -> Result<ExitCode> {
+    let action = action.unwrap_or(TasksCommand::List {
+        lane: LaneFilter::Background,
+        status: None,
+        all: false,
+        limit: 20,
+        json: false,
+    });
+    match action {
+        TasksCommand::Cancel { id } => cancel_id(socket, Some(id)).await,
+        TasksCommand::List {
+            lane,
+            status,
+            all,
+            limit,
+            json,
+        } => {
+            let parsed_status = match status.as_deref() {
+                Some(s) => match store::TurnStatus::parse(s) {
+                    Some(st) => Some(st),
+                    None => anyhow::bail!(
+                        "unknown status `{s}` (expected queued, running, completed, suppressed, failed, or cancelled)"
+                    ),
+                },
+                None => None,
+            };
+            let state_dir = config.state_dir()?;
+            let rows = store::list_turns(
+                &state_dir,
+                &store::ListFilter {
+                    lane: lane.into_lane(),
+                    status: parsed_status,
+                    include_suppressed: all,
+                    limit,
+                },
+            )?;
+            if json {
+                println!("{}", serde_json::to_string(&rows)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            if rows.is_empty() {
+                println!("no tasks recorded");
+                return Ok(ExitCode::SUCCESS);
+            }
+            for row in rows {
+                let ts = store::format_local_timestamp(row.created_at_ms);
+                let prof = if row.profile.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", row.profile)
+                };
+                let preview = row.request.replace('\n', " ");
+                let preview = match preview.char_indices().nth(72) {
+                    Some((i, _)) => format!("{}…", preview[..i].trim_end()),
+                    None => preview,
+                };
+                println!(
+                    "#{}  {ts}  {:<10}{prof}  {preview}",
+                    row.id,
+                    row.status.as_str()
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        TasksCommand::Show { id, json } => {
+            let state_dir = config.state_dir()?;
+            let Some(row) = store::get_turn(&state_dir, id)? else {
+                eprintln!("hey-computer: task {id} not found");
+                return Ok(ExitCode::FAILURE);
+            };
+            if json {
+                println!("{}", serde_json::to_string(&row)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!(
+                "#{} [{} / {}]{}  {}",
+                row.id,
+                row.lane,
+                row.status,
+                if row.profile.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", row.profile)
+                },
+                store::format_local_timestamp(row.created_at_ms)
+            );
+            println!("Request: {}", row.request);
+            if !row.answer.is_empty() {
+                println!("\n{}", row.answer);
+            } else if let Some(msg) = &row.error_message {
+                println!("\nError: {msg}");
+            } else if let Some(tok) = &row.suppressed_token {
+                println!("\nSuppressed ({tok})");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        TasksCommand::Open { id } => {
+            let state_dir = config.state_dir()?;
+            let Some(row) = store::get_turn(&state_dir, id)? else {
+                eprintln!("hey-computer: task {id} not found");
+                return Ok(ExitCode::FAILURE);
+            };
+            if row.answer.trim().is_empty() {
+                eprintln!("hey-computer: task {id} has no answer to open");
+                return Ok(ExitCode::FAILURE);
+            }
+            let answers = ipc::runtime_dir()?.join("hey-computer");
+            present::open_answer(&config.present, &answers, row.id, &row.answer, &row.denied)
+                .await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        TasksCommand::Copy { id } => {
+            let state_dir = config.state_dir()?;
+            let Some(row) = store::get_turn(&state_dir, id)? else {
+                eprintln!("hey-computer: task {id} not found");
+                return Ok(ExitCode::FAILURE);
+            };
+            if row.answer.trim().is_empty() {
+                eprintln!("hey-computer: task {id} has no answer to copy");
+                return Ok(ExitCode::FAILURE);
+            }
+            present::copy_to_clipboard(&config.present, &row.answer).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ask(
     config: &Config,
@@ -376,10 +577,18 @@ async fn ask(
     words: Vec<String>,
     print: bool,
     new: bool,
+    background: bool,
+    suppress_token: Option<String>,
     profile: Option<String>,
     files: Vec<PathBuf>,
     images: Vec<PathBuf>,
 ) -> Result<ExitCode> {
+    if let Some(tok) = &suppress_token
+        && tok.trim().is_empty()
+    {
+        eprintln!("hey-computer: --suppress-token must not be empty");
+        return Ok(ExitCode::from(2));
+    }
     // Every refusal after this point is also a notification (see below).
     let has_attachments = !files.is_empty() || !images.is_empty();
     let text = if words.is_empty() && has_attachments && std::io::stdin().is_terminal() {
@@ -402,6 +611,8 @@ async fn ask(
                 wait: print,
                 new,
                 profile,
+                background,
+                suppress_token,
                 attachments,
             };
             match request_size(&req) {
@@ -440,12 +651,22 @@ async fn ask(
     };
     tracing::debug!("request {id} accepted");
     if !print {
+        if background {
+            println!("{id}");
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
     match client.next(None).await? {
-        Reply::Answer { text, denied, .. } => {
-            println!("{text}");
+        Reply::Answer {
+            text,
+            denied,
+            suppressed,
+            ..
+        } => {
+            if !suppressed {
+                println!("{text}");
+            }
             for command in denied {
                 eprintln!("hey-computer: refused to run {command}");
             }
@@ -513,11 +734,35 @@ mod tests {
                 "explain",
             ],
             vec!["hey-computer", "ask", "--image", "shot.png"],
+            vec![
+                "hey-computer",
+                "ask",
+                "-b",
+                "--suppress-token",
+                "HEARTBEAT_OK",
+                "check",
+            ],
             vec!["hey-computer", "ask", "--profile", "default", "hi"],
             vec!["hey-computer", "ask", "--print"],
             vec!["hey-computer", "--socket", "/tmp/s", "cancel"],
+            vec!["hey-computer", "cancel", "--id", "7"],
+            vec!["hey-computer", "tasks"],
+            vec![
+                "hey-computer",
+                "tasks",
+                "list",
+                "--lane",
+                "all",
+                "--all",
+                "--json",
+            ],
+            vec!["hey-computer", "tasks", "show", "3", "--json"],
+            vec!["hey-computer", "tasks", "open", "3"],
+            vec!["hey-computer", "tasks", "copy", "3"],
+            vec!["hey-computer", "tasks", "cancel", "3"],
             vec!["hey-computer", "status", "--json"],
             vec!["hey-computer", "last"],
+            vec!["hey-computer", "last", "--lane", "all", "--json"],
             vec!["hey-computer", "last", "--copy"],
             vec!["hey-computer", "last", "--open"],
             vec!["hey-computer", "debug", "config"],

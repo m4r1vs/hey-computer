@@ -33,15 +33,13 @@ pub const MAX_AGENT_LINE: usize = 32 * 1024 * 1024;
 /// How much of the agent's stderr is kept to explain its death.
 const STDERR_TAIL: usize = 4096;
 
-/// Something the agent sent that is not the answer to one of our calls.
+/// Events routed to one subscribed ACP session.
 #[derive(Debug)]
-pub enum Incoming {
-    /// `session/update`.
-    Update { session: String, update: Value },
-    /// `session/request_permission`; answer it with [`Connection::respond`].
+pub enum SessionEvent {
+    /// `session/update` for this session.
+    Update(Value),
+    /// `session/request_permission` for this session; answer via [`Client::respond`].
     Permission { id: Value, params: Value },
-    /// The agent's stdout ended: it exited or is about to.
-    Exited,
 }
 
 /// A JSON-RPC error object, as the agent sent it.
@@ -107,25 +105,130 @@ impl fmt::Display for Ended {
 }
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CallError>>>>>;
+type SessionMap = Arc<Mutex<HashMap<String, (u64, mpsc::UnboundedSender<SessionEvent>)>>>;
+
+/// RAII subscription to one ACP session's `session/update` and
+/// `session/request_permission` stream. Dropping it unregisters the session
+/// so late updates from a cancelled turn are discarded before the next turn
+/// subscribes.
+pub struct SessionSubscription {
+    session: String,
+    token: u64,
+    rx: mpsc::UnboundedReceiver<SessionEvent>,
+    sessions: SessionMap,
+}
+
+impl SessionSubscription {
+    pub async fn recv(&mut self) -> Option<SessionEvent> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for SessionSubscription {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.sessions.lock()
+            && map
+                .get(&self.session)
+                .is_some_and(|(tok, _)| *tok == self.token)
+        {
+            map.remove(&self.session);
+        }
+    }
+}
+
+/// Cloneable JSON-RPC handle shared across concurrent lanes on one agent process.
+#[derive(Clone)]
+pub struct Client {
+    out: mpsc::UnboundedSender<String>,
+    pending: Pending,
+    next_id: Arc<AtomicU64>,
+    sessions: SessionMap,
+    next_sub: Arc<AtomicU64>,
+}
+
+impl Client {
+    /// Subscribe to all updates and permission requests for `session`.
+    pub fn subscribe(&self, session: &str) -> SessionSubscription {
+        let token = self.next_sub.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        if let Ok(mut map) = self.sessions.lock() {
+            map.insert(session.to_string(), (token, tx));
+        }
+        SessionSubscription {
+            session: session.to_string(),
+            token,
+            rx,
+            sessions: Arc::clone(&self.sessions),
+        }
+    }
+
+    /// Send a request and get a receiver for its answer, so the caller can
+    /// wait for it alongside the agent's other messages.
+    pub fn start_call(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> oneshot::Receiver<Result<Value, CallError>> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.insert(id, tx);
+        }
+        let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        if self.out.send(line.to_string()).is_err()
+            && let Ok(mut pending) = self.pending.lock()
+            && let Some(tx) = pending.remove(&id)
+        {
+            let _ = tx.send(Err(CallError::Closed));
+        }
+        rx
+    }
+
+    /// Send a request and wait for its answer.
+    pub async fn call(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, CallError> {
+        let rx = self.start_call(method, params);
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(CallError::Closed),
+            Err(_) => Err(CallError::Timeout(timeout)),
+        }
+    }
+
+    pub fn notify(&self, method: &str, params: Value) {
+        let line = json!({"jsonrpc": "2.0", "method": method, "params": params});
+        let _ = self.out.send(line.to_string());
+    }
+
+    /// Answer a request the agent made. The id goes back exactly as it came:
+    /// agy numbers its requests with strings.
+    pub fn respond(&self, id: Value, result: Value) {
+        let line = json!({"jsonrpc": "2.0", "id": id, "result": result});
+        let _ = self.out.send(line.to_string());
+    }
+}
 
 pub struct Connection {
     child: Child,
     /// The child leads its own process group, so the shells and tools it
     /// starts can be killed with it.
     pgid: Option<i32>,
-    out: mpsc::UnboundedSender<String>,
-    pending: Pending,
-    next_id: AtomicU64,
+    client: Client,
     stderr: Arc<Mutex<String>>,
 }
 
 impl Connection {
     /// Start the agent and the tasks that read and write its stdio.
+    /// Returns the connection owner and a one-shot fired when stdout reaches EOF.
     pub fn spawn(
         argv: &[String],
         cwd: &Path,
         state_dir: &Path,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Incoming>)> {
+    ) -> Result<(Self, oneshot::Receiver<()>)> {
         let (program, args) = argv.split_first().context("the agent command is empty")?;
         let mut child = Command::new(program)
             .args(args)
@@ -184,74 +287,62 @@ impl Connection {
         });
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let (events, incoming) = mpsc::unbounded_channel();
+        let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let (exited_tx, exited_rx) = oneshot::channel();
         tokio::spawn(read_loop(
             BufReader::new(stdout),
             Arc::clone(&pending),
-            events,
+            Arc::clone(&sessions),
+            exited_tx,
             out.clone(),
         ));
+
+        let client = Client {
+            out,
+            pending,
+            next_id: Arc::new(AtomicU64::new(1)),
+            sessions,
+            next_sub: Arc::new(AtomicU64::new(1)),
+        };
 
         Ok((
             Self {
                 child,
                 pgid,
-                out,
-                pending,
-                next_id: AtomicU64::new(1),
+                client,
                 stderr: tail,
             },
-            incoming,
+            exited_rx,
         ))
     }
 
-    /// Send a request and get a receiver for its answer, so the caller can
-    /// wait for it alongside the agent's other messages.
+    pub fn client(&self) -> Client {
+        self.client.clone()
+    }
+
     pub fn start_call(
         &self,
         method: &str,
         params: Value,
     ) -> oneshot::Receiver<Result<Value, CallError>> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(id, tx);
-        }
-        let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        if self.out.send(line.to_string()).is_err()
-            && let Ok(mut pending) = self.pending.lock()
-            && let Some(tx) = pending.remove(&id)
-        {
-            let _ = tx.send(Err(CallError::Closed));
-        }
-        rx
+        self.client.start_call(method, params)
     }
 
-    /// Send a request and wait for its answer.
     pub async fn call(
         &self,
         method: &str,
         params: Value,
         timeout: Duration,
     ) -> Result<Value, CallError> {
-        let rx = self.start_call(method, params);
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(CallError::Closed),
-            Err(_) => Err(CallError::Timeout(timeout)),
-        }
+        self.client.call(method, params, timeout).await
     }
 
     pub fn notify(&self, method: &str, params: Value) {
-        let line = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        let _ = self.out.send(line.to_string());
+        self.client.notify(method, params);
     }
 
-    /// Answer a request the agent made. The id goes back exactly as it came:
-    /// agy numbers its requests with strings.
     pub fn respond(&self, id: Value, result: Value) {
-        let line = json!({"jsonrpc": "2.0", "id": id, "result": result});
-        let _ = self.out.send(line.to_string());
+        self.client.respond(id, result);
     }
 
     /// The last lines the agent wrote to stderr.
@@ -321,7 +412,8 @@ fn last_lines(text: &str, n: usize) -> String {
 async fn read_loop<R: tokio::io::AsyncBufRead + Unpin>(
     mut reader: R,
     pending: Pending,
-    events: mpsc::UnboundedSender<Incoming>,
+    sessions: SessionMap,
+    exited: oneshot::Sender<()>,
     out: mpsc::UnboundedSender<String>,
 ) {
     loop {
@@ -355,22 +447,26 @@ async fn read_loop<R: tokio::io::AsyncBufRead + Unpin>(
                 continue;
             }
         };
-        dispatch(message, &pending, &events, &out);
+        dispatch(message, &pending, &sessions, &out);
     }
 
-    // Nobody will answer the calls still waiting.
+    // Nobody will answer the calls still waiting, and every active turn wakes
+    // up immediately when its session channel closes.
     if let Ok(mut pending) = pending.lock() {
         for (_, tx) in pending.drain() {
             let _ = tx.send(Err(CallError::Closed));
         }
     }
-    let _ = events.send(Incoming::Exited);
+    if let Ok(mut map) = sessions.lock() {
+        map.clear();
+    }
+    let _ = exited.send(());
 }
 
 fn dispatch(
     message: Value,
     pending: &Pending,
-    events: &mpsc::UnboundedSender<Incoming>,
+    sessions: &SessionMap,
     out: &mpsc::UnboundedSender<String>,
 ) {
     let method = message.get("method").and_then(Value::as_str);
@@ -381,7 +477,30 @@ fn dispatch(
         (Some(method), Some(id)) => {
             if method == "session/request_permission" {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
-                let _ = events.send(Incoming::Permission { id, params });
+                let session = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let delivered = sessions
+                    .lock()
+                    .ok()
+                    .and_then(|map| map.get(session).map(|(_, tx)| tx.clone()))
+                    .is_some_and(|tx| {
+                        tx.send(SessionEvent::Permission {
+                            id: id.clone(),
+                            params,
+                        })
+                        .is_ok()
+                    });
+                if !delivered {
+                    // Nothing is subscribed to this session; refuse cleanly instead of hanging agy.
+                    let line = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"outcome": {"outcome": "cancelled"}},
+                    });
+                    let _ = out.send(line.to_string());
+                }
             } else {
                 // The client advertised no file system and no terminal, so
                 // anything else is unexpected; say so instead of leaving the
@@ -403,10 +522,15 @@ fn dispatch(
                 let session = params
                     .get("sessionId")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                    .unwrap_or_default();
                 let update = params.get("update").cloned().unwrap_or(Value::Null);
-                let _ = events.send(Incoming::Update { session, update });
+                if let Some(tx) = sessions
+                    .lock()
+                    .ok()
+                    .and_then(|map| map.get(session).map(|(_, tx)| tx.clone()))
+                {
+                    let _ = tx.send(SessionEvent::Update(update));
+                }
             }
         }
         // A response to one of our calls.
@@ -941,13 +1065,23 @@ mod tests {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (tx, rx) = oneshot::channel();
         pending.lock().unwrap().insert(7, tx);
-        let (events, mut incoming) = mpsc::unbounded_channel();
+        let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let (s1_tx, mut s1_rx) = mpsc::unbounded_channel();
+        let (s2_tx, mut s2_rx) = mpsc::unbounded_channel();
+        {
+            let mut map = sessions.lock().unwrap();
+            map.insert(
+                "00000000-0000-4000-8000-000000000001".to_string(),
+                (1, s1_tx),
+            );
+            map.insert("s2".to_string(), (2, s2_tx));
+        }
         let (out, mut written) = mpsc::unbounded_channel();
 
         dispatch(
             json!({"jsonrpc": "2.0", "id": 7, "result": {"stopReason": "end_turn"}}),
             &pending,
-            &events,
+            &sessions,
             &out,
         );
         assert_eq!(rx.await.unwrap().unwrap()["stopReason"], "end_turn");
@@ -955,18 +1089,29 @@ mod tests {
         dispatch(
             json!({"jsonrpc": "2.0", "id": "1", "method": "session/request_permission", "params": agy_permission()}),
             &pending,
-            &events,
+            &sessions,
             &out,
         );
-        match incoming.recv().await.unwrap() {
-            Incoming::Permission { id, .. } => assert_eq!(id, json!("1")),
+        match s1_rx.recv().await.unwrap() {
+            SessionEvent::Permission { id, .. } => assert_eq!(id, json!("1")),
             other => panic!("{other:?}"),
         }
+
+        // Unsubscribed permission requests receive an immediate cancelled outcome.
+        dispatch(
+            json!({"jsonrpc": "2.0", "id": "9", "method": "session/request_permission", "params": {"sessionId": "orphan"}}),
+            &pending,
+            &sessions,
+            &out,
+        );
+        let cancelled: Value = serde_json::from_str(&written.recv().await.unwrap()).unwrap();
+        assert_eq!(cancelled["id"], "9");
+        assert_eq!(cancelled["result"]["outcome"]["outcome"], "cancelled");
 
         dispatch(
             json!({"jsonrpc": "2.0", "id": 3, "method": "fs/read_text_file", "params": {}}),
             &pending,
-            &events,
+            &sessions,
             &out,
         );
         let refusal: Value = serde_json::from_str(&written.recv().await.unwrap()).unwrap();
@@ -974,13 +1119,13 @@ mod tests {
         assert_eq!(refusal["error"]["code"], -32601);
 
         dispatch(
-            json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s", "update": {"sessionUpdate": "usage_update"}}}),
+            json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s2", "update": {"sessionUpdate": "usage_update"}}}),
             &pending,
-            &events,
+            &sessions,
             &out,
         );
-        match incoming.recv().await.unwrap() {
-            Incoming::Update { session, .. } => assert_eq!(session, "s"),
+        match s2_rx.recv().await.unwrap() {
+            SessionEvent::Update(u) => assert_eq!(u["sessionUpdate"], "usage_update"),
             other => panic!("{other:?}"),
         }
     }

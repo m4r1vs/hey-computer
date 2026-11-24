@@ -235,9 +235,9 @@ async fn connection(handle: &Handle, stream: UnixStream) -> Result<()> {
 
     match request {
         Request::Status => send(&mut write, &Reply::Status(handle.status())).await,
-        Request::Cancel => {
-            let id = handle.cancel(None, FailReason::Cancelled);
-            send(&mut write, &Reply::Cancelled { id }).await
+        Request::Cancel { id } => {
+            let cancelled_id = handle.cancel(id, FailReason::Cancelled);
+            send(&mut write, &Reply::Cancelled { id: cancelled_id }).await
         }
         Request::Ask {
             text, attachments, ..
@@ -255,8 +255,21 @@ async fn connection(handle: &Handle, stream: UnixStream) -> Result<()> {
             wait,
             new,
             profile,
+            background,
+            suppress_token,
             attachments,
         } => {
+            if let Some(tok) = &suppress_token
+                && tok.trim().is_empty()
+            {
+                return send(
+                    &mut write,
+                    &Reply::Error {
+                        message: "suppress_token must not be empty".to_string(),
+                    },
+                )
+                .await;
+            }
             if let Err(message) = handle.validate_profile(profile.as_deref()) {
                 return send(&mut write, &Reply::Error { message }).await;
             }
@@ -286,12 +299,25 @@ async fn connection(handle: &Handle, stream: UnixStream) -> Result<()> {
                     }
                 }
             };
+            let params = conductor::AskParams {
+                text,
+                new,
+                profile,
+                background,
+                suppress_token,
+                attachments: loaded_attachments,
+            };
             if !wait {
-                let id = handle.ask(text, new, profile, loaded_attachments, Sink::Present);
-                return send(&mut write, &Reply::Accepted { id }).await;
+                return match handle.ask(params, Sink::Present) {
+                    Ok(id) => send(&mut write, &Reply::Accepted { id }).await,
+                    Err(message) => send(&mut write, &Reply::Error { message }).await,
+                };
             }
             let (tx, rx) = oneshot::channel();
-            let id = handle.ask(text, new, profile, loaded_attachments, Sink::Client(tx));
+            let id = match handle.ask(params, Sink::Client(tx)) {
+                Ok(id) => id,
+                Err(message) => return send(&mut write, &Reply::Error { message }).await,
+            };
             send(&mut write, &Reply::Accepted { id }).await?;
             // The client waits for the answer; if it hangs up first, the
             // request is cancelled, since nobody would see the answer.

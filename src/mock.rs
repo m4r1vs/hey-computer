@@ -61,18 +61,24 @@ pub struct TurnScript {
     pub steps: Vec<Step>,
 }
 
+fn default_execute_kind() -> String {
+    "execute".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Step {
     /// An `agent_message_chunk`.
     Chunk(String),
     SleepMs(u64),
-    /// A `run_command` tool call that asks for permission. Rejected or
-    /// cancelled, it ends the turn with no text, as agy does.
+    /// A tool call that asks for permission. Rejected or cancelled, it ends
+    /// the turn with no text, as agy does.
     Permission {
         command: String,
         #[serde(default)]
         summary: Option<String>,
+        #[serde(default = "default_execute_kind")]
+        kind: String,
     },
     /// A non-permission tool call (`tool_call` followed by completed `tool_call_update`).
     ToolCall {
@@ -90,6 +96,10 @@ pub enum Step {
     AttachmentInfo,
     /// "you said: TEXT".
     Echo,
+    /// Wait until another concurrent turn emits `Signal(name)`.
+    WaitFor(String),
+    /// Release any turn waiting on `WaitFor(name)` (latched).
+    Signal(String),
     /// Exit at once with this status, mid-turn.
     Exit(i32),
     /// Write this line as it is (not JSON, for example).
@@ -98,6 +108,8 @@ pub enum Step {
     Huge(usize),
     /// Send nothing more until cancelled.
     Hang,
+    /// Ignore `session/cancel` completely (for wedged-session recovery tests).
+    HangUninterruptible,
     /// End the turn with this stop reason.
     Stop(String),
     /// Answer the prompt with a JSON-RPC error.
@@ -132,6 +144,7 @@ struct State {
     session_config: HashMap<String, HashMap<String, String>>,
     cancels: HashMap<String, Arc<Notify>>,
     waiting: HashMap<String, oneshot::Sender<Value>>,
+    barriers: HashMap<String, (bool, Arc<Notify>)>,
 }
 
 struct Mock {
@@ -454,6 +467,35 @@ impl Mock {
                     self.chunk(&session, &format!("{text}{attach_tag}"));
                 }
                 Step::Echo => self.chunk(&session, &format!("you said: {text}")),
+                Step::Signal(name) => {
+                    let notify = {
+                        let mut state = self.state.lock().unwrap();
+                        let entry = state
+                            .barriers
+                            .entry(name)
+                            .or_insert_with(|| (false, Arc::new(Notify::new())));
+                        entry.0 = true;
+                        Arc::clone(&entry.1)
+                    };
+                    notify.notify_waiters();
+                }
+                Step::WaitFor(name) => loop {
+                    let (signaled, notify) = {
+                        let mut state = self.state.lock().unwrap();
+                        let entry = state
+                            .barriers
+                            .entry(name.clone())
+                            .or_insert_with(|| (false, Arc::new(Notify::new())));
+                        (entry.0, Arc::clone(&entry.1))
+                    };
+                    if signaled {
+                        break;
+                    }
+                    tokio::select! {
+                        () = notify.notified() => {}
+                        () = cancel.notified() => return cancelled(),
+                    }
+                },
                 Step::SleepMs(ms) => {
                     tokio::select! {
                         () = tokio::time::sleep(Duration::from_millis(ms)) => {}
@@ -464,19 +506,35 @@ impl Mock {
                     cancel.notified().await;
                     return cancelled();
                 }
-                Step::Permission { command, summary } => {
+                Step::HangUninterruptible => {
+                    std::future::pending::<()>().await;
+                }
+                Step::Permission {
+                    command,
+                    summary,
+                    kind,
+                } => {
                     let call = format!("call_{}", self.next_request.load(Ordering::Relaxed));
-                    let mut input = json!({"CommandLine": command, "WaitMsBeforeAsync": 5000});
+                    let mut input = if kind == "execute" {
+                        json!({"CommandLine": command, "WaitMsBeforeAsync": 5000})
+                    } else {
+                        json!({"target": command})
+                    };
                     if let Some(summary) = &summary {
                         input["toolSummary"] = json!(summary);
                     }
+                    let tool_name = if kind == "execute" {
+                        "run_command"
+                    } else {
+                        "tool_action"
+                    };
                     let tool = json!({
                         "sessionUpdate": "tool_call",
                         "toolCallId": call,
-                        "name": "run_command",
+                        "name": tool_name,
                         "args": input,
                         "status": "pending",
-                        "kind": "execute",
+                        "kind": kind,
                         "title": command,
                         "rawInput": input,
                     });

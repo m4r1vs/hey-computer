@@ -21,6 +21,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, Profile>,
     pub conversation: Conversation,
+    pub tasks: Tasks,
     pub permissions: Permissions,
     pub instructions: Instructions,
     pub context: Context,
@@ -131,6 +132,30 @@ pub struct Conversation {
     /// A request this soon after the previous answer continues that
     /// conversation; a later one starts a new one.
     pub follow_up_secs: f64,
+}
+
+/// Concurrency and queueing settings for background tasks (`ask --background`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Tasks {
+    /// Maximum background tasks running concurrently alongside the interactive
+    /// lane.
+    pub max_concurrent: usize,
+    /// Maximum background tasks waiting in the FIFO queue.
+    pub max_queued: usize,
+    /// Default profile for background tasks when `--profile` is omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+impl Default for Tasks {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 1,
+            max_queued: 32,
+            profile: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,6 +448,23 @@ impl Config {
                     "profiles.{name}.max_turn_secs must be between 0 and {MAX_SECS} seconds, not {v}"
                 );
             }
+        }
+        if !(1..=8).contains(&self.tasks.max_concurrent) {
+            bail!(
+                "tasks.max_concurrent must be between 1 and 8, not {}",
+                self.tasks.max_concurrent
+            );
+        }
+        if !(1..=256).contains(&self.tasks.max_queued) {
+            bail!(
+                "tasks.max_queued must be between 1 and 256, not {}",
+                self.tasks.max_queued
+            );
+        }
+        if let Some(profile) = self.tasks.profile.as_deref()
+            && let Err(msg) = self.resolve_profile(Some(profile))
+        {
+            bail!("tasks.profile: {msg}");
         }
         Ok(())
     }

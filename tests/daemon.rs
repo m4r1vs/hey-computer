@@ -370,14 +370,18 @@ async fn cancel_stops_the_running_request() {
     h.wait_log("prompt mock-1 slow").await;
     assert_eq!(h.status().await.running, Some(id));
 
-    let reply = ipc::request(&h.socket, &Request::Cancel).await.unwrap();
+    let reply = ipc::request(&h.socket, &Request::Cancel { id: None })
+        .await
+        .unwrap();
     assert_eq!(reply, Reply::Cancelled { id: Some(id) });
     let reply = waiting.next(Some(Duration::from_secs(5))).await.unwrap();
     let (reason, _) = failure(&reply);
     assert_eq!(reason, FailReason::Cancelled);
 
     // Nothing left to cancel.
-    let reply = ipc::request(&h.socket, &Request::Cancel).await.unwrap();
+    let reply = ipc::request(&h.socket, &Request::Cancel { id: None })
+        .await
+        .unwrap();
     assert_eq!(reply, Reply::Cancelled { id: None });
     h.stop().await;
 }
@@ -704,6 +708,7 @@ async fn a_shutdown_replaces_the_progress_popup() {
             reason: FailReason::AgentDown,
             message: "The daemon is shutting down.".to_string(),
             profile: None,
+            background: false,
         }),
         "{items:?}"
     );
@@ -744,6 +749,7 @@ async fn a_correction_during_a_cold_start_keeps_the_starting_agent() {
             reason: FailReason::Superseded,
             message: "A newer request replaced this one.".to_string(),
             profile: None,
+            background: false,
         }),
         "{items:?}"
     );
@@ -1194,7 +1200,9 @@ async fn the_last_successful_answer_is_persisted_and_failures_do_not_overwrite_i
     let _ = h.ask("silent", false).await;
     let (_, mut slow) = h.ask_waiting("slow").await;
     h.wait_log("prompt mock-1 slow").await;
-    ipc::request(&h.socket, &Request::Cancel).await.unwrap();
+    ipc::request(&h.socket, &Request::Cancel { id: None })
+        .await
+        .unwrap();
     let _ = slow.next(Some(Duration::from_secs(5))).await.unwrap();
     assert_eq!(
         hey_computer::store::load_last(&state_dir)
@@ -1255,6 +1263,8 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             wait: true,
             new: false,
             profile: Some("deep".to_string()),
+            background: false,
+            suppress_token: None,
             attachments: vec![],
         },
     )
@@ -1275,6 +1285,8 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             wait: true,
             new: false,
             profile: Some("default".to_string()),
+            background: false,
+            suppress_token: None,
             attachments: vec![],
         },
     )
@@ -1301,6 +1313,8 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             wait: true,
             new: true,
             profile: Some("deep".to_string()),
+            background: false,
+            suppress_token: None,
             attachments: vec![],
         },
     )
@@ -1318,6 +1332,8 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             wait: false,
             new: true,
             profile: Some("deep".to_string()),
+            background: false,
+            suppress_token: None,
             attachments: vec![],
         },
     )
@@ -1382,6 +1398,8 @@ async fn mid_session_config_rejection_falls_back_to_a_fresh_session() {
             wait: true,
             new: false,
             profile: Some("deep".to_string()),
+            background: false,
+            suppress_token: None,
             attachments: vec![],
         },
     )
@@ -1409,6 +1427,8 @@ async fn unknown_profile_returns_error_without_superseding_running_request() {
             wait: false,
             new: false,
             profile: Some("nonexistent".to_string()),
+            background: false,
+            suppress_token: None,
             attachments: vec![],
         },
     )
@@ -1421,7 +1441,9 @@ async fn unknown_profile_returns_error_without_superseding_running_request() {
 
     // The running request must not have been superseded by the rejected ask.
     assert_eq!(h.status().await.running, Some(running_id));
-    ipc::request(&h.socket, &Request::Cancel).await.unwrap();
+    ipc::request(&h.socket, &Request::Cancel { id: None })
+        .await
+        .unwrap();
     let (reason, _) = failure(&slow.next(Some(Duration::from_secs(5))).await.unwrap());
     assert_eq!(reason, FailReason::Cancelled);
     h.stop().await;
@@ -1454,6 +1476,8 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
             wait: true,
             new: false,
             profile: None,
+            background: false,
+            suppress_token: None,
             attachments: vec![
                 Attachment {
                     kind: AttachmentKind::File,
@@ -1499,6 +1523,8 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
             wait: true,
             new: true,
             profile: None,
+            background: false,
+            suppress_token: None,
             attachments: vec![Attachment {
                 kind: AttachmentKind::File,
                 path: note,
@@ -1523,6 +1549,8 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
             wait: false,
             new: false,
             profile: None,
+            background: false,
+            suppress_token: None,
             attachments: vec![Attachment {
                 kind: AttachmentKind::Image,
                 path: h.dir.join("missing.png"),
@@ -1533,7 +1561,289 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
     .unwrap();
     assert!(matches!(err, Reply::Error { .. }), "{err:?}");
     assert_eq!(h.status().await.running, Some(running_id));
-    ipc::request(&h.socket, &Request::Cancel).await.unwrap();
+    ipc::request(&h.socket, &Request::Cancel { id: None })
+        .await
+        .unwrap();
     let _ = slow.next(Some(Duration::from_secs(5))).await.unwrap();
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_task_runs_concurrently_with_interactive_and_survives_interactive_cancel() {
+    let script = r#"{
+        "turns": [
+            {"match": "bg_job", "steps": [
+                {"chunk": "bg-start "},
+                {"wait_for": "fg_done"},
+                {"chunk": "bg-end"}
+            ]},
+            {"match": "fg_quick", "steps": [
+                {"permission": {"command": "hyprctl version"}},
+                {"signal": "fg_done"},
+                {"chunk": "fg-answer"}
+            ]},
+            {"match": "fg_slow", "steps": ["hang"]}
+        ],
+        "default": ["echo"]
+    }"#;
+    let h = Harness::start(script, |_| {}).await;
+    h.wait_log("new mock-1").await;
+
+    // Submit a background task (wait=false) -> opens mock-2, keeping mock-1 spare for voice.
+    let (bg_id, _) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "bg_job".to_string(),
+            wait: false,
+            new: false,
+            profile: None,
+            background: true,
+            suppress_token: None,
+            attachments: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    h.wait_log("prompt mock-2 bg_job").await;
+
+    let st = h.status().await;
+    assert_eq!(st.running, None);
+    assert_eq!(st.background_running, 1);
+    assert_eq!(st.background_queued, 0);
+
+    // Start an interactive ask and cancel it via plain Cancel { id: None };
+    // the background task must keep running untouched.
+    let (fg_slow_id, mut fg_slow) = h.ask_waiting("fg_slow").await;
+    h.wait_log("prompt mock-1 fg_slow").await;
+    let cancel_reply = ipc::request(&h.socket, &Request::Cancel { id: None })
+        .await
+        .unwrap();
+    assert_eq!(
+        cancel_reply,
+        Reply::Cancelled {
+            id: Some(fg_slow_id)
+        }
+    );
+    let (reason, _) = failure(&fg_slow.next(Some(Duration::from_secs(5))).await.unwrap());
+    assert_eq!(reason, FailReason::Cancelled);
+    assert_eq!(h.status().await.background_running, 1);
+
+    // Interactive ask runs concurrently with bg_job and releases the barrier.
+    let fg_reply = h.ask("fg_quick", false).await;
+    assert_eq!(answer(&fg_reply), "fg-answer");
+
+    // Background task finishes and emits TaskComplete (never interactive Answer).
+    let items = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::TaskComplete { id, .. } if *id == bg_id))
+        })
+        .await
+        .expect("TaskComplete presented");
+    assert!(
+        items.iter().any(|i| matches!(
+            i,
+            Presentation::TaskComplete { id, text, .. } if *id == bg_id && text == "bg-start bg-end"
+        )),
+        "{items:?}"
+    );
+    h.wait_log("close mock-2").await;
+
+    // Default `load_last` stays interactive-only ("fg-answer"), while `get_turn(bg_id)` has the task.
+    let state_dir = h.dir.join("state");
+    h.eventually("bg task completed in db", || {
+        hey_computer::store::get_turn(&state_dir, bg_id)
+            .ok()
+            .flatten()
+            .is_some_and(|t| t.status == hey_computer::store::TurnStatus::Completed)
+    })
+    .await;
+    assert_eq!(
+        hey_computer::store::load_last(&state_dir)
+            .unwrap()
+            .unwrap()
+            .text,
+        "fg-answer"
+    );
+    assert_eq!(
+        hey_computer::store::get_turn(&state_dir, bg_id)
+            .unwrap()
+            .unwrap()
+            .answer,
+        "bg-start bg-end"
+    );
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_tasks_queue_fifo_respect_max_queued_and_cancel_by_id() {
+    let h = Harness::start(SCRIPT, |c| {
+        c.tasks.max_concurrent = 1;
+        c.tasks.max_queued = 1;
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    // bg1 runs immediately; bg2 sits in queue; bg3 is rejected (max_queued = 1).
+    let (bg1, mut c1) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "slow".to_string(),
+            wait: true,
+            new: false,
+            profile: None,
+            background: true,
+            suppress_token: None,
+            attachments: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    h.wait_log("prompt mock-2 slow").await;
+
+    let (bg2, mut c2) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "plain".to_string(),
+            wait: true,
+            new: false,
+            profile: None,
+            background: true,
+            suppress_token: None,
+            attachments: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let st = h.status().await;
+    assert_eq!(st.background_running, 1);
+    assert_eq!(st.background_queued, 1);
+
+    let bg3 = ipc::request(
+        &h.socket,
+        &Request::Ask {
+            text: "overflow".to_string(),
+            wait: false,
+            new: false,
+            profile: None,
+            background: true,
+            suppress_token: None,
+            attachments: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(bg3, Reply::Error { .. }), "{bg3:?}");
+
+    // Cancel queued bg2 by id -> immediately evicted without affecting bg1.
+    let cancel2 = ipc::request(&h.socket, &Request::Cancel { id: Some(bg2) })
+        .await
+        .unwrap();
+    assert_eq!(cancel2, Reply::Cancelled { id: Some(bg2) });
+    let (r2, _) = failure(&c2.next(Some(Duration::from_secs(5))).await.unwrap());
+    assert_eq!(r2, FailReason::Cancelled);
+    assert_eq!(h.status().await.background_queued, 0);
+    assert_eq!(h.status().await.background_running, 1);
+
+    // Cancel running bg1 by id.
+    let cancel1 = ipc::request(&h.socket, &Request::Cancel { id: Some(bg1) })
+        .await
+        .unwrap();
+    assert_eq!(cancel1, Reply::Cancelled { id: Some(bg1) });
+    let (r1, _) = failure(&c1.next(Some(Duration::from_secs(5))).await.unwrap());
+    assert_eq!(r1, FailReason::Cancelled);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suppress_token_silences_heartbeats_and_notifies_on_alerts() {
+    let script = r#"{
+        "turns": [
+            {"match": "hb_ok", "steps": [{"chunk": "HEARTBEAT_OK."}]},
+            {"match": "hb_alert", "steps": [{"chunk": "Disk 92% full"}]}
+        ],
+        "default": ["echo"]
+    }"#;
+    let h = Harness::start(script, |_| {}).await;
+    h.wait_log("new mock-1").await;
+
+    // 1. Background fire-and-forget heartbeat matching token -> silent + persisted as suppressed.
+    let (hb_id, _) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "hb_ok".to_string(),
+            wait: false,
+            new: false,
+            profile: None,
+            background: true,
+            suppress_token: Some("HEARTBEAT_OK".to_string()),
+            attachments: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let state_dir = h.dir.join("state");
+    h.eventually("heartbeat persisted as suppressed", || {
+        hey_computer::store::get_turn(&state_dir, hb_id)
+            .ok()
+            .flatten()
+            .is_some_and(|t| t.status == hey_computer::store::TurnStatus::Suppressed)
+    })
+    .await;
+    assert!(h.recorder.items().is_empty());
+
+    // 2. Waiting (--print) heartbeat matching token -> Reply::Answer { suppressed: true }.
+    let (_, mut c) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "hb_ok".to_string(),
+            wait: true,
+            new: false,
+            profile: None,
+            background: true,
+            suppress_token: Some("HEARTBEAT_OK".to_string()),
+            attachments: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    match c.next(Some(Duration::from_secs(10))).await.unwrap() {
+        Reply::Answer { suppressed, .. } => assert!(suppressed),
+        other => panic!("expected suppressed answer, got {other:?}"),
+    }
+
+    // 3. Non-matching alert -> emits TaskComplete!
+    let (alert_id, _) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "hb_alert".to_string(),
+            wait: false,
+            new: false,
+            profile: None,
+            background: true,
+            suppress_token: Some("HEARTBEAT_OK".to_string()),
+            attachments: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let items = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::TaskComplete { id, .. } if *id == alert_id))
+        })
+        .await
+        .expect("alert TaskComplete");
+    assert!(
+        items.iter().any(|i| matches!(
+            i,
+            Presentation::TaskComplete { id, text, .. } if *id == alert_id && text == "Disk 92% full"
+        )),
+        "{items:?}"
+    );
     h.stop().await;
 }

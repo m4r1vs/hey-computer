@@ -69,7 +69,7 @@ pub async fn prompt(
     attachments: Vec<crate::protocol::Attachment>,
 ) -> Result<bool> {
     match conductor::ask_once(config, text, profile, attachments).await? {
-        Outcome::Answer { text, denied } => {
+        Outcome::Answer { text, denied, .. } => {
             println!("{text}");
             for command in denied {
                 eprintln!("refused: {command}");

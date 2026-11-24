@@ -92,6 +92,7 @@ fn takes_value(wrapper: &str, option: &str) -> bool {
 /// Shells whose `-c` argument is itself a command line.
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "ksh"];
 
+#[derive(Debug, Clone)]
 pub struct Policy {
     deny: Vec<String>,
 }
@@ -111,6 +112,106 @@ impl Policy {
         command_words(line, 0)
             .into_iter()
             .find(|word| self.deny.iter().any(|d| d == word))
+    }
+}
+
+/// Decision made by a [`LanePolicy`] for one `session/request_permission`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Allow,
+    Deny {
+        /// Short category/word safe to log at `info`.
+        tag: String,
+        /// Command or tool name included in the refusal report.
+        detail: String,
+    },
+}
+
+/// Per-lane permission profile hook.
+///
+/// Interactive and background lanes enforce the configured shell deny list and
+/// allow configured MCP servers; restricted lanes (for Phase 6 reactive tasks)
+/// additionally refuse every mutating/executing tool kind and disable MCP.
+#[derive(Debug, Clone)]
+pub struct LanePolicy {
+    pub deny_commands: Policy,
+    pub deny_tool_kinds: Vec<String>,
+    pub allow_mcp: bool,
+}
+
+impl LanePolicy {
+    pub fn standard(deny: &[String]) -> Self {
+        Self {
+            deny_commands: Policy::new(deny),
+            deny_tool_kinds: Vec::new(),
+            allow_mcp: true,
+        }
+    }
+
+    /// Restricted read-only lane: refuses `execute`, `edit`, `delete`, `move`
+    /// and disables MCP servers.
+    pub fn restricted() -> Self {
+        Self {
+            deny_commands: Policy::new(&[]),
+            deny_tool_kinds: ["execute", "edit", "delete", "move"]
+                .map(String::from)
+                .to_vec(),
+            allow_mcp: false,
+        }
+    }
+
+    pub fn evaluate_permission(&self, params: &serde_json::Value) -> PermissionDecision {
+        let Some(tool_call) = params.get("toolCall") else {
+            return PermissionDecision::Allow;
+        };
+        self.evaluate_tool_call(tool_call)
+    }
+
+    pub fn will_deny_update(&self, update: &serde_json::Value) -> bool {
+        matches!(
+            self.evaluate_tool_call(update),
+            PermissionDecision::Deny { .. }
+        )
+    }
+
+    fn evaluate_tool_call(&self, tool_call: &serde_json::Value) -> PermissionDecision {
+        let kind = tool_call
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("other");
+        let command = crate::acp::tool_command(tool_call);
+        if self.deny_tool_kinds.iter().any(|k| k == kind) {
+            let detail = command
+                .or_else(|| {
+                    tool_call
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .map(String::from)
+                })
+                .unwrap_or_else(|| kind.to_string());
+            return PermissionDecision::Deny {
+                tag: kind.to_string(),
+                detail,
+            };
+        }
+        if !self.allow_mcp
+            && let Some(name) = tool_call.get("name").and_then(serde_json::Value::as_str)
+            && name.starts_with("mcp_")
+        {
+            return PermissionDecision::Deny {
+                tag: "mcp".to_string(),
+                detail: name.to_string(),
+            };
+        }
+        if let Some(cmd) = command
+            && let Some(word) = self.deny_commands.denied_word(&cmd)
+        {
+            return PermissionDecision::Deny {
+                tag: word,
+                detail: cmd,
+            };
+        }
+        PermissionDecision::Allow
     }
 }
 
@@ -871,5 +972,51 @@ mod tests {
             command_words("systemd-run --user --scope -u v -- env A=1 marker f", 0),
             ["systemd-run", "env", "marker"]
         );
+    }
+
+    #[test]
+    fn lane_policy_restricted_blocks_mutating_kinds_and_mcp_only() {
+        use serde_json::json;
+
+        let std_lane = LanePolicy::standard(&["sudo".to_string()]);
+        assert_eq!(
+            std_lane.evaluate_permission(&json!({
+                "toolCall": {"kind": "edit", "title": "Edit note.md"}
+            })),
+            PermissionDecision::Allow
+        );
+        assert!(matches!(
+            std_lane.evaluate_permission(&json!({
+                "toolCall": {"kind": "execute", "rawInput": {"CommandLine": "sudo id"}}
+            })),
+            PermissionDecision::Deny { ref tag, .. } if tag == "sudo"
+        ));
+
+        let restricted = LanePolicy::restricted();
+        assert!(!restricted.allow_mcp);
+        for blocked in [
+            json!({"toolCall": {"kind": "execute", "rawInput": {"CommandLine": "ls"}}}),
+            json!({"toolCall": {"kind": "edit", "title": "notes.md"}}),
+            json!({"toolCall": {"kind": "delete", "title": "notes.md"}}),
+            json!({"toolCall": {"kind": "move", "title": "notes.md"}}),
+            json!({"toolCall": {"kind": "other", "name": "mcp_slack_post"}}),
+        ] {
+            assert!(
+                matches!(
+                    restricted.evaluate_permission(&blocked),
+                    PermissionDecision::Deny { .. }
+                ),
+                "{blocked} should be denied in restricted lane"
+            );
+        }
+        for allowed in [
+            json!({"toolCall": {"kind": "read", "title": "notes.md"}}),
+            json!({"toolCall": {"kind": "search", "title": "grep"}}),
+        ] {
+            assert_eq!(
+                restricted.evaluate_permission(&allowed),
+                PermissionDecision::Allow
+            );
+        }
     }
 }
