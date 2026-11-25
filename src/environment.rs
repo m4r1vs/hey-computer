@@ -121,7 +121,24 @@ pub fn prepare(config: &Config) -> Result<Paths> {
     let config_dir = paths.agent_dir.join("config");
     private_dir(&config_dir)?;
     let mcp_config_path = config_dir.join("mcp_config.json");
-    if let Some(mcp_cfg) = crate::mcp::build_mcp_config(config) {
+    let mcp_browser_path = paths.agent_dir.join("mcp-browser");
+    let has_stdio_mcp = config
+        .mcp
+        .values()
+        .any(|server| server.enabled && !server.command.is_empty());
+    let mcp_browser = if has_stdio_mcp {
+        write_mcp_browser(&mcp_browser_path)?;
+        Some(mcp_browser_path.as_path())
+    } else {
+        if let Err(e) = std::fs::remove_file(&mcp_browser_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e)
+                .with_context(|| format!("removing stale {}", mcp_browser_path.display()));
+        }
+        None
+    };
+    if let Some(mcp_cfg) = crate::mcp::build_mcp_config(config, mcp_browser) {
         let json = serde_json::to_string_pretty(&mcp_cfg)?;
         write_file(&mcp_config_path, &json)?;
     } else if let Err(e) = std::fs::remove_file(&mcp_config_path)
@@ -609,8 +626,34 @@ fn private_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("restricting {}", dir.display()))
 }
 
+/// Wrapper set as `BROWSER` for stdio MCP servers so OAuth browser launches
+/// detach stdin/stdout/stderr before invoking `xdg-open`/`open`. Browsers like
+/// Chromium/Brave otherwise write `"Opening in existing browser session."` to
+/// inherited stdout, corrupting the MCP JSON-RPC stream and killing the server
+/// (along with its localhost OAuth callback listener).
+const MCP_BROWSER_SCRIPT: &str = "\
+#!/bin/sh
+unset BROWSER
+if command -v xdg-open >/dev/null 2>&1; then
+  xdg-open \"$@\" </dev/null >/dev/null 2>&1 &
+  exit 0
+elif command -v open >/dev/null 2>&1; then
+  open \"$@\" </dev/null >/dev/null 2>&1 &
+  exit 0
+fi
+exit 1
+";
+
+fn write_mcp_browser(path: &Path) -> Result<()> {
+    write_file_mode(path, MCP_BROWSER_SCRIPT, 0o700)
+}
+
 /// Replace a file in one step, readable only by the user.
 fn write_file(path: &Path, text: &str) -> Result<()> {
+    write_file_mode(path, text, 0o600)
+}
+
+fn write_file_mode(path: &Path, text: &str, mode: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let temporary = path.with_extension("tmp");
@@ -619,12 +662,14 @@ fn write_file(path: &Path, text: &str) -> Result<()> {
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
+            .mode(mode)
             .open(&temporary)
             .with_context(|| format!("writing {}", temporary.display()))?;
         file.write_all(text.as_bytes())
             .with_context(|| format!("writing {}", temporary.display()))?;
     }
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("restricting {}", temporary.display()))?;
     std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))
 }
 
@@ -1141,6 +1186,95 @@ mod tests {
 
         let text = instructions(&config);
         assert!(text.contains("MEMORY: 2,840 / 4,000 chars (71%)"), "{text}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn stdio_mcp_gets_quiet_browser_wrapper_that_never_pollutes_stdout() {
+        let root = scratch("mcp-browser");
+        let mut config = Config {
+            state_dir: root.join("state"),
+            ..Config::default()
+        };
+        config.mcp.insert(
+            "demo".to_string(),
+            crate::config::McpServer {
+                enabled: true,
+                command: "/bin/demo-mcp".to_string(),
+                ..crate::config::McpServer::default()
+            },
+        );
+        let paths = prepare(&config).unwrap();
+        let wrapper = paths.agent_dir.join("mcp-browser");
+        assert!(wrapper.is_file());
+        assert_eq!(
+            std::fs::metadata(&wrapper).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let mcp_cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(paths.agent_dir.join("config/mcp_config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            mcp_cfg["mcpServers"]["demo"]["env"]["BROWSER"],
+            wrapper.to_string_lossy().as_ref()
+        );
+
+        // Execute the wrapper against a noisy fake xdg-open and verify stdout
+        // and stderr stay completely empty while the URL is delivered with
+        // BROWSER unset.
+        let fake_bin = root.join("bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        let marker = root.join("opened.txt");
+        let fake_xdg = fake_bin.join("xdg-open");
+        std::fs::write(
+            &fake_xdg,
+            format!(
+                "#!/bin/sh\necho 'Opening in existing browser session.'\necho 'stderr noise' >&2\nprintf '%s|%s' \"${{BROWSER:-unset}}\" \"$1\" > \"{}\"\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let existing_path = std::env::var("PATH").unwrap_or_default();
+        let output = std::process::Command::new(&wrapper)
+            .arg("https://accounts.google.com/o/oauth2/auth")
+            .env("BROWSER", &wrapper)
+            .env("PATH", format!("{}:{existing_path}", fake_bin.display()))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "wrapper leaked stdout: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "wrapper leaked stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Wait briefly for the detached background fake xdg-open to write marker.
+        let mut recorded = String::new();
+        for _ in 0..40 {
+            if let Ok(content) = std::fs::read_to_string(&marker)
+                && !content.is_empty()
+            {
+                recorded = content;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(recorded, "unset|https://accounts.google.com/o/oauth2/auth");
+
+        // Removing stdio MCP servers cleans up the wrapper too.
+        config.mcp.clear();
+        prepare(&config).unwrap();
+        assert!(!wrapper.exists());
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
