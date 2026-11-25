@@ -11,6 +11,7 @@
 
 pub mod acp;
 pub mod attachments;
+pub mod bridge;
 pub mod conductor;
 pub mod config;
 pub mod context;

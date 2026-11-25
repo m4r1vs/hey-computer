@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "hey-computer-viewer"
 path = "src/bin/hey-computer-viewer.rs"
 
+[[bin]]
+name = "hey-computer-bridge"
+path = "src/bin/hey-computer-bridge.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
