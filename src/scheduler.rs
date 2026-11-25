@@ -1068,6 +1068,7 @@ async fn run_agent_job(
             new: true,
             profile: profile.clone(),
             background: true,
+            restricted: false,
             suppress_token: job.suppress_token.clone(),
             attachments: Vec::new(),
             source: InputSource::Cli,
@@ -1090,6 +1091,7 @@ async fn run_agent_job(
             text,
             denied,
             widgets,
+            tool_icons,
             ..
         }) => {
             presenter.present(Presentation::TaskComplete {
@@ -1099,7 +1101,7 @@ async fn run_agent_job(
                 denied,
                 profile,
                 widgets,
-                icons: Vec::new(),
+                icons: tool_icons,
             });
             AgentJobResult::Ok
         }

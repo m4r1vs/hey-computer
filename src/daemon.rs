@@ -15,11 +15,19 @@ use crate::attachments;
 use crate::conductor::{self, Handle, Sink};
 use crate::config::Config;
 use crate::context::{ContextProvider, SystemContext};
+use crate::keyring::{DbusKeyringWatcher, KeyringWatcher};
 use crate::lines::{self, Line};
-use crate::present::{Desktop, Presenter};
-use crate::protocol::{self, FailReason, MAX_REQUEST_LINE, Reply, Request};
+use crate::messenger::{self, MessengerHandle};
+use crate::notify_filter::{
+    self, EnrichmentResult, FilterDecision, IncomingNotification, NotificationFilter,
+};
+use crate::present::{self, Desktop, Presenter};
+use crate::protocol::{
+    self, DraftAction, FailReason, InputSource, MAX_REQUEST_LINE, NotifyReleaseAction, Reply,
+    Request,
+};
 use crate::scheduler::{self, SchedulerHandle};
-use crate::store::Store;
+use crate::store::{self, CheckpointClaim, DraftStatus, NewDraftCheckpoint, Store};
 use crate::{environment, ipc};
 
 /// A client gets this long to send its request line.
@@ -64,6 +72,37 @@ pub async fn serve_with_context(
     context: Arc<dyn ContextProvider>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    serve_with_deps(
+        config,
+        socket,
+        presenter,
+        context,
+        Arc::new(DbusKeyringWatcher),
+        shutdown,
+    )
+    .await
+}
+
+#[derive(Clone)]
+struct DaemonServices {
+    config: Arc<Config>,
+    handle: Handle,
+    scheduler: SchedulerHandle,
+    store: Store,
+    notify_filter: Arc<NotificationFilter>,
+    messenger: MessengerHandle,
+}
+
+/// Serve on `socket` with injectable ambient context provider and keyring
+/// watcher (for integration tests).
+pub async fn serve_with_deps(
+    config: Config,
+    socket: &Path,
+    presenter: Arc<dyn Presenter>,
+    context: Arc<dyn ContextProvider>,
+    keyring: Arc<dyn KeyringWatcher>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
     // `Config::load` validates too, but a config built in code (the tests,
     // another front end) comes here directly.
     config.validate()?;
@@ -99,28 +138,42 @@ pub async fn serve_with_context(
     tracing::info!("listening on {}", socket.display());
 
     let config = Arc::new(config);
-    let (handle, mut conductor) = conductor::spawn_with_store(
+    let (handle, mut conductor) = conductor::spawn_with_deps(
         Arc::clone(&config),
         Arc::clone(&presenter),
         context,
         Some((store.clone(), initial_last_id)),
+        keyring,
     );
     let (sched_handle, sched_task) = scheduler::spawn(
         Arc::clone(&config),
         paths.state_dir.clone(),
         handle.clone(),
+        Arc::clone(&presenter),
+    );
+    let (messenger_handle, messenger_task) = messenger::spawn(
+        Arc::clone(&config),
+        handle.clone(),
+        store.clone(),
         presenter,
     );
+    let services = DaemonServices {
+        config: Arc::clone(&config),
+        handle: handle.clone(),
+        scheduler: sched_handle.clone(),
+        store: store.clone(),
+        notify_filter: Arc::new(NotificationFilter::new(config.notifications.clone())),
+        messenger: messenger_handle.clone(),
+    };
     tokio::pin!(shutdown);
     let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    let handle = handle.clone();
-                    let sched = sched_handle.clone();
+                    let svc = services.clone();
                     connections.spawn(async move {
-                        if let Err(e) = connection(&handle, &sched, stream).await {
+                        if let Err(e) = connection(&svc, stream).await {
                             tracing::debug!("client connection: {e:#}");
                         }
                     });
@@ -137,6 +190,8 @@ pub async fn serve_with_context(
             // (a panic), the daemon would accept requests and answer none;
             // exiting with an error lets systemd restart it instead.
             ended = &mut conductor => {
+                messenger_handle.shutdown();
+                let _ = messenger_task.await;
                 sched_handle.shutdown();
                 let _ = sched_task.await;
                 let _ = std::fs::remove_file(socket);
@@ -155,6 +210,8 @@ pub async fn serve_with_context(
     if let Err(e) = std::fs::remove_file(socket) {
         tracing::warn!("cannot remove {}: {e}", socket.display());
     }
+    messenger_handle.shutdown();
+    let _ = messenger_task.await;
     sched_handle.shutdown();
     let _ = sched_task.await;
     // Cancels the running request too: with an agent that keeps working,
@@ -229,11 +286,9 @@ async fn bind(path: &Path) -> Result<UnixListener> {
 }
 
 /// One request in, one or more replies out.
-async fn connection(
-    handle: &Handle,
-    scheduler: &SchedulerHandle,
-    stream: UnixStream,
-) -> Result<()> {
+async fn connection(svc: &DaemonServices, stream: UnixStream) -> Result<()> {
+    let handle = &svc.handle;
+    let scheduler = &svc.scheduler;
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
 
@@ -391,6 +446,7 @@ async fn connection(
                 new,
                 profile,
                 background,
+                restricted: false,
                 suppress_token,
                 attachments: loaded_attachments,
                 source,
@@ -474,6 +530,327 @@ async fn connection(
                     .await
                 }
             }
+        }
+        Request::NotifyHold {
+            noti_id,
+            replaces_id: _,
+            app_name,
+            desktop_entry,
+            summary,
+            body,
+            category,
+            urgency,
+            has_default_action: _,
+            dnd,
+        } => {
+            handle_notify_hold(
+                svc,
+                &mut reader,
+                &mut write,
+                IncomingNotification {
+                    app_name,
+                    desktop_entry: (!desktop_entry.trim().is_empty()).then_some(desktop_entry),
+                    summary,
+                    body,
+                    category: (!category.trim().is_empty()).then_some(category),
+                    urgency: (!urgency.trim().is_empty()).then_some(urgency),
+                    dnd,
+                    source_notif_id: (noti_id > 0).then_some(noti_id),
+                    ..IncomingNotification::default()
+                },
+            )
+            .await
+        }
+        Request::DraftResume { token, action } => {
+            handle_draft_resume(svc, &mut write, token, action).await
+        }
+    }
+}
+
+fn show_raw_reply(reason: impl Into<String>) -> Reply {
+    Reply::NotifyRelease {
+        action: NotifyReleaseAction::ShowRaw,
+        turn_id: None,
+        token: None,
+        context_note: None,
+        draft_text: None,
+        readonly: None,
+        reason: Some(reason.into()),
+    }
+}
+
+async fn handle_notify_hold(
+    svc: &DaemonServices,
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    incoming: IncomingNotification,
+) -> Result<()> {
+    // Immediate < 1 ms fail-open when keyring is locked so lock-screen toasts
+    // are never held.
+    if svc.handle.is_locked() {
+        return send(write, &show_raw_reply("keyring_locked")).await;
+    }
+
+    // Tier 2 deterministic AI-less filter (< 50 us).
+    let prepared = match svc.notify_filter.evaluate(&incoming) {
+        FilterDecision::Drop(reason) => {
+            return send(write, &show_raw_reply(reason.as_str())).await;
+        }
+        FilterDecision::Allow(prepared) => prepared,
+    };
+
+    svc.messenger
+        .record_notify_hold(&prepared.channel, &prepared.sender, &prepared.body);
+
+    let max_hold_ms = (svc.config.notifications.max_hold_secs * 1000.0).round() as u64;
+    send(write, &Reply::NotifyAccepted { max_hold_ms }).await?;
+
+    // Opportunistically fetch bidirectional recent chat context from the
+    // read-only messenger bridge (#36) within 150 ms, failing open to empty.
+    let recent_chat = if let Some(platform) = messenger::channel_platform(&prepared.channel)
+        && (svc.config.messenger.enabled || !svc.config.messenger.socket.as_os_str().is_empty())
+        && let Some(bridge_sock) = messenger::resolve_bridge_socket(&svc.config)
+    {
+        messenger::fetch_recent_context(&bridge_sock, Some(platform), &prepared.sender, 10).await
+    } else {
+        Vec::new()
+    };
+
+    let prompt = notify_filter::build_enrichment_prompt(&prepared, &recent_chat);
+    let (tx, rx) = oneshot::channel();
+    let turn_id = match svc.handle.ask(
+        conductor::AskParams {
+            text: prompt,
+            new: true,
+            profile: svc.config.notifications.profile.clone(),
+            background: true,
+            restricted: true,
+            suppress_token: Some("HEARTBEAT_OK".to_string()),
+            attachments: Vec::new(),
+            source: InputSource::Cli,
+            reply_to: None,
+            distill: false,
+            schedule_id: None,
+            schedule_has_script: false,
+        },
+        Sink::Client(tx),
+    ) {
+        Ok(id) => id,
+        Err(msg) => {
+            tracing::debug!("notify_hold failed to queue restricted turn: {msg}");
+            return send(write, &show_raw_reply("queue_full")).await;
+        }
+    };
+
+    // Cancel the restricted drafting turn immediately if SwayNC closes the
+    // socket (notification closed by app, watchdog expired, or SwayNC exited).
+    let reply = tokio::select! {
+        reply = rx => reply,
+        () = hung_up(reader) => {
+            tracing::debug!("notify_hold client disconnected; cancelling restricted turn {turn_id}");
+            svc.handle.cancel(Some(turn_id), FailReason::Cancelled);
+            return Ok(());
+        }
+    };
+
+    let Ok(Reply::Answer {
+        text,
+        suppressed: false,
+        ..
+    }) = reply
+    else {
+        return send(write, &show_raw_reply("suppressed")).await;
+    };
+
+    let EnrichmentResult::Enriched {
+        context_note,
+        draft_text,
+    } = notify_filter::parse_enrichment_output(&text)
+    else {
+        return send(write, &show_raw_reply("suppressed")).await;
+    };
+
+    let now_ms = store::unix_timestamp_ms();
+    let ttl_ms = (svc.config.notifications.draft_ttl_secs * 1000.0).round() as i64;
+    let cp = match svc
+        .store
+        .create_draft_checkpoint(NewDraftCheckpoint {
+            turn_id: Some(turn_id),
+            channel: prepared.channel.clone(),
+            app_name: prepared.app_name.clone(),
+            sender: prepared.sender.clone(),
+            chat_target: prepared.chat_target.clone(),
+            source_notif_id: prepared.source_notif_id,
+            window_class: prepared.window_class.clone(),
+            context_note: context_note.clone().unwrap_or_default(),
+            draft_text: draft_text.clone().unwrap_or_default(),
+            created_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(ttl_ms),
+        })
+        .await
+    {
+        Ok(cp) => cp,
+        Err(e) => {
+            tracing::warn!("cannot persist draft checkpoint for turn {turn_id}: {e:#}");
+            return send(write, &show_raw_reply("store_error")).await;
+        }
+    };
+
+    send(
+        write,
+        &Reply::NotifyRelease {
+            action: NotifyReleaseAction::ShowEnriched,
+            turn_id: Some(turn_id),
+            token: Some(cp.token),
+            context_note,
+            draft_text,
+            readonly: Some(prepared.readonly),
+            reason: None,
+        },
+    )
+    .await
+}
+
+async fn handle_draft_resume(
+    svc: &DaemonServices,
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    token: String,
+    action: DraftAction,
+) -> Result<()> {
+    let peeked = match svc.store.get_draft_checkpoint(token.clone()).await {
+        Ok(cp) => cp,
+        Err(e) => {
+            return send(
+                write,
+                &Reply::Error {
+                    message: format!("reading draft checkpoint: {e:#}"),
+                },
+            )
+            .await;
+        }
+    };
+
+    // Enforce strict WhatsApp/Signal read-only guarantee: Paste always degrades
+    // to clipboard-only Copy on read-only channels.
+    let effective_action = match (&peeked, action) {
+        (Some(cp), DraftAction::Paste) if notify_filter::is_readonly_channel(&cp.channel) => {
+            DraftAction::Copy
+        }
+        _ => action,
+    };
+
+    let now_ms = store::unix_timestamp_ms();
+    let claim = match svc
+        .store
+        .claim_draft_checkpoint(token, effective_action, now_ms)
+        .await
+    {
+        Ok(claim) => claim,
+        Err(e) => {
+            return send(
+                write,
+                &Reply::Error {
+                    message: format!("claiming draft checkpoint: {e:#}"),
+                },
+            )
+            .await;
+        }
+    };
+
+    match claim {
+        CheckpointClaim::NotFound => {
+            send(
+                write,
+                &Reply::Error {
+                    message: "draft checkpoint not found".to_string(),
+                },
+            )
+            .await
+        }
+        CheckpointClaim::Expired(cp) => {
+            send(
+                write,
+                &Reply::DraftResumed {
+                    id: cp.id,
+                    turn_id: cp.turn_id,
+                    action: effective_action,
+                    status: "expired".to_string(),
+                    message: "draft checkpoint expired".to_string(),
+                },
+            )
+            .await
+        }
+        CheckpointClaim::AlreadyUsed(cp) => {
+            // Allow opening the viewer for `Edit` even after an earlier `Copy`
+            // claim (e.g. clicking Copy then Edit on the same SwayNC card),
+            // while still reporting `already_used` for single-use token auditing.
+            if effective_action == DraftAction::Edit && cp.status != DraftStatus::Dismissed {
+                let present_cfg = svc.config.present.clone();
+                let turn_id = cp.turn_id;
+                let draft_text = cp.draft_text.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        present::open_draft_editor(&present_cfg, turn_id, &draft_text).await
+                    {
+                        tracing::debug!("draft edit viewer launch skipped/failed: {e:#}");
+                    }
+                });
+            }
+            send(
+                write,
+                &Reply::DraftResumed {
+                    id: cp.id,
+                    turn_id: cp.turn_id,
+                    action: effective_action,
+                    status: "already_used".to_string(),
+                    message: format!("draft checkpoint already {}", cp.status),
+                },
+            )
+            .await
+        }
+        CheckpointClaim::Claimed(cp) => {
+            let message = match effective_action {
+                DraftAction::Copy | DraftAction::Paste => {
+                    if !cp.draft_text.is_empty() && !svc.config.present.clipboard.is_empty() {
+                        let present_cfg = svc.config.present.clone();
+                        let text = cp.draft_text.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = present::copy_to_clipboard(&present_cfg, &text).await {
+                                tracing::debug!("draft copy_to_clipboard failed: {e:#}");
+                            }
+                        });
+                    }
+                    "copied draft to clipboard".to_string()
+                }
+                DraftAction::Edit => {
+                    let present_cfg = svc.config.present.clone();
+                    let turn_id = cp.turn_id;
+                    let text = cp.draft_text.clone();
+                    tokio::spawn(async move {
+                        if !text.is_empty() && !present_cfg.clipboard.is_empty() {
+                            let _ = present::copy_to_clipboard(&present_cfg, &text).await;
+                        }
+                        if let Err(e) =
+                            present::open_draft_editor(&present_cfg, turn_id, &text).await
+                        {
+                            tracing::debug!("draft edit viewer launch skipped/failed: {e:#}");
+                        }
+                    });
+                    "opened draft in viewer".to_string()
+                }
+                DraftAction::Dismiss => "dismissed draft".to_string(),
+            };
+            send(
+                write,
+                &Reply::DraftResumed {
+                    id: cp.id,
+                    turn_id: cp.turn_id,
+                    action: effective_action,
+                    status: "claimed".to_string(),
+                    message,
+                },
+            )
+            .await
         }
     }
 }

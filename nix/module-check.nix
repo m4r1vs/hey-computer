@@ -8,11 +8,12 @@
 }: let
   inherit (pkgs) lib;
 
-  # Stand-ins for the unfree agent, Obsidian, openhue, and piper packages.
+  # Stand-ins for the unfree agent, Obsidian, openhue, piper, and bridge packages.
   stubAgent = pkgs.writeShellScriptBin "agy" ''echo "agy stub: $*"'';
   stubObsidian = pkgs.writeShellScriptBin "obsidian-cli" ''echo "obsidian-cli stub: $*"'';
   stubOpenhue = pkgs.writeShellScriptBin "openhue" ''echo "openhue stub: $*"'';
   stubPiper = pkgs.writeShellScriptBin "piper" ''cat >/dev/null'';
+  stubBridge = pkgs.writeShellScriptBin "hey-computer-bridge" ''echo "bridge stub: $*"'';
 
   evaluate = settings:
     (home-manager.lib.homeManagerConfiguration {
@@ -92,6 +93,10 @@
         demo = {
           command = "/bin/true";
           args = ["--stdio"];
+          icon = "";
+          toolIcons = {
+            "*gmail*" = "";
+          };
           env = {
             PLAIN = "ok";
             SECRET.file = "/run/secrets/nonexistent-in-sandbox";
@@ -108,6 +113,41 @@
           disabled = null;
           enabled = true;
         };
+      };
+    };
+    toolIcons = {
+      enable = true;
+      maxIcons = 10;
+    };
+    notifications = {
+      enable = true;
+      profile = "lean";
+      maxHoldSecs = 60;
+      maxTurnSecs = 45;
+      maxToolCalls = 0;
+      quietStart = "22:00";
+      quietEnd = "08:00";
+      sendersFile = "/home/alice/.local/state/hey-computer/senders.json";
+      workdayFile = "/home/alice/.local/state/hey-computer/workday.json";
+      apps = {
+        signal = {
+          match_apps = ["signal"];
+          allow_senders = ["Bob"];
+        };
+      };
+    };
+    messengerBridge = {
+      enable = true;
+      package = stubBridge;
+      draftProfile = "lean";
+      selfChat = {
+        enable = true;
+        lane = "background";
+        profile = "deep";
+      };
+      extraBindReadOnlyPaths = ["/run/secrets/signal-account"];
+      settings = {
+        whatsapp.enabled = true;
       };
     };
   };
@@ -163,8 +203,28 @@
 
   settingsOf = config: config.programs.hey-computer.settings;
   service = full.systemd.user.services.hey-computer.Service;
+  bridgeService = full.systemd.user.services.hey-computer-messenger-bridge.Service;
 
   evaluated = assert lib.assertMsg service.NoNewPrivileges "the service must set NoNewPrivileges";
+  assert lib.assertMsg ((settingsOf full).agent.wait_for_keyring == true)
+  "agent.waitForKeyring defaults to true";
+  assert lib.assertMsg ((settingsOf full).present.tool_icons.enabled == true)
+  "toolIcons.enable forwards to present.tool_icons.enabled";
+  assert lib.assertMsg ((settingsOf full).mcp.demo.icon == "" && (settingsOf full).mcp.demo.tool_icons."*gmail*" == "")
+  "mcp.servers.<name>.{icon,toolIcons} forward into settings.mcp";
+  assert lib.assertMsg ((settingsOf full).notifications.enabled == true)
+  "notifications.enable forwards to settings.notifications";
+  assert lib.assertMsg ((settingsOf full).messenger.enabled == true)
+  "messengerBridge.enable forwards to settings.messenger";
+  assert lib.assertMsg (
+    bridgeService.UMask
+    == "0077"
+    && bridgeService.NoNewPrivileges
+    && bridgeService.PrivateTmp
+    && bridgeService.ProtectSystem == "strict"
+    && bridgeService.ProtectHome == "tmpfs"
+  )
+  "messenger bridge service must enable systemd hardening";
   assert lib.assertMsg (lib.hasSuffix "/bin/systemd-run" (lib.head (settingsOf full).present.viewer))
   "the viewer must start in a scope of its own";
   assert lib.assertMsg (lib.any (lib.hasSuffix "/bin/hey-computer-viewer") (settingsOf full).present.viewer)
@@ -195,9 +255,11 @@
   "a misspelt option must fail"; true;
 
   configFile = full.xdg.configFile."hey-computer/config.toml".source;
+  bridgeConfigFile = full.xdg.configFile."hey-computer/bridge.toml".source;
   bareConfig = bare.xdg.configFile."hey-computer/config.toml".source;
   memoryConfig = withMemory.xdg.configFile."hey-computer/config.toml".source;
   unit = full.xdg.configFile."systemd/user/hey-computer.service".source;
+  bridgeUnit = full.xdg.configFile."systemd/user/hey-computer-messenger-bridge.service".source;
   package = full.programs.hey-computer.package;
 in
   assert evaluated;
@@ -236,6 +298,13 @@ in
       grep -qx 'Restart=on-failure' ${unit}
       grep -qx 'WantedBy=graphical-session.target' ${unit}
       grep -q "^ExecStart=$hc daemon" ${unit}
+      grep -qx 'read_only = true' ${bridgeConfigFile}
+      grep -qx 'UMask=0077' ${bridgeUnit}
+      grep -qx 'NoNewPrivileges=true' ${bridgeUnit}
+      grep -qx 'PrivateTmp=true' ${bridgeUnit}
+      grep -qx 'ProtectSystem=strict' ${bridgeUnit}
+      grep -qx 'ProtectHome=tmpfs' ${bridgeUnit}
+      grep -q 'BindPaths=' ${bridgeUnit}
       agent_path=$(sed -n 's/^Environment=PATH=//p' ${unit})
       test -n "$agent_path"
 

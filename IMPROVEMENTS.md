@@ -56,169 +56,9 @@ All Phase 4 items (#20–#28) are implemented and listed under [Done](#done).
 
 All Phase 5 items (#29–#32) are implemented and listed under [Done](#done).
 
-## Phase 6: Unified work/personal context & reactive messaging
+## Phase 6: Unified work/personal context & reactive messaging — Implemented
 
-Builds workday-aware personal + work briefing and reactive incoming-message
-workflows on top of the single daemon.
-
-33. `[Lower priority]` `[Upstream + Config]` **Native keyring wait
-    (`agent.wait_for_keyring`).** Move the consumer's GNOME Keyring wait into
-    the daemon before warm start so downstream Home Manager configs do not need
-    to `mkForce` `ExecStart` (which otherwise silently masks future module
-    changes). Wait for `org.freedesktop.secrets` to be unlocked before warm
-    start (avoiding a hidden gcr-prompter behind the lock screen timing out).
-
-    *Implementation note:* Bind `hey-computer.sock` **first** and watch
-    `org.freedesktop.secrets` `Locked == false` via a D-Bus `PropertiesChanged`
-    subscription inside `Conductor::run`'s `select!` loop (rather than a `0.5 s`
-    `dbus-send` shell poll), exposing `agent: "locked"` (or `"starting"`) via
-    `status --json` so Waybar and Rofi reflect the locked state immediately.
-34. `[Important]` `[Config]` **Unified work + personal mode & workday-aware
-    Morning Brief.** Keep **one** single daemon instance that reaches both
-    personal and work integrations simultaneously—no split `hey-computer@work` /
-    `hey-computer@personal` daemons, socket switching, or separate conversation
-    history/memory.
-    - **Work & personal in one harness:**
-      - **Work:** the employer's Linear (official MCP with read/write access,
-        already wired via `mcp_oauth_tokens_file`), GitLab (direct write access
-        allowed without permission prompts), Slack (including read-only
-        forwarded work email), and work Google Calendar / Drive.
-      - **Personal:** personal Gmail, Google Calendar, Contacts, Drive and
-        Tasks, private GitHub projects (`gh`), WhatsApp, Signal, and Philips Hue
-        (`openhue`).
-      - Single-daemon foundations already in place in the consuming
-        configuration: `open-browser work|personal`, multi-account
-        `google-workspace` OAuth with `google-workspace-auth <email>
-        [work|personal]`, and prompt-level separation routing work mail via
-        Slack DM while keeping Gmail and Google Tasks strictly on the personal
-        account. Points settled: the employer allows sending work data (Linear,
-        GitLab, Slack, calendar) to the model service, and everything runs as
-        the same Unix user (not an OS security boundary).
-    - **Workday-aware Morning Brief (`morning-digest`) & standup
-      (`pre-daily`):**
-      - **Working days:** the Morning Brief covers **both personal and work**
-        items (personal + work Google Calendars, unread personal Gmail,
-        non-noise forwarded work emails in Slack, and urgent Slack/Linear/GitLab
-        updates).
-      - **Weekends & days off:** the Morning Brief covers **only personal**
-        items (personal calendar, unread personal Gmail, personal tasks—skipping
-        work calendar, forwarded work mail, Slack, Linear, and GitLab
-        completely), and `pre-daily` suppresses itself (`HEARTBEAT_OK`).
-      - **Day-off detection via personal Google Calendar:** treat a day as a
-        **working day** only on weekdays (`Mon–Fri`) when an `"Arbeit"` event is
-        scheduled for that day in the personal Google Calendar (and no
-        all-day vacation/out-of-office override applies). Weekends or weekdays
-        without an `"Arbeit"` event in personal Google Calendar (vacation,
-        public holidays, sick/flex days off) automatically switch the brief to
-        personal-only.
-
-    *Implementation notes:*
-    - Verify `google-workspace-mcp` multi-account credential selection when both
-      personal and work `<email>.json` tokens live in `credentialsDir` (in
-      particular whether `--single-user` pins one account vs. honoring
-      `user_google_email` across both personal and work Calendar/Drive calls in
-      the same session).
-    - Have `morning-digest` (and `pre-daily`) check the personal Google Calendar
-      for today's `"Arbeit"` event **first**—before calling any work MCP tools
-      (`slack`, `linear`, `gitlab`, or work Google Calendar)—so weekends and
-      days off never spend tool calls on or surface work noise.
-35. `[Important]` **Acting on incoming notifications (v1: notification text
-    only).** Watch notifications (a D-Bus monitor on
-    `org.freedesktop.Notifications`, or a hook in the notification daemon) for
-    an allowlist of apps (WhatsApp, Signal, mail). For each one, start a
-    background task (#17) that, for example, drafts a reply from the
-    notification's sender and text preview, with sending pasting into the
-    focused chat window. Show the draft as a notification with Send / Edit /
-    Dismiss actions. Rules:
-    - **Never send automatically.** Sending is always a click.
-    - **Stateless checkpoint + single-use resume token.** Instead of holding an
-      idle process or ACP session open waiting for a click, persist each draft
-      checkpoint (draft text, target app/chat, single-use resume token, TTL) in
-      SQLite and let the drafting turn exit immediately; clicking Send / Edit
-      resumes idempotently by token and survives daemon restarts (reused by the
-      messenger bridge in #36).
-    - **A restricted lane (decided: light, no OS sandbox).** These tasks run in
-      their own ACP session with their own permission profile: the daemon
-      refuses every `execute` and `edit` permission request and passes no MCP
-      servers. No extra confinement (systemd hardening, bus proxy, separate
-      account) on purpose. *(Implementation note: because `agy` 1.5.13 executes
-      `read_file` without sending `session/request_permission`,
-      `LanePolicy::restricted()` in `src/policy.rs` must also explicitly deny
-      `"fetch"` and `"search"` tool kinds—in addition to
-      `["execute", "edit", "delete", "move"]` + `mcp`—so untrusted incoming
-      notification or message text cannot combine `read_file` with web fetch to
-      exfiltrate local files; `LaneFilter::Restricted` in `src/main.rs` is
-      already wired as of `69fd4ea`.)*
-    - **Cost and noise.** A cheap filter decides first whether a message
-      deserves a model at all (sender allowlist, group chats off, quiet hours),
-      with `HEARTBEAT_OK`-style suppression (#17) and a rate limit.
-    - **Channel-scoped & workday-aware** (#34): drafts run in the MCP-free
-      restricted lane from the notification's own app/sender/text preview, and
-      work-app notifications (if allowlisted) can be suppressed on weekends and
-      detected days off alongside quiet hours.
-36. `[Important]` **Separate messenger bridge (WhatsApp / Signal) & phone
-    self-chat.** Worth adding once v1 drafts (#35) prove useful and need the
-    previous messages of a chat, or when you want to talk to hey-computer from
-    your phone.
-
-    **How OpenClaw and Hermes connect messengers** (from their channel docs,
-    November 2026):
-
-    - **WhatsApp.** Both use **Baileys**, a library that emulates a WhatsApp Web
-      session as a *linked device*. It is paired once by QR code (Settings →
-      Linked Devices) and the session is kept on disk (OpenClaw
-      `~/.openclaw/credentials/whatsapp/<account>/creds.json`, Hermes
-      `~/.hermes/platforms/whatsapp/session`; Hermes runs it as a Node.js bridge
-      process that its gateway starts). Neither uses the official Business API
-      by default. Hermes offers it as a second path; it needs a Meta Business
-      account and a public webhook. OpenClaw's voice-call feature uses a
-      separate whatsmeow session.
-    - **Number model.** Both recommend a **dedicated number** for the bot and
-      treat the personal number as a supported second choice in **self-chat**
-      mode: you message yourself and the agent answers there (OpenClaw
-      `selfChatMode`, Hermes `WHATSAPP_MODE=self-chat`). Both model the agent as
-      a contact *you talk to*, not as a reader of your other chats.
-    - **Risk.** Hermes says plainly that WhatsApp does not support third-party
-      bots outside the Business API, so a bridge "carries a small risk of
-      account restrictions". Its mitigations: a dedicated number, no bulk
-      messages, and no automated messages to people who haven't written first.
-      It also warns that protocol updates can break the bridge and that WhatsApp
-      unlinks devices after long inactivity. OpenClaw's page doesn't mention
-      bans at all.
-    - **Access control** is deny-by-default in both: DM allowlists by phone
-      number, pairing codes for unknown senders, and groups off unless
-      allowlisted, often with replies only on mention. Hermes refuses all
-      incoming messages until an allowlist is set. Hermes also has
-      `/approve` / `/deny` for dangerous commands raised from a chat.
-    - **Session = the whole account.** Hermes: the session directory "grants
-      full access to the WhatsApp account"; keep it `0700` and never commit it.
-    - **Signal.** Both use **signal-cli** as a linked device, running as a
-      daemon in HTTP mode: events come in over SSE (`/api/v1/events`) and sends
-      go out over JSON-RPC (`/api/v1/rpc`) (`signal-cli daemon --http
-      127.0.0.1:8080`, linked with `signal-cli link -n NAME`). OpenClaw can also
-      use the `signal-cli-rest-api` container in `MODE=json-rpc`. Hermes
-      supports talking to the agent through Signal's "Note to Self" on your own
-      number. OpenClaw notes that on a personal account the bot ignores your
-      own messages (loop protection) and recommends a separate number. Signal
-      rate-limits attachment uploads.
-
-    **What this means for hey-computer.** The goal here differs from theirs: not
-    a bot people message, but an assistant that reads *your* incoming messages
-    and drafts *your* replies (#35). That rules out a dedicated number: the
-    bridge has to be a linked device on the personal account, which sees every
-    chat. Suggested design:
-
-    - **A separate messenger bridge service**, not part of the daemon. It holds
-      the Baileys (or whatsmeow) and signal-cli sessions and offers a small
-      local socket API: a stream of incoming messages (with the last few
-      messages of that chat as context) and `send` to one chat. hey-computer
-      consumes the stream and never touches the session files itself.
-    - **Sends stay human.** Only replies to people who wrote first, each one a
-      click, never bulk. That is exactly the usage Hermes calls low-risk.
-    - **Phone as a front end, for free.** Once the bridge exists, self-chat
-      (WhatsApp "message yourself", Signal "Note to Self") becomes a way to ask
-      hey-computer from the phone. Accept only messages from your own number,
-      and run them in the same lane as voice requests (no permission prompts).
+All Phase 6 items (#33–#36) are implemented and listed under [Done](#done).
 
 ## Independent track (slot in anytime)
 
@@ -242,6 +82,43 @@ workflows on top of the single daemon.
 
 ## Done
 
+- `[Important]` `[Upstream + Config]` `[Done]` **Phase 6: Native keyring wait,
+  sequential Nerd-Font tool icons, Hold-and-Enrich notifications, & strictly
+  read-only WhatsApp/Signal messenger bridge (#33, #34, #35, #36).**
+  - **#33 Native keyring wait (`agent.wait_for_keyring`):** Added zero-dep
+    pure-Rust Freedesktop Secret Service watcher (`src/keyring.rs` over
+    `tokio::net::UnixStream` + `MockKeyringWatcher`), `AgentState::Locked`,
+    `FailReason::KeyringLocked` (1.5 s interactive unlock grace; background &
+    scheduled tasks queue until unlock; `NotifyHold` fails open immediately),
+    and `agent.waitForKeyring` (`default = true`) in `nix/home-manager.nix`.
+  - **#34 Sequential Nerd-Font tool icons & workday gating:** Added
+    `src/icons.rs` (`IconResolver` + `IconTracker`, stub-to-permission upgrades,
+    internal MCP/skill read suppression, `google-workspace` sub-service globs,
+    Tier 2 reset wipe, `Reply::Answer.tool_icons`, and `scheduler.rs`
+    forwarding), `mcp.servers.<name>.{icon,toolIcons}`, `toolIcons` module
+    options, and `workday_file` gating in `notify_filter.rs`.
+  - **#35 Hold-and-Enrich notifications & hardened restricted lane:** Hardened
+    `LanePolicy::restricted()` (`RESTRICTED_DENY_KINDS`, `RESTRICTED_DENY_NAMES`,
+    MCP disabled, auto-executed denied-tool abort guard, `reply_to` restricted
+    taint guard, fresh per-turn ACP sessions closed on finish), bumped
+    `history.db` to schema v5 (`draft_checkpoints` with atomic `IMMEDIATE`
+    single-use token claims, TTL pruning, and restricted-lane exclusion from
+    `distill` & `recall --user-only`), added deterministic `< 50 µs` Tier 2
+    `src/notify_filter.rs`, wired SwayNC-compatible `Request::NotifyHold` /
+    `Request::DraftResume` (`Reply::NotifyAccepted` / `NotifyRelease` /
+    `DraftResumed`) with EOF disconnect cancellation and strict WhatsApp/Signal
+    read-only enforcement, added fallback `Presentation::DraftReady`, and added
+    `hey-computer draft {list|show|copy|edit|dismiss|hold}` with offline
+    `history.db` fallback.
+  - **#36 Separate strictly read-only messenger bridge (`hey-computer-bridge`)
+    & phone self-chat:** Added `packages.messenger-bridge` (`hey-computer-bridge`
+    wrapping `baileys-reader` via `buildNpmPackage` + `pkgs.signal-cli`),
+    4-layer read-only enforcement (zero outbound messages, zero read receipts,
+    `markOnlineOnConnect: false`), rolling per-chat `me` + `them` context LRU
+    (`GetContext` enrichment in `NotifyHold`), `UserReplied` stale-draft
+    auto-dismiss, verified phone self-chat routing (`src/messenger.rs`), and
+    hardened `systemd.user.services.hey-computer-messenger-bridge` (`UMask=0077`,
+    `ProtectSystem=strict`, `ProtectHome=tmpfs`, `BindPaths`).
 - `[Important]` `[Upstream + Config]` `[Done]` **Post-Phase-5 UX, launcher,
   recall & Morning Brief refinements.** Added 5-step `Escape` precedence and
   out-of-the-box VIM motions (`j`/`k`, `Ctrl-e`/`y`, `Ctrl-d`/`u`, `Ctrl-o`/`i`

@@ -117,6 +117,20 @@ pub enum Presentation {
         urgency: Urgency,
         replaces_id: Option<u64>,
     },
+    /// Fallback desktop notification for a persisted notification/messenger draft
+    /// when SwayNC Hold-and-Enrich is not holding the card (e.g. messenger bridge
+    /// DM when desktop chat app is closed). Strictly read-only: offers Copy /
+    /// Edit / Dismiss actions and never auto-sends.
+    DraftReady {
+        id: u64,
+        turn_id: Option<u64>,
+        token: String,
+        channel: String,
+        sender: String,
+        context_note: String,
+        draft_text: String,
+        readonly: bool,
+    },
 }
 
 pub trait Presenter: Send + Sync + 'static {
@@ -1608,6 +1622,7 @@ impl Worker {
             item,
             Presentation::TaskComplete { .. }
                 | Presentation::Notice { .. }
+                | Presentation::DraftReady { .. }
                 | Presentation::Failure {
                     background: true,
                     ..
@@ -1768,6 +1783,27 @@ impl Worker {
                 };
                 self.notify(&summary, &escape_markup(&body), urgency, expire, replaces)
                     .await;
+            }
+            Presentation::DraftReady {
+                id,
+                turn_id,
+                token,
+                channel,
+                sender,
+                context_note,
+                draft_text,
+                readonly: _,
+            } => {
+                self.draft_ready(
+                    id,
+                    turn_id,
+                    &token,
+                    &channel,
+                    &sender,
+                    &context_note,
+                    &draft_text,
+                )
+                .await;
             }
             Presentation::Failure {
                 reason,
@@ -2090,6 +2126,113 @@ impl Worker {
         ) {
             self.spawn_action_waiter(wait_fut);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn draft_ready(
+        &mut self,
+        _id: u64,
+        turn_id: Option<u64>,
+        token: &str,
+        channel: &str,
+        sender: &str,
+        context_note: &str,
+        draft_text: &str,
+    ) {
+        if !self.config.notifications || self.config.notifier.is_empty() {
+            return;
+        }
+        let summary = format!("Draft reply ({channel}) · {sender}");
+        let mut body = String::new();
+        let ctx = context_note.trim();
+        let draft = draft_text.trim();
+        if !ctx.is_empty() {
+            body.push_str(&format!("✦ {}", escape_markup(ctx)));
+            if !draft.is_empty() {
+                body.push('\n');
+            }
+        }
+        if !draft.is_empty() {
+            body.push_str(&escape_markup(draft));
+        }
+
+        // Strictly read-only buttons: never expose `Send` on desktop fallback
+        // draft cards (especially WhatsApp/Signal).
+        let mut actions: Vec<(&'static str, &'static str)> = Vec::with_capacity(3);
+        if !draft.is_empty() && !self.config.clipboard.is_empty() {
+            actions.push(("copy", "Copy"));
+        }
+        if turn_id.is_some() {
+            actions.push(("edit", "Edit"));
+        }
+        actions.push(("dismiss", "Dismiss"));
+
+        let mut cancel_rx = self.action_cancel.subscribe();
+        let config = self.config.clone();
+        let action_timeout = self.action_timeout;
+        let token_owned = token.to_string();
+        let draft_owned = draft.to_string();
+        let command = build_action_notifier_command(&config, &summary, &body, None, &actions);
+        let Some((guard, stdout)) = ActionChildGuard::spawn(command, &config.notifier[0]) else {
+            return;
+        };
+        let wait_fut = async move {
+            let mut lines = BufReader::new(stdout).lines();
+            let deadline = tokio::time::Instant::now() + action_timeout;
+            let mut chosen: Option<String> = None;
+            for _ in 0..2 {
+                let next = tokio::select! {
+                    res = lines.next_line() => match res {
+                        Ok(Some(line)) => line,
+                        Ok(None) | Err(_) => break,
+                    },
+                    () = tokio::time::sleep_until(deadline) => return,
+                    _ = cancel_rx.changed() => return,
+                };
+                let trimmed = next.trim();
+                if matches!(trimmed, "copy" | "edit" | "dismiss") {
+                    chosen = Some(trimmed.to_string());
+                    break;
+                }
+            }
+            guard.finish_cleanly().await;
+            let Some(action) = chosen else {
+                return;
+            };
+            let draft_action = match action.as_str() {
+                "copy" => crate::protocol::DraftAction::Copy,
+                "edit" => crate::protocol::DraftAction::Edit,
+                "dismiss" => crate::protocol::DraftAction::Dismiss,
+                _ => return,
+            };
+            if let Ok(sock) = ipc::socket_path(None)
+                && ipc::request(
+                    &sock,
+                    &crate::protocol::Request::DraftResume {
+                        token: token_owned,
+                        action: draft_action,
+                    },
+                )
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            // Fallback when socket path isn't the default (e.g. custom --socket):
+            match draft_action {
+                crate::protocol::DraftAction::Copy | crate::protocol::DraftAction::Paste => {
+                    let _ = copy_to_clipboard(&config, &draft_owned).await;
+                }
+                crate::protocol::DraftAction::Edit => {
+                    if !draft_owned.is_empty() {
+                        let _ = copy_to_clipboard(&config, &draft_owned).await;
+                    }
+                    let _ = open_draft_editor(&config, turn_id, &draft_owned).await;
+                }
+                crate::protocol::DraftAction::Dismiss => {}
+            }
+        };
+        self.spawn_action_waiter(wait_fut);
     }
 
     /// Show one popup; returns its id so the next one can replace it.
@@ -2866,6 +3009,26 @@ pub async fn open_viewer_detached(
             Ok(())
         }
     }
+}
+
+/// Spawn `hey-computer-viewer` detached on `turn_id` with `--focus-composer`
+/// so the user can refine a restricted notification draft interactively.
+pub async fn open_draft_editor(
+    config: &PresentConfig,
+    turn_id: Option<u64>,
+    draft_text: &str,
+) -> anyhow::Result<()> {
+    let mut viewer_args: Vec<std::ffi::OsString> = Vec::new();
+    let fallback = if let Some(id) = turn_id {
+        viewer_args.push(std::ffi::OsString::from("--turn-id"));
+        viewer_args.push(std::ffi::OsString::from(id.to_string()));
+        viewer_args.push(std::ffi::OsString::from("--focus-composer"));
+        Some((id, draft_text, &[][..]))
+    } else {
+        viewer_args.push(std::ffi::OsString::from("--focus-composer"));
+        None
+    };
+    open_viewer_detached(config, &viewer_args, fallback).await
 }
 
 /// Open turn `id`'s answer in the configured viewer using `$XDG_RUNTIME_DIR/hey-computer`

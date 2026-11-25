@@ -1088,6 +1088,7 @@ pub async fn run(config: &Config, socket: &Path, options: &DistillOptions) -> Re
             widgets,
             conversation_id,
             profile,
+            tool_icons,
         } => {
             if options.json {
                 println!(
@@ -1101,6 +1102,7 @@ pub async fn run(config: &Config, socket: &Path, options: &DistillOptions) -> Re
                         "widgets": widgets,
                         "conversation_id": conversation_id,
                         "profile": profile,
+                        "tool_icons": tool_icons,
                     }))?
                 );
                 return Ok(ExitCode::SUCCESS);
@@ -1620,6 +1622,7 @@ mod tests {
                         }],
                         conversation_id: Some(turn_id),
                         profile: Some("deep".to_string()),
+                        tool_icons: Vec::new(),
                     });
                     answer.push('\n');
                     write.write_all(answer.as_bytes()).await.unwrap();

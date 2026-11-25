@@ -236,6 +236,14 @@ impl LanePolicy {
         )
     }
 
+    /// Return `(tag, detail)` if `update` represents a tool call denied by this policy.
+    pub fn denied_update_detail(&self, update: &serde_json::Value) -> Option<(String, String)> {
+        match self.evaluate_tool_call(update) {
+            PermissionDecision::Deny { tag, detail } => Some((tag, detail)),
+            PermissionDecision::Allow => None,
+        }
+    }
+
     fn evaluate_tool_call(&self, tool_call: &serde_json::Value) -> PermissionDecision {
         let name = tool_call.get("name").and_then(serde_json::Value::as_str);
         // Handle lazy MCP dispatch tools (`call_mcp_tool`, `list_resources`,

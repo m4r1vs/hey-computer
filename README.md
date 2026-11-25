@@ -171,6 +171,7 @@ hey-computer [--config FILE] [--socket PATH] [-v|-vv] COMMAND
 | `last [--copy \| --open] [--lane interactive\|background\|restricted\|all] [--json]` | Retrieve the last successful answer (defaults to the `interactive` lane): print it, output JSON, copy to the clipboard (`present.clipboard`), or open in the viewer (`present.viewer`, falling back to `hey-computer-viewer`). Works even when the daemon is stopped. |
 | `tasks [list \| show ID \| open ID \| copy ID \| cancel ID]` | List recent tasks (`--lane`, `--status`, `--all`, `--limit`, `--json`; defaults to the `background` lane), inspect one task, open it in the viewer, copy its answer, or cancel a running/queued task. `list`, `show`, `open`, and `copy` work even when the daemon is stopped. |
 | `schedule [add \| list \| show \| edit \| pause \| resume \| remove \| run \| open]` | Create, inspect, pause, resume, edit, remove, test-run, or open scheduled jobs stored in `history.db` in the viewer (`open [TARGET]`, alias `view`). `list --json` and `show <target> --json` enrich `ScheduleRecord` with humanized titles/specs, live running state, relative times, `latest_turn_id`, `active_turn_id`, and `recent_turns`. `list`/`show` and mutations work even when the daemon is stopped (mutations wake a running daemon automatically); `run <id\|name>` triggers an immediate test run in the running daemon (setting `HEY_COMPUTER_SCHEDULE_ID` and `HEY_COMPUTER_SCHEDULE_MANUAL=1` for collector scripts). |
+| `draft [list \| show TARGET \| copy TARGET \| edit TARGET \| dismiss TARGET \| hold --app APP --sender SENDER --body BODY]` | Inspect, copy, open in the restricted viewer composer, dismiss, or test-hold persisted notification reply drafts (`draft_checkpoints` in `history.db`). `list`, `show`, `copy`, `edit`, and `dismiss` fall back offline to `history.db` when the daemon is stopped; WhatsApp and Signal remain strictly read-only. |
 | `recall [--since SPEC] [--until SPEC] [--on DATE] [--user-only] [--id ID \| --thread ID] [-n\|--limit N] [--lane ...] [--sort relevance\|recent] [--any] [--full] [--max-chars N] [--raw-fts] [--json] [--plain] [QUERY...]` | Full-text search (SQLite FTS5) over past completed answers, wrapped in `<untrusted_recall>` by default (for agent skill use; `--plain` or `--json` for direct terminal/script use). Supports single-day `--on` (`today`, `yesterday`, `YYYY-MM-DD`), `--user-only`, and sanitized single-turn (`--id`) or full-thread (`--thread`) inspection. Time specs accept relative (`24h`, `7d`, `2w`) and calendar (`today`, `yesterday`, `YYYY-MM-DD`; `--until` dates are inclusive of that entire day) forms. Works even when the daemon is stopped. |
 
 - An empty or whitespace-only request (with no attachments) is reported on stderr and exits 2.
@@ -490,6 +491,7 @@ told about Obsidian.
 | `package` | this flake's package | |
 | `settings` | `{}` | the TOML above, free-form; checked with the package's own binary at build time, so an unknown key fails the build |
 | `agent.package` | `pkgs.antigravity-cli or null` | put on the agent's PATH |
+| `agent.waitForKeyring` | `true` | wait for `org.freedesktop.secrets` default collection to unlock before warm-starting the agent (`agent.wait_for_keyring`) |
 | `extraPackages` | `[]` | more programs for the agent's PATH |
 | `systemPath` | the home profile, `/etc/profiles/per-user/$USER/bin`, `/run/current-system/sw/bin`, `/run/wrappers/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` | searched after the packages |
 | `vault` | null | sets `instructions.vault` |
@@ -510,6 +512,9 @@ told about Obsidian.
 | `viewer.package` | `null` | optional external viewer package; `null` uses the built-in `hey-computer-viewer` |
 | `viewer.command` | `["${cfg.package}/bin/hey-computer-viewer" "--turn-id" "{id}" "{file}"]` | started in its own `systemd-run --user --scope` |
 | `speak.enable` | `false` | enables `[present.speak]` spoken answers & earcons (`voiceOnly = true` by default; pairs with `pkgs.piper-tts` -> `pw-play` when `voiceEn`/`voiceDe` are set) |
+| `toolIcons.enable` | `false` | appends sequential Nerd Font tool and MCP server icons to live progress and completion notification titles (`present.tool_icons.enabled`) |
+| `notifications.enable` | `false` | enables Hold-and-Enrich incoming desktop notification drafting (`[notifications]`, restricted lane + v5 `draft_checkpoints`) |
+| `messengerBridge.enable` | `false` | enables the separate hardened `hey-computer-messenger-bridge` systemd user service (strictly read-only WhatsApp & Signal context + verified phone self-chat) and `[messenger]` subscriber |
 | `service.enable` | true | the systemd user service |
 
 **The service** is bound to `graphical-session.target` (`After`, `PartOf`,

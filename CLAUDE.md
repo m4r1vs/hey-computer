@@ -38,11 +38,14 @@ files: `git add` new files before building.
 
 ## Architecture
 
-One package, two binaries: `hey-computer` (`daemon`, `ask`, `cancel`, `status`, `speak`,
-`distill`, `view`, `last`, `tasks`, `recall`, `schedule`, internal `mcp-ui`, and `debug` —
-pure Rust, never linking GTK4/WebKitGTK) and `hey-computer-viewer` (native GTK4 + WebKitGTK
-6.0 viewer with `application_id = "hey-computer.answer"`, `NON_UNIQUE`). `daemon` owns the
-socket; every other subcommand is a client.
+One workspace, two packages, three binaries: `packages.default` ships `hey-computer` (`daemon`,
+`ask`, `cancel`, `status`, `speak`, `distill`, `view`, `last`, `tasks`, `recall`, `schedule`,
+`draft`, internal `mcp-ui`, and `debug` — pure Rust, never linking GTK4/WebKitGTK at runtime)
+and `hey-computer-viewer` (native GTK4 + WebKitGTK 6.0 viewer with `application_id =
+"hey-computer.answer"`, `NON_UNIQUE`); `packages.messenger-bridge` ships `hey-computer-bridge`
+wrapped with `hey-computer-baileys-reader` (Node 22 + Baileys v7) and `signal-cli` for strictly
+read-only WhatsApp & Signal context and phone self-chat. `daemon` owns the socket; every other
+subcommand is a client.
 
 - `protocol`, `ipc`: the JSON-lines socket protocol (documented at the top of
   `protocol.rs` and in README) and the client side. `lines`: bounded line reading shared by
@@ -89,13 +92,25 @@ socket; every other subcommand is a client.
   preferring the focused terminal client) prepended inside
   `<untrusted_desktop_context>`, plus authoritative per-turn `<budget>` headers.
 - `store`: private `0600` SQLite WAL + FTS5 database at
-  `<state_dir>/history.db` (schema v3 with `turns` + `schedules` including
-  declarative `managed` jobs, `PRAGMA secure_delete = ON`, automatic FTS5/SQLite
-  `maintain_connection`, dedicated `hc-store` actor thread with
-  `wal_checkpoint(TRUNCATE)` on shutdown, crash recovery, monotonic ID seeding
-  from `sqlite_sequence`, legacy `last.json` migration, safe FTS5 query sanitizer
-  + BM25/recency ranking, `<untrusted_recall>` formatter) backing `last`,
-  `tasks`, `recall`, and `schedule`.
+  `<state_dir>/history.db` (schema v5 with `turns`, `schedules`, and `draft_checkpoints`,
+  `PRAGMA secure_delete = ON`, automatic FTS5/SQLite `maintain_connection`, dedicated `hc-store`
+  actor thread with `wal_checkpoint(TRUNCATE)` on shutdown, crash recovery, monotonic ID seeding
+  from `sqlite_sequence`, legacy `last.json` migration, safe FTS5 query sanitizer + BM25/recency
+  ranking, `<untrusted_recall>` formatter, and atomic `IMMEDIATE`-transaction single-use draft
+  checkpoint claims) backing `last`, `tasks`, `recall`, `schedule`, and `draft`.
+- `keyring`: zero-dep pure-Rust Freedesktop Secret Service (`org.freedesktop.secrets`) watcher over
+  `tokio::net::UnixStream` (`DbusKeyringWatcher` + `MockKeyringWatcher`), driving `AgentState::Locked`,
+  1.5 s interactive unlock grace (`FailReason::KeyringLocked`), and queued background drain on unlock.
+- `icons`: sequential Nerd Font v3 tool and MCP server icon resolver (`IconResolver` + `IconTracker`),
+  holding argument-less `agy` stubs in `Pending` until arguments arrive, suppressing internal MCP/skill
+  reads and denied calls, and wiping cleanly on Tier 2 smart-routing escalation.
+- `notify_filter`: deterministic `< 50 µs` Tier 2 notification pre-filter, `whatsapp-electron` prefix
+  normalizer, 2FA/quiet-hours/workday/group/sender-file gate, `<untrusted_notification>` prompt builder,
+  and `CONTEXT:` / `DRAFT:` / `HEARTBEAT_OK` enrichment output parser.
+- `bridge`, `messenger`: separate strictly read-only WhatsApp (Baileys v7 `baileys-reader`) and Signal
+  (`signal-cli` private UNIX socket) bridge supervisor + rolling LRU per-chat context cache, plus the
+  daemon's `messenger.rs` subscriber (`1s..30s` backoff, 150 ms `GetContext` enrichment for `NotifyHold`,
+  `UserReplied` draft auto-dismiss, verified phone self-chat routing, and `AuthRequired` desktop alerts).
 - `scheduler`: SQLite-backed hybrid job scheduler (`[scheduler]`, `hey-computer schedule`)
   with local-time human/cron specs, `--script` pre-collectors (0 tokens on empty stdout),
   `--no-agent` timed notifications, `Policy::denied_word` validation, and split

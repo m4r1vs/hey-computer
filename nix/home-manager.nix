@@ -148,6 +148,8 @@
         transport = server.transport or null;
         disabled = server.disabled or null;
         enabledOpt = server.enabled or null;
+        icon = server.icon or null;
+        toolIcons = server.toolIcons or (server.tool_icons or null);
         enabled =
           if builtins.isBool disabled
           then !disabled
@@ -180,6 +182,12 @@
         // lib.optionalAttrs (headerSplit.files != {}) {
           header_files = headerSplit.files;
         }
+        // lib.optionalAttrs (builtins.isString icon) {
+          inherit icon;
+        }
+        // lib.optionalAttrs (builtins.isAttrs toolIcons && toolIcons != {}) {
+          tool_icons = toolIcons;
+        }
     )
     cfg.mcp.servers;
 
@@ -193,6 +201,15 @@
     '';
 
   configFile = checkedConfig cfg.settings;
+
+  bridgeSettings =
+    {
+      read_only = true;
+      state_dir = cfg.messengerBridge.stateDir;
+    }
+    // cfg.messengerBridge.settings;
+
+  bridgeConfigFile = tomlFormat.generate "hey-computer-bridge.toml" bridgeSettings;
 in {
   options.programs.hey-computer = {
     enable = mkEnableOption "hey-computer, a voice assistant daemon that keeps one ACP agent warm";
@@ -234,15 +251,28 @@ in {
       '';
     };
 
-    agent.package = mkOption {
-      type = types.nullOr types.package;
-      default = pkgs.antigravity-cli or null;
-      defaultText = literalExpression "pkgs.antigravity-cli or null";
-      description = ''
-        The package that provides the agent command (`agy` by default), put
-        on the agent's PATH. Null expects it elsewhere on the PATH, or an
-        absolute path in `settings.agent.command`.
-      '';
+    agent = {
+      package = mkOption {
+        type = types.nullOr types.package;
+        default = pkgs.antigravity-cli or null;
+        defaultText = literalExpression "pkgs.antigravity-cli or null";
+        description = ''
+          The package that provides the agent command (`agy` by default), put
+          on the agent's PATH. Null expects it elsewhere on the PATH, or an
+          absolute path in `settings.agent.command`.
+        '';
+      };
+
+      waitForKeyring = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Wait for the Freedesktop Secret Service (`org.freedesktop.secrets`
+          default collection) to unlock before warm-starting the ACP agent
+          (`settings.agent.wait_for_keyring`). Degrades cleanly when no Secret
+          Service is present on the session bus.
+        '';
+      };
     };
 
     extraPackages = mkOption {
@@ -591,6 +621,190 @@ in {
       };
     };
 
+    toolIcons = {
+      enable = mkEnableOption "sequential Nerd Font tool and MCP server icons in notification titles (`present.tool_icons.enabled`)";
+
+      maxIcons = mkOption {
+        type = types.ints.between 1 16;
+        default = 8;
+        description = "Maximum distinct tool/MCP icons appended to a notification title before `…`.";
+      };
+
+      kinds = mkOption {
+        type = types.attrsOf types.str;
+        default = {};
+        description = "Overrides for built-in tool kinds (`execute`, `read`, `edit`, `search`, `fetch`, `mcp_ui`, `vault`); `\"\"` suppresses.";
+      };
+
+      commands = mkOption {
+        type = types.attrsOf types.str;
+        default = {};
+        description = "Overrides for `execute` command basenames (e.g. `gh`, `openhue`); `\"\"` suppresses.";
+      };
+    };
+
+    notifications = {
+      enable = mkEnableOption "reactive Hold-and-Enrich incoming desktop notification drafting (`[notifications]`)";
+
+      profile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Optional profile name for restricted notification drafting turns.";
+      };
+
+      maxHoldSecs = mkOption {
+        type = types.number;
+        default = 60;
+        description = "Maximum seconds SwayNC holds a matched notification waiting for enrichment (1..=300).";
+      };
+
+      maxTurnSecs = mkOption {
+        type = types.number;
+        default = 45;
+        description = "Hard wall-clock cap per restricted notification drafting turn in seconds.";
+      };
+
+      maxToolCalls = mkOption {
+        type = types.ints.unsigned;
+        default = 0;
+        description = "Maximum tool calls per restricted notification drafting turn (`0` = notification text only).";
+      };
+
+      draftTtlSecs = mkOption {
+        type = types.number;
+        default = 43200;
+        description = "TTL in seconds for persisted `draft_checkpoints` rows.";
+      };
+
+      drop2faCodes = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Suppress incoming notifications containing 2FA/OTP verification codes.";
+      };
+
+      respectDnd = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Drop incoming notifications when Do Not Disturb / inhibitor is active.";
+      };
+
+      quietStart = mkOption {
+        type = types.str;
+        default = "";
+        description = "Optional local quiet-hours start (`HH:MM`).";
+      };
+
+      quietEnd = mkOption {
+        type = types.str;
+        default = "";
+        description = "Optional local quiet-hours end (`HH:MM`).";
+      };
+
+      sendersFile = mkOption {
+        type = types.nullOr (types.either types.path types.str);
+        default = null;
+        description = "Optional private JSON/TOML file outside `/nix/store` and the vault holding sender allow/deny lists.";
+      };
+
+      workdayFile = mkOption {
+        type = types.nullOr (types.either types.path types.str);
+        default = null;
+        description = "Optional workday status JSON file written by `hey-computer-proactive workday`.";
+      };
+
+      apps = mkOption {
+        type = types.attrsOf (types.attrsOf types.anything);
+        default = {};
+        description = "Per-channel / app allowlist rules lowered to `settings.notifications.apps`.";
+      };
+    };
+
+    messengerBridge = {
+      enable = mkEnableOption "strictly read-only WhatsApp & Signal messenger bridge (`hey-computer-messenger-bridge`)";
+
+      package = mkOption {
+        type = types.package;
+        default = self.packages.${system}.messenger-bridge;
+        defaultText = literalExpression "hey-computer.packages.\${system}.messenger-bridge";
+        description = "The `hey-computer-messenger-bridge` package wrapping `baileys-reader` and `signal-cli`.";
+      };
+
+      settings = mkOption {
+        type = types.submodule {freeformType = tomlFormat.type;};
+        default = {};
+        description = "Contents of {file}`~/.config/hey-computer/bridge.toml` (`read_only = true` is always enforced).";
+      };
+
+      stateDir = mkOption {
+        type = types.str;
+        default = "${config.xdg.stateHome}/hey-computer-bridge";
+        defaultText = literalExpression ''"''${config.xdg.stateHome}/hey-computer-bridge"'';
+        description = "Private `0700` state directory holding WhatsApp/Signal linked-device credentials.";
+      };
+
+      extraBindReadOnlyPaths = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        description = "Additional read-only host paths (such as secret files for `allow_from_file` / `account_file`) bound into the bridge service sandbox.";
+      };
+
+      preferOverNotifications = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Allow bridge-originated DM fallback drafts when no recent SwayNC `NotifyHold` handled the message.";
+      };
+
+      draftProfile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Optional profile for bridge-originated DM drafts.";
+      };
+
+      selfChat = {
+        enable = mkOption {
+          type = types.bool;
+          default = true;
+          description = "Accept verified phone self-chat requests (`settings.messenger.self_chat_enabled`).";
+        };
+
+        lane = mkOption {
+          type = types.enum ["background" "interactive"];
+          default = "background";
+          description = "Lane for verified phone self-chat requests (`settings.messenger.self_chat_lane`).";
+        };
+
+        profile = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "Optional profile for verified phone self-chat requests.";
+        };
+      };
+
+      cooldownSecs = mkOption {
+        type = types.number;
+        default = 60;
+        description = "Minimum seconds between bridge-originated DM drafts per chat.";
+      };
+
+      quietStart = mkOption {
+        type = types.str;
+        default = "";
+        description = "Optional local quiet-hours start (`HH:MM`) for messenger DM drafts.";
+      };
+
+      quietEnd = mkOption {
+        type = types.str;
+        default = "";
+        description = "Optional local quiet-hours end (`HH:MM`) for messenger DM drafts.";
+      };
+
+      service.enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Run `hey-computer-messenger-bridge` as a hardened systemd user service.";
+      };
+    };
+
     service.enable = mkOption {
       type = types.bool;
       default = true;
@@ -599,10 +813,16 @@ in {
   };
 
   config = mkIf cfg.enable {
-    home.packages = [cfg.package] ++ lib.optional (cfg.viewer.package != null) cfg.viewer.package;
+    home.packages =
+      [cfg.package]
+      ++ lib.optional (cfg.viewer.package != null) cfg.viewer.package
+      ++ lib.optional cfg.messengerBridge.enable cfg.messengerBridge.package;
 
     programs.hey-computer.settings = {
-      agent.mcp_oauth_tokens_file = mkIf (cfg.mcp.oauthTokensFile != null) (mkDefault cfg.mcp.oauthTokensFile);
+      agent = {
+        wait_for_keyring = mkDefault cfg.agent.waitForKeyring;
+        mcp_oauth_tokens_file = mkIf (cfg.mcp.oauthTokensFile != null) (mkDefault cfg.mcp.oauthTokensFile);
+      };
       mcp = mkIf (translatedMcpServers != {}) (lib.mapAttrs (_: mkDefault) translatedMcpServers);
       instructions = {
         vault = mkIf (cfg.vault != null) (mkDefault cfg.vault);
@@ -613,6 +833,12 @@ in {
       present = {
         viewer = mkIf (cfg.viewer.command != []) (mkDefault (viewerLauncher ++ cfg.viewer.command));
         clipboard = mkDefault [(lib.getExe' pkgs.wl-clipboard "wl-copy")];
+        tool_icons = mkIf (cfg.toolIcons.enable || cfg.toolIcons.kinds != {} || cfg.toolIcons.commands != {}) {
+          enabled = mkDefault cfg.toolIcons.enable;
+          max_icons = mkDefault cfg.toolIcons.maxIcons;
+          kinds = mkIf (cfg.toolIcons.kinds != {}) (mkDefault cfg.toolIcons.kinds);
+          commands = mkIf (cfg.toolIcons.commands != {}) (mkDefault cfg.toolIcons.commands);
+        };
         speak = mkIf cfg.speak.enable {
           enabled = mkDefault cfg.speak.defaultOn;
           voice_only = mkDefault cfg.speak.voiceOnly;
@@ -625,9 +851,38 @@ in {
           earcon_cancel = mkIf (cfg.speak.earcons.cancel != []) (mkDefault cfg.speak.earcons.cancel);
         };
       };
+      notifications = mkIf cfg.notifications.enable {
+        enabled = mkDefault true;
+        profile = mkIf (cfg.notifications.profile != null) (mkDefault cfg.notifications.profile);
+        max_hold_secs = mkDefault cfg.notifications.maxHoldSecs;
+        max_turn_secs = mkDefault cfg.notifications.maxTurnSecs;
+        max_tool_calls = mkDefault cfg.notifications.maxToolCalls;
+        draft_ttl_secs = mkDefault cfg.notifications.draftTtlSecs;
+        drop_2fa_codes = mkDefault cfg.notifications.drop2faCodes;
+        respect_dnd = mkDefault cfg.notifications.respectDnd;
+        quiet_start = mkIf (cfg.notifications.quietStart != "") (mkDefault cfg.notifications.quietStart);
+        quiet_end = mkIf (cfg.notifications.quietEnd != "") (mkDefault cfg.notifications.quietEnd);
+        senders_file = mkIf (cfg.notifications.sendersFile != null) (mkDefault (toString cfg.notifications.sendersFile));
+        workday_file = mkIf (cfg.notifications.workdayFile != null) (mkDefault (toString cfg.notifications.workdayFile));
+        apps = mkIf (cfg.notifications.apps != {}) (lib.mapAttrs (_: mkDefault) cfg.notifications.apps);
+      };
+      messenger = mkIf cfg.messengerBridge.enable {
+        enabled = mkDefault true;
+        prefer_over_notifications = mkDefault cfg.messengerBridge.preferOverNotifications;
+        draft_profile = mkIf (cfg.messengerBridge.draftProfile != null) (mkDefault cfg.messengerBridge.draftProfile);
+        self_chat_enabled = mkDefault cfg.messengerBridge.selfChat.enable;
+        self_chat_lane = mkDefault cfg.messengerBridge.selfChat.lane;
+        self_chat_profile = mkIf (cfg.messengerBridge.selfChat.profile != null) (mkDefault cfg.messengerBridge.selfChat.profile);
+        cooldown_secs = mkDefault cfg.messengerBridge.cooldownSecs;
+        quiet_start = mkIf (cfg.messengerBridge.quietStart != "") (mkDefault cfg.messengerBridge.quietStart);
+        quiet_end = mkIf (cfg.messengerBridge.quietEnd != "") (mkDefault cfg.messengerBridge.quietEnd);
+      };
     };
 
     xdg.configFile."hey-computer/config.toml".source = configFile;
+    xdg.configFile."hey-computer/bridge.toml" = mkIf cfg.messengerBridge.enable {
+      source = bridgeConfigFile;
+    };
 
     systemd.user.services.hey-computer = mkIf cfg.service.enable {
       Unit = {
@@ -651,6 +906,30 @@ in {
         */
         NoNewPrivileges = true;
         Environment = ["PATH=${agentPath}"];
+      };
+      Install.WantedBy = ["graphical-session.target"];
+    };
+
+    systemd.user.services.hey-computer-messenger-bridge = mkIf (cfg.messengerBridge.enable && cfg.messengerBridge.service.enable) {
+      Unit = {
+        Description = "hey-computer strictly read-only messenger bridge (WhatsApp & Signal)";
+        After = ["graphical-session.target" "network-online.target"];
+        PartOf = ["graphical-session.target"];
+        X-Restart-Triggers = ["${bridgeConfigFile}"];
+      };
+      Service = {
+        ExecStart = "${lib.getExe cfg.messengerBridge.package} daemon";
+        Restart = "on-failure";
+        RestartSec = 5;
+        UMask = "0077";
+        NoNewPrivileges = true;
+        PrivateTmp = true;
+        ProtectSystem = "strict";
+        ProtectHome = "tmpfs";
+        BindPaths = [cfg.messengerBridge.stateDir];
+        BindReadOnlyPaths =
+          ["${config.xdg.configHome}/hey-computer/bridge.toml"]
+          ++ cfg.messengerBridge.extraBindReadOnlyPaths;
       };
       Install.WantedBy = ["graphical-session.target"];
     };

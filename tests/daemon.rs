@@ -3347,3 +3347,669 @@ async fn read_aloud_streams_completion_and_stops_immediately_on_disconnect() {
 
     h.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keyring_wait_blocks_agent_start_until_unlock_and_drains_queued_tasks() {
+    use hey_computer::keyring::MockKeyringWatcher;
+    use hey_computer::notify_filter::NotificationAppRule;
+    use hey_computer::protocol::NotifyReleaseAction;
+
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("hc-kr-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let script_path = dir.join("script.json");
+    std::fs::write(&script_path, SCRIPT).unwrap();
+    let log = dir.join("mock.log");
+    let socket = dir.join("s.sock");
+
+    let mut config = Config {
+        state_dir: dir.join("state"),
+        ..Config::default()
+    };
+    config.agent.command = vec![
+        env!("CARGO_BIN_EXE_hey-computer").to_string(),
+        "debug".to_string(),
+        "mock-agent".to_string(),
+        script_path.to_string_lossy().into_owned(),
+        "--log".to_string(),
+        log.to_string_lossy().into_owned(),
+    ];
+    config.agent.warm_start = true;
+    config.agent.wait_for_keyring = true;
+    config.notifications.enabled = true;
+    config.notifications.apps.insert(
+        "signal".to_string(),
+        NotificationAppRule {
+            match_apps: vec!["signal".to_string()],
+            allow_senders: vec!["Alice".to_string()],
+            ..NotificationAppRule::default()
+        },
+    );
+
+    let keyring = MockKeyringWatcher::locked();
+    let recorder = Recorder::new();
+    let presenter: Arc<dyn Presenter> = recorder.clone();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn({
+        let socket = socket.clone();
+        let kr = Arc::clone(&keyring);
+        async move {
+            daemon::serve_with_deps(
+                config,
+                &socket,
+                presenter,
+                Arc::new(hey_computer::context::SystemContext),
+                kr,
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+        }
+    });
+
+    // 1. Socket binds immediately and reports AgentState::Locked without spawning the agent.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "socket never appeared");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Reply::Status(st) = ipc::request(&socket, &Request::Status).await.unwrap()
+            && st.agent == AgentState::Locked
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "status never reached Locked");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !log.exists(),
+        "agent must not spawn while keyring is locked"
+    );
+
+    // 2. NotifyHold fails open immediately (< 500 ms) with show_raw while locked.
+    let hold_start = Instant::now();
+    let hold_reply = ipc::request(
+        &socket,
+        &Request::NotifyHold {
+            noti_id: 1,
+            replaces_id: 0,
+            app_name: "Signal".to_string(),
+            desktop_entry: "signal".to_string(),
+            summary: "Alice".to_string(),
+            body: "Ping".to_string(),
+            category: "im.received".to_string(),
+            urgency: "normal".to_string(),
+            has_default_action: true,
+            dnd: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(hold_start.elapsed() < Duration::from_millis(500));
+    assert!(matches!(
+        hold_reply,
+        Reply::NotifyRelease {
+            action: NotifyReleaseAction::ShowRaw,
+            reason: Some(ref r),
+            ..
+        } if r == "keyring_locked"
+    ));
+
+    // 3. Background ask stays queued while locked (does not fail).
+    let (bg_id, _bg_client) = ipc::ask_request(
+        &socket,
+        &Request::Ask {
+            text: "plain bg while locked".to_string(),
+            wait: false,
+            new: true,
+            profile: None,
+            background: true,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
+            schedule_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // 4. Interactive waiting ask fails fast with FailReason::KeyringLocked after the 1.5s grace.
+    let (_id1, mut fg_locked) = ipc::ask(&socket, "plain while locked", true, true)
+        .await
+        .unwrap();
+    let locked_reply = fg_locked.next(Some(Duration::from_secs(5))).await.unwrap();
+    assert_eq!(failure(&locked_reply).0, FailReason::KeyringLocked);
+    assert!(!log.exists(), "agent still must not have spawned");
+
+    // 5. Unlocking during the 1.5s grace lets a waiting interactive ask succeed
+    //    AND drains the queued background task!
+    let (_id2, mut fg_unlock) = ipc::ask(&socket, "plain after unlock", true, true)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    keyring.unlock();
+
+    let unlocked_reply = fg_unlock.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert_eq!(answer(&unlocked_reply), "Hello from the mock.");
+
+    let bg_done = recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::TaskComplete { id, .. } if *id == bg_id))
+        })
+        .await;
+    assert!(
+        bg_done.is_some(),
+        "queued background task must drain on unlock"
+    );
+
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequential_tool_icons_propagate_wipe_on_tier2_reset_and_forward_in_scheduler() {
+    use hey_computer::config::{McpServer, Profile};
+    use hey_computer::store::{self, FailureDeliver, NewSchedule};
+
+    let script = r##"{
+      "turns": [
+        {
+          "match": "icons_ok",
+          "steps": [
+            {"permission": {"command": "conversations_history", "server": "slack"}},
+            {"permission": {"command": "search_gmail_messages", "server": "google-workspace"}},
+            {"permission": {"command": "gh pr list", "kind": "execute"}},
+            {"chunk": "All three checked."}
+          ]
+        },
+        {
+          "match": "icons_escalate",
+          "steps": [
+            {"permission": {"command": "conversations_history", "server": "slack"}},
+            {"stop": "end_turn"}
+          ]
+        },
+        {
+          "match": "sched_slack",
+          "steps": [
+            {"permission": {"command": "channels_list", "server": "slack"}},
+            {"chunk": "Slack checked."}
+          ]
+        }
+      ],
+      "default": ["echo"]
+    }"##;
+
+    let h = Harness::start(script, |cfg| {
+        cfg.present.tool_icons.enabled = true;
+        cfg.mcp.insert(
+            "slack".to_string(),
+            McpServer {
+                command: "/bin/true".to_string(),
+                ..McpServer::default()
+            },
+        );
+        cfg.mcp.insert(
+            "google-workspace".to_string(),
+            McpServer {
+                command: "/bin/true".to_string(),
+                ..McpServer::default()
+            },
+        );
+        cfg.profiles.insert(
+            "fast".to_string(),
+            Profile {
+                thought_level: Some("low".to_string()),
+                ..Profile::default()
+            },
+        );
+        cfg.profiles.insert(
+            "deep".to_string(),
+            Profile {
+                thought_level: Some("high".to_string()),
+                ..Profile::default()
+            },
+        );
+        cfg.routing.enabled = true;
+        cfg.routing.fast_profile = "fast".to_string();
+        cfg.routing.deep_profile = "deep".to_string();
+        cfg.routing.triage_non_voice = false;
+        cfg.routing.escalate_on_failure = true;
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    // 1. Waiting ask returns sequential tool_icons in Reply::Answer.
+    let reply = h.ask("icons_ok", true).await;
+    match reply {
+        Reply::Answer {
+            text, tool_icons, ..
+        } => {
+            assert_eq!(text, "All three checked.");
+            assert_eq!(tool_icons, vec!["\u{e8a4}", "\u{f42f}", "\u{e709}"]);
+        }
+        other => panic!("expected Answer, got {other:?}"),
+    }
+
+    // 2. Non-waiting ask emits progressive ProgressUpdate icons and final Answer icons.
+    let (id2, _) = ipc::ask(&h.socket, "icons_ok", false, true).await.unwrap();
+    let items = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::Answer { id, .. } if *id == id2))
+        })
+        .await
+        .expect("Answer presented");
+    let answer_icons = items.iter().find_map(|i| match i {
+        Presentation::Answer { id, icons, .. } if *id == id2 => Some(icons.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        answer_icons,
+        Some(vec![
+            "\u{e8a4}".to_string(),
+            "\u{f42f}".to_string(),
+            "\u{e709}".to_string(),
+        ])
+    );
+    let progress_updates: Vec<Vec<String>> = items
+        .iter()
+        .filter_map(|i| match i {
+            Presentation::ProgressUpdate { id, icons, .. } if *id == id2 => Some(icons.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        progress_updates
+            .iter()
+            .any(|v| v == &vec!["\u{e8a4}".to_string()]),
+        "expected first Slack icon update in {progress_updates:?}"
+    );
+    assert!(
+        progress_updates.iter().any(|v| {
+            v == &vec![
+                "\u{e8a4}".to_string(),
+                "\u{f42f}".to_string(),
+                "\u{e709}".to_string(),
+            ]
+        }),
+        "expected final 3-icon update in {progress_updates:?}"
+    );
+
+    // 3. Tier 2 smart-routing escalation emits a fresh Progress (wiping failed fast-attempt icons).
+    let (id3, _) = ipc::ask(&h.socket, "icons_escalate", false, true)
+        .await
+        .unwrap();
+    let items3 = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::Failure { id, .. } if *id == id3))
+        })
+        .await
+        .expect("escalated failure presented");
+    let progress_starts: Vec<Option<String>> = items3
+        .iter()
+        .filter_map(|i| match i {
+            Presentation::Progress { id, profile, .. } if *id == id3 => Some(profile.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        progress_starts.len() >= 2 && progress_starts.last() == Some(&Some("deep".to_string())),
+        "Tier 2 escalation must re-emit Progress for deep profile to wipe fast icons: {progress_starts:?}"
+    );
+
+    // 4. Scheduler forwards Reply::Answer.tool_icons into Presentation::TaskComplete.icons.
+    let state_dir = h.dir.join("state");
+    let now_ms = store::unix_timestamp_ms();
+    store::create_schedule(
+        &state_dir,
+        &NewSchedule {
+            name: "slack-check".to_string(),
+            schedule_spec: "daily 08:00".to_string(),
+            prompt: "sched_slack".to_string(),
+            profile: "deep".to_string(),
+            script: String::new(),
+            no_agent: false,
+            suppress_token: None,
+            failure_deliver: FailureDeliver::Notify,
+            max_runs: None,
+            expires_at: None,
+            next_run_at: now_ms + 86_400_000,
+        },
+        128,
+    )
+    .unwrap();
+    let run_reply = ipc::request(
+        &h.socket,
+        &Request::ScheduleRun {
+            target: "slack-check".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(run_reply, Reply::Ok { .. }), "{run_reply:?}");
+
+    let items4 = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items.iter().any(|i| {
+                matches!(
+                    i,
+                    Presentation::TaskComplete { request, .. } if request == "slack-check"
+                )
+            })
+        })
+        .await
+        .expect("scheduled TaskComplete presented");
+    let sched_icons = items4.iter().find_map(|i| match i {
+        Presentation::TaskComplete { request, icons, .. } if request == "slack-check" => {
+            Some(icons.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(sched_icons, Some(vec!["\u{e8a4}".to_string()]));
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notify_hold_enrichment_disconnect_cancel_draft_resume_restart_and_restricted_taint() {
+    use hey_computer::notify_filter::NotificationAppRule;
+    use hey_computer::protocol::{DraftAction, NotifyReleaseAction};
+    use hey_computer::store::{self, Lane};
+
+    let script = r##"{
+      "turns": [
+        {"match": "try shell", "steps": [{"permission": {"command": "echo hacked", "kind": "execute"}}, {"chunk": "never"}]},
+        {"match": "quiet ping", "steps": [{"chunk": "HEARTBEAT_OK"}]},
+        {"match": "dinner at 7", "steps": [{"chunk": "CONTEXT: Dinner invite\nDRAFT: Sounds great, see you at 7!"}]},
+        {"match": "hold hang", "steps": ["hang"]}
+      ],
+      "default": [{"chunk": "refined restricted draft"}]
+    }"##;
+
+    let configure = |cfg: &mut Config| {
+        cfg.notifications.enabled = true;
+        cfg.notifications.max_hold_secs = 30.0;
+        cfg.notifications.max_turn_secs = 20.0;
+        cfg.notifications.max_tool_calls = 0;
+        cfg.notifications.per_sender_cooldown_secs = 0.0;
+        cfg.notifications.dedupe_window_secs = 0.0;
+        cfg.present.clipboard = Vec::new();
+        cfg.notifications.apps.insert(
+            "signal".to_string(),
+            NotificationAppRule {
+                match_apps: vec!["signal".to_string()],
+                allow_senders: vec!["Alice".to_string()],
+                ..NotificationAppRule::default()
+            },
+        );
+    };
+
+    let mut h = Harness::start(script, configure).await;
+    h.wait_log("new mock-1").await;
+
+    // 1. Unallowlisted app drops immediately (< 50 ms) with show_raw and 0 LLM calls.
+    let t0 = Instant::now();
+    let drop_reply = ipc::request(
+        &h.socket,
+        &Request::NotifyHold {
+            noti_id: 1,
+            replaces_id: 0,
+            app_name: "Spotify".to_string(),
+            desktop_entry: "spotify".to_string(),
+            summary: "Track".to_string(),
+            body: "Artist".to_string(),
+            category: String::new(),
+            urgency: "normal".to_string(),
+            has_default_action: false,
+            dnd: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(t0.elapsed() < Duration::from_millis(200));
+    assert!(matches!(
+        drop_reply,
+        Reply::NotifyRelease {
+            action: NotifyReleaseAction::ShowRaw,
+            reason: Some(ref r),
+            ..
+        } if r == "app_not_allowlisted"
+    ));
+
+    // 2. Allowed Signal message returning HEARTBEAT_OK -> NotifyAccepted then ShowRaw.
+    let mut c_hb = Client::send(
+        &h.socket,
+        &Request::NotifyHold {
+            noti_id: 2,
+            replaces_id: 0,
+            app_name: "Signal".to_string(),
+            desktop_entry: "signal".to_string(),
+            summary: "Alice".to_string(),
+            body: "quiet ping".to_string(),
+            category: "im.received".to_string(),
+            urgency: "normal".to_string(),
+            has_default_action: true,
+            dnd: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c_hb.next(Some(Duration::from_secs(5))).await.unwrap(),
+        Reply::NotifyAccepted { max_hold_ms: 30000 }
+    ));
+    assert!(matches!(
+        c_hb.next(Some(Duration::from_secs(10))).await.unwrap(),
+        Reply::NotifyRelease {
+            action: NotifyReleaseAction::ShowRaw,
+            ..
+        }
+    ));
+
+    // 3. Actionable Signal message -> NotifyAccepted then ShowEnriched with persisted token & turn_id.
+    let mut c_ok = Client::send(
+        &h.socket,
+        &Request::NotifyHold {
+            noti_id: 3,
+            replaces_id: 0,
+            app_name: "Signal".to_string(),
+            desktop_entry: "signal".to_string(),
+            summary: "Alice".to_string(),
+            body: "Are we still on for dinner at 7?".to_string(),
+            category: "im.received".to_string(),
+            urgency: "normal".to_string(),
+            has_default_action: true,
+            dnd: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c_ok.next(Some(Duration::from_secs(5))).await.unwrap(),
+        Reply::NotifyAccepted { max_hold_ms: 30000 }
+    ));
+    let (draft_turn_id, draft_token) = match c_ok.next(Some(Duration::from_secs(10))).await.unwrap()
+    {
+        Reply::NotifyRelease {
+            action: NotifyReleaseAction::ShowEnriched,
+            turn_id: Some(tid),
+            token: Some(tok),
+            context_note: Some(ctx),
+            draft_text: Some(draft),
+            readonly: Some(true),
+            ..
+        } => {
+            assert_eq!(ctx, "Dinner invite");
+            assert_eq!(draft, "Sounds great, see you at 7!");
+            assert!(tok.starts_with("hc_d_"));
+            (tid, tok)
+        }
+        other => panic!("expected ShowEnriched, got {other:?}"),
+    };
+
+    // 4. reply_to taint guard: replying to the restricted draft turn stays pinned to Lane::Restricted
+    //    and refuses execute tools!
+    let (reply_id, mut c_taint) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "try shell".to_string(),
+            wait: true,
+            new: false,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Typed,
+            reply_to: Some(draft_turn_id),
+            stream: false,
+            distill: false,
+            schedule_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let taint_reply = c_taint.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert!(
+        matches!(
+            taint_reply,
+            Reply::Failed {
+                reason: FailReason::LimitReached | FailReason::Denied,
+                ..
+            }
+        ),
+        "restricted reply_to must block tool calls: {taint_reply:?}"
+    );
+
+    // 5. Client disconnect during NotifyHold cancels the restricted turn promptly.
+    let mut c_hang = Client::send(
+        &h.socket,
+        &Request::NotifyHold {
+            noti_id: 4,
+            replaces_id: 0,
+            app_name: "Signal".to_string(),
+            desktop_entry: "signal".to_string(),
+            summary: "Alice".to_string(),
+            body: "hold hang".to_string(),
+            category: "im.received".to_string(),
+            urgency: "normal".to_string(),
+            has_default_action: true,
+            dnd: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c_hang.next(Some(Duration::from_secs(5))).await.unwrap(),
+        Reply::NotifyAccepted { .. }
+    ));
+    h.wait_log("hold hang").await;
+    drop(c_hang);
+    h.wait_log("turn cancelled").await;
+
+    // 6. Restart survival + strict read-only DraftResume:
+    //    Stop daemon, verify restricted lane persisted in SQLite, start a brand new
+    //    daemon on the same state_dir, and claim the draft token (Paste degrades to Copy on Signal).
+    let state_dir = h.dir.join("state");
+    let socket2 = h.dir.join("s2.sock");
+    let script_path = h.dir.join("script.json");
+    let log2 = h.dir.join("mock2.log");
+    h.shut_down().await;
+
+    let draft_turn = store::get_turn(&state_dir, draft_turn_id).unwrap().unwrap();
+    assert_eq!(draft_turn.lane, Lane::Restricted);
+    let reply_turn = store::get_turn(&state_dir, reply_id).unwrap().unwrap();
+    assert_eq!(reply_turn.lane, Lane::Restricted);
+
+    let mut cfg2 = Config {
+        state_dir: state_dir.clone(),
+        ..Config::default()
+    };
+    cfg2.agent.command = vec![
+        env!("CARGO_BIN_EXE_hey-computer").to_string(),
+        "debug".to_string(),
+        "mock-agent".to_string(),
+        script_path.to_string_lossy().into_owned(),
+        "--log".to_string(),
+        log2.to_string_lossy().into_owned(),
+    ];
+    cfg2.agent.warm_start = false;
+    configure(&mut cfg2);
+
+    let rec2 = Recorder::new();
+    let (stop2, stopped2) = oneshot::channel::<()>();
+    let sock2_clone = socket2.clone();
+    let task2 = tokio::spawn(async move {
+        daemon::serve(cfg2, &sock2_clone, rec2, async {
+            let _ = stopped2.await;
+        })
+        .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket2.exists() {
+        assert!(Instant::now() < deadline, "restarted socket never appeared");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let resumed = ipc::request(
+        &socket2,
+        &Request::DraftResume {
+            token: draft_token.clone(),
+            action: DraftAction::Paste,
+        },
+    )
+    .await
+    .unwrap();
+    match resumed {
+        Reply::DraftResumed {
+            turn_id,
+            action,
+            status,
+            ..
+        } => {
+            assert_eq!(turn_id, Some(draft_turn_id));
+            // Strict Signal read-only guarantee: Paste degrades to Copy.
+            assert_eq!(action, DraftAction::Copy);
+            assert_eq!(status, "claimed");
+        }
+        other => panic!("expected DraftResumed(claimed), got {other:?}"),
+    }
+
+    // Replaying the same single-use token returns already_used.
+    let replay = ipc::request(
+        &socket2,
+        &Request::DraftResume {
+            token: draft_token,
+            action: DraftAction::Copy,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        replay,
+        Reply::DraftResumed {
+            status,
+            ..
+        } if status == "already_used"
+    ));
+
+    let _ = stop2.send(());
+    task2.await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&h.dir);
+}

@@ -33,6 +33,73 @@ pub struct Config {
     pub context: Context,
     pub history: History,
     pub present: Present,
+    pub notifications: crate::notify_filter::NotificationsConfig,
+    pub messenger: MessengerConfig,
+}
+
+/// Lane used for verified phone self-chat turns (`[messenger]`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfChatLane {
+    #[default]
+    Background,
+    Interactive,
+}
+
+fn is_empty_path(path: &Path) -> bool {
+    path.as_os_str().is_empty()
+}
+
+/// Configuration for consuming events from `hey-computer-bridge` (`[messenger]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MessengerConfig {
+    /// Connect to `hey-computer-bridge.sock` for bidirectional chat context and phone self-chat.
+    pub enabled: bool,
+    /// Optional explicit path to `hey-computer-bridge.sock` (empty uses
+    /// `$HEY_COMPUTER_BRIDGE_SOCKET` or `$XDG_RUNTIME_DIR/hey-computer-bridge.sock`).
+    #[serde(default, skip_serializing_if = "is_empty_path")]
+    pub socket: PathBuf,
+    /// Optional profile for bridge-originated DM drafts (`None` falls back to `notifications.profile`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_profile: Option<String>,
+    /// When true, allow bridge-originated DM events to create fallback drafts when
+    /// no recent SwayNC `NotifyHold` handled that message.
+    #[serde(default = "default_true")]
+    pub prefer_over_notifications: bool,
+    /// Accept verified phone self-chat ("Message Yourself" / "Note to Self") requests.
+    #[serde(default = "default_true")]
+    pub self_chat_enabled: bool,
+    /// Lane used for verified phone self-chat requests (`background` or `interactive`).
+    pub self_chat_lane: SelfChatLane,
+    /// Optional profile for verified phone self-chat requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_chat_profile: Option<String>,
+    /// Minimum seconds between bridge-originated DM draft turns per `(platform, chat_id)`.
+    pub cooldown_secs: f64,
+    /// Optional local quiet-hours start (`"HH:MM"`, e.g. `"22:00"`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub quiet_start: String,
+    /// Optional local quiet-hours end (`"HH:MM"`, e.g. `"08:00"`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub quiet_end: String,
+}
+
+impl Default for MessengerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket: PathBuf::new(),
+            draft_profile: None,
+            prefer_over_notifications: true,
+            self_chat_enabled: true,
+            self_chat_lane: SelfChatLane::Background,
+            self_chat_profile: None,
+            cooldown_secs: 60.0,
+            quiet_start: String::new(),
+            quiet_end: String::new(),
+        }
+    }
 }
 
 /// Retention settings for the local SQLite history database (`history.db`).
@@ -1026,6 +1093,72 @@ impl Config {
                 bail!("routing.deep_profile: {msg}");
             }
         }
+        self.notifications.validate()?;
+        if let Some(profile) = self.notifications.profile.as_deref()
+            && let Err(msg) = self.resolve_profile(Some(profile))
+        {
+            bail!("notifications.profile: {msg}");
+        }
+        if !self.instructions.vault.as_os_str().is_empty() {
+            let vault = normalize_lexical(&self.instructions.vault);
+            for (label, path) in [
+                (
+                    "notifications.senders_file",
+                    &self.notifications.senders_file,
+                ),
+                (
+                    "notifications.workday_file",
+                    &self.notifications.workday_file,
+                ),
+            ] {
+                if !path.as_os_str().is_empty() && normalize_lexical(path).starts_with(&vault) {
+                    bail!(
+                        "{label} must not be inside instructions.vault (the vault is untrusted data)"
+                    );
+                }
+            }
+        }
+        if !self.messenger.socket.as_os_str().is_empty() && !self.messenger.socket.is_absolute() {
+            bail!("messenger.socket must be an absolute path");
+        }
+        if !self.messenger.cooldown_secs.is_finite()
+            || self.messenger.cooldown_secs < 0.0
+            || self.messenger.cooldown_secs > MAX_SECS
+        {
+            bail!(
+                "messenger.cooldown_secs must be between 0 and {MAX_SECS}, not {}",
+                self.messenger.cooldown_secs
+            );
+        }
+        if self.messenger.quiet_start.is_empty() != self.messenger.quiet_end.is_empty() {
+            bail!(
+                "messenger.quiet_start and messenger.quiet_end must both be set or both be empty"
+            );
+        }
+        if !self.messenger.quiet_start.is_empty() {
+            crate::notify_filter::parse_hh_mm(&self.messenger.quiet_start).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "messenger.quiet_start must be HH:MM (00:00..=23:59), got `{}`",
+                    self.messenger.quiet_start
+                )
+            })?;
+            crate::notify_filter::parse_hh_mm(&self.messenger.quiet_end).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "messenger.quiet_end must be HH:MM (00:00..=23:59), got `{}`",
+                    self.messenger.quiet_end
+                )
+            })?;
+        }
+        if let Some(profile) = self.messenger.draft_profile.as_deref()
+            && let Err(msg) = self.resolve_profile(Some(profile))
+        {
+            bail!("messenger.draft_profile: {msg}");
+        }
+        if let Some(profile) = self.messenger.self_chat_profile.as_deref()
+            && let Err(msg) = self.resolve_profile(Some(profile))
+        {
+            bail!("messenger.self_chat_profile: {msg}");
+        }
         Ok(())
     }
 
@@ -1634,6 +1767,76 @@ mod tests {
             "[mcp.s]\ncommand = \"/bin/true\"\nicon = \"a\\nb\"\n",
             "[mcp.s]\ncommand = \"/bin/true\"\n[mcp.s.tool_icons]\n\"   \" = \"x\"\n",
             "[mcp.s]\ncommand = \"/bin/true\"\n[mcp.s.tool_icons]\n\"*a*\" = \"12345678901234567\"\n",
+        ] {
+            let cfg: Config = toml::from_str(bad).unwrap();
+            assert!(cfg.validate().is_err(), "{bad} should fail validation");
+        }
+    }
+
+    #[test]
+    fn notifications_and_messenger_config_defaults_and_validation() {
+        let cfg = Config::default();
+        assert!(!cfg.notifications.enabled);
+        assert_eq!(cfg.notifications.max_hold_secs, 60.0);
+        assert!(!cfg.messenger.enabled);
+        assert!(cfg.messenger.prefer_over_notifications);
+        assert!(cfg.messenger.self_chat_enabled);
+        assert_eq!(cfg.messenger.self_chat_lane, SelfChatLane::Background);
+        assert_eq!(cfg.messenger.cooldown_secs, 60.0);
+        cfg.validate().unwrap();
+
+        let parsed: Config = toml::from_str(
+            r#"
+            [profiles.fast]
+            thought_level = "low"
+
+            [notifications]
+            enabled = true
+            profile = "fast"
+            max_hold_secs = 60
+            max_turn_secs = 45
+            max_tool_calls = 0
+            draft_ttl_secs = 43200
+            quiet_start = "22:00"
+            quiet_end = "08:00"
+            senders_file = "/tmp/senders.json"
+            workday_file = "/tmp/workday.json"
+
+            [notifications.apps.signal]
+            match_apps = ["signal"]
+            allow_senders = ["Alice"]
+
+            [messenger]
+            enabled = true
+            socket = "/run/user/1000/hey-computer-bridge.sock"
+            draft_profile = "fast"
+            prefer_over_notifications = true
+            self_chat_enabled = true
+            self_chat_lane = "interactive"
+            self_chat_profile = "fast"
+            cooldown_secs = 30
+            quiet_start = "23:00"
+            quiet_end = "07:00"
+            "#,
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.messenger.self_chat_lane, SelfChatLane::Interactive);
+
+        for bad in [
+            "[notifications]\nmax_hold_secs = 0.5\n",
+            "[notifications]\nmax_hold_secs = 301\n",
+            "[notifications]\nprofile = \"missing\"\n",
+            "[notifications]\nsenders_file = \"relative.json\"\n",
+            "[notifications]\nworkday_file = \"relative.json\"\n",
+            "[instructions]\nvault = \"/tmp/v\"\n[notifications]\nsenders_file = \"/tmp/v/senders.json\"\n",
+            "[instructions]\nvault = \"/tmp/v\"\n[notifications]\nworkday_file = \"/tmp/v/workday.json\"\n",
+            "[messenger]\nsocket = \"relative.sock\"\n",
+            "[messenger]\ncooldown_secs = -1\n",
+            "[messenger]\nquiet_start = \"22:00\"\n",
+            "[messenger]\nquiet_start = \"25:00\"\nquiet_end = \"08:00\"\n",
+            "[messenger]\ndraft_profile = \"missing\"\n",
+            "[messenger]\nself_chat_profile = \"missing\"\n",
         ] {
             let cfg: Config = toml::from_str(bad).unwrap();
             assert!(cfg.validate().is_err(), "{bad} should fail validation");

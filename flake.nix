@@ -62,6 +62,12 @@
         };
 
         cargoLock.lockFile = ./Cargo.lock;
+        cargoBuildFlags = [
+          "--bin"
+          "hey-computer"
+          "--bin"
+          "hey-computer-viewer"
+        ];
 
         nativeBuildInputs = [
           pkgs.makeWrapper
@@ -103,6 +109,83 @@
         };
       };
 
+    mkBaileysReader = pkgs:
+      pkgs.buildNpmPackage {
+        pname = "hey-computer-baileys-reader";
+        version = "0.1.0";
+        src = ./bridge/baileys-reader;
+        nodejs = pkgs.nodejs_22;
+        npmDepsHash = "sha256-6r70im6uK0Bha+UWmg1Bst4QA2kjjd0+dmbM3dP+kZs=";
+        npmFlags = ["--ignore-scripts"];
+        dontNpmBuild = true;
+        nativeBuildInputs = [pkgs.makeWrapper];
+
+        installPhase = ''
+          runHook preInstall
+          mkdir -p $out/lib/hey-computer-baileys-reader $out/bin
+          cp -r index.mjs package.json node_modules $out/lib/hey-computer-baileys-reader/
+          makeWrapper ${pkgs.nodejs_22}/bin/node $out/bin/hey-computer-baileys-reader \
+            --add-flags "$out/lib/hey-computer-baileys-reader/index.mjs"
+          runHook postInstall
+        '';
+
+        meta = with pkgs.lib; {
+          description = "Strictly read-only WhatsApp Web linked-device reader for hey-computer-bridge";
+          homepage = "https://github.com/m4r1vs/hey-computer";
+          license = licenses.mit;
+          platforms = platforms.linux;
+          mainProgram = "hey-computer-baileys-reader";
+        };
+      };
+
+    mkBridgePackage = pkgs: let
+      baileysReader = mkBaileysReader pkgs;
+    in
+      pkgs.rustPlatform.buildRustPackage {
+        pname = "hey-computer-messenger-bridge";
+        version = "0.1.0";
+        src = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            ./rustfmt.toml
+            ./src
+          ];
+        };
+
+        cargoLock.lockFile = ./Cargo.lock;
+        cargoBuildFlags = [
+          "--bin"
+          "hey-computer-bridge"
+        ];
+        doCheck = false;
+
+        nativeBuildInputs = [
+          pkgs.makeWrapper
+          pkgs.pkg-config
+        ];
+        buildInputs = [
+          pkgs.glib-networking
+          pkgs.gtk4
+          pkgs.sqlite
+          pkgs.webkitgtk_6_0
+        ];
+
+        postFixup = ''
+          wrapProgram $out/bin/hey-computer-bridge \
+            --prefix PATH : "${pkgs.lib.makeBinPath [baileysReader pkgs.signal-cli]}"
+        '';
+
+        meta = with pkgs.lib; {
+          description = "Strictly read-only WhatsApp and Signal messenger bridge for hey-computer";
+          homepage = "https://github.com/m4r1vs/hey-computer";
+          license = licenses.mit;
+          platforms = platforms.linux;
+          mainProgram = "hey-computer-bridge";
+        };
+      };
+
     homeManagerModule = import ./nix/home-manager.nix {
       inherit self;
       obsidianSkills = obsidian-skills;
@@ -110,12 +193,14 @@
   in {
     overlays.default = final: _prev: {
       hey-computer = mkPackage final;
+      hey-computer-messenger-bridge = mkBridgePackage final;
     };
 
     packages = forAllSystems (system: let
       pkgs = pkgsFor system;
     in {
       default = mkPackage pkgs;
+      messenger-bridge = mkBridgePackage pkgs;
     });
 
     homeManagerModules.default = homeManagerModule;

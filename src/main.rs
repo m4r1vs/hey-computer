@@ -20,7 +20,8 @@ use hey_computer::distill::{self, DistillOptions};
 use hey_computer::ipc::{self, NotRunning};
 use hey_computer::present::{self, Urgency};
 use hey_computer::protocol::{
-    self, Attachment, AttachmentKind, InputSource, MAX_REQUEST_LINE, Reply, Request, SpeakAction,
+    self, Attachment, AttachmentKind, DraftAction, InputSource, MAX_REQUEST_LINE,
+    NotifyReleaseAction, Reply, Request, SpeakAction,
 };
 use hey_computer::{daemon, debug, mcp, mock, scheduler, store};
 
@@ -102,6 +103,11 @@ enum Command {
     Schedule {
         #[command(subcommand)]
         action: Option<ScheduleCommand>,
+    },
+    /// Inspect, copy, edit, dismiss, or test-hold notification reply drafts.
+    Draft {
+        #[command(subcommand)]
+        action: Option<DraftCommand>,
     },
     /// Browse recent conversation history and active tasks (fast read-only SQLite feed).
     History {
@@ -470,6 +476,59 @@ impl RecallSortArg {
 }
 
 #[derive(Debug, Subcommand)]
+enum DraftCommand {
+    /// List persisted notification draft checkpoints (pending by default; works offline).
+    List {
+        /// Include consumed, dismissed, and expired drafts.
+        #[arg(long)]
+        all: bool,
+        /// Maximum drafts to list.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show full details of one draft checkpoint by token or `#id` / `id` (works offline).
+    Show {
+        target: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Claim a draft and copy its text to the clipboard (falls back offline when daemon is stopped).
+    Copy { target: String },
+    /// Claim a draft, copy its text, and open it in the viewer composer (falls back offline).
+    Edit { target: String },
+    /// Dismiss a pending draft checkpoint (falls back offline when daemon is stopped).
+    Dismiss { target: String },
+    /// Simulate a SwayNC `notify_hold` round-trip against the running daemon.
+    Hold {
+        /// Desktop app name (e.g. `Signal`, `whatsapp-electron`, `Slack`).
+        #[arg(long)]
+        app: String,
+        /// Optional desktop entry ID.
+        #[arg(long, default_value = "")]
+        desktop_entry: String,
+        /// Notification summary / sender name.
+        #[arg(long)]
+        sender: String,
+        /// Notification message body.
+        #[arg(long)]
+        body: String,
+        /// Optional notification category (e.g. `im.received`).
+        #[arg(long, default_value = "")]
+        category: String,
+        /// Simulate Do Not Disturb active.
+        #[arg(long)]
+        dnd: bool,
+        /// Output raw JSON replies.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum TasksCommand {
     /// List recent tasks (background lane by default).
     List {
@@ -729,6 +788,10 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
                 action,
             )
             .await
+        }
+        Command::Draft { action } => {
+            let socket = ipc::socket_path(cli.socket.as_deref())?;
+            draft_cmd(&config, &socket, action).await
         }
         Command::History {
             limit,
@@ -1394,6 +1457,245 @@ async fn cancel_id(socket: &Path, id: Option<u64>) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         other => unexpected(other),
+    }
+}
+
+async fn draft_cmd(
+    config: &Config,
+    socket: &Path,
+    action: Option<DraftCommand>,
+) -> Result<ExitCode> {
+    let action = action.unwrap_or(DraftCommand::List {
+        all: false,
+        limit: 20,
+        json: false,
+    });
+    match action {
+        DraftCommand::List { all, limit, json } => {
+            let state_dir = config.state_dir()?;
+            let rows = store::list_draft_checkpoints(&state_dir, all, limit)?;
+            if json {
+                println!("{}", serde_json::to_string(&rows)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            if rows.is_empty() {
+                println!("no drafts");
+                return Ok(ExitCode::SUCCESS);
+            }
+            for row in rows {
+                let preview = if !row.draft_text.trim().is_empty() {
+                    row.draft_text.lines().next().unwrap_or("").trim()
+                } else {
+                    row.context_note.lines().next().unwrap_or("").trim()
+                };
+                println!(
+                    "#{}  {:<9}  {:<10}  {}  {}  [{}]",
+                    row.id,
+                    row.status.as_str(),
+                    row.channel,
+                    row.sender,
+                    preview,
+                    row.token,
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        DraftCommand::Show { target, json } => {
+            let state_dir = config.state_dir()?;
+            let Some(row) = store::get_draft_checkpoint(&state_dir, &target)? else {
+                eprintln!("hey-computer: draft `{target}` not found");
+                return Ok(ExitCode::FAILURE);
+            };
+            if json {
+                println!("{}", serde_json::to_string(&row)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!("id: #{}", row.id);
+            println!("token: {}", row.token);
+            println!("status: {}", row.status);
+            println!("channel: {} ({})", row.channel, row.app_name);
+            println!("sender: {}", row.sender);
+            if let Some(tid) = row.turn_id {
+                println!("turn_id: #{tid}");
+            }
+            if !row.context_note.trim().is_empty() {
+                println!("context: {}", row.context_note);
+            }
+            if !row.draft_text.trim().is_empty() {
+                println!("\n{}", row.draft_text);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        DraftCommand::Copy { target } => {
+            draft_resume_cli(config, socket, target, DraftAction::Copy).await
+        }
+        DraftCommand::Edit { target } => {
+            draft_resume_cli(config, socket, target, DraftAction::Edit).await
+        }
+        DraftCommand::Dismiss { target } => {
+            draft_resume_cli(config, socket, target, DraftAction::Dismiss).await
+        }
+        DraftCommand::Hold {
+            app,
+            desktop_entry,
+            sender,
+            body,
+            category,
+            dnd,
+            json,
+        } => {
+            let req = Request::NotifyHold {
+                noti_id: 1,
+                replaces_id: 0,
+                app_name: app,
+                desktop_entry,
+                summary: sender,
+                body,
+                category,
+                urgency: "normal".to_string(),
+                has_default_action: true,
+                dnd,
+            };
+            let mut client = ipc::Client::send(socket, &req).await?;
+            let max_wait = std::time::Duration::from_secs_f64(
+                config.notifications.max_hold_secs.clamp(5.0, 300.0) + 5.0,
+            );
+            loop {
+                let reply = client.next(Some(max_wait)).await?;
+                if json {
+                    println!("{}", protocol::encode(&reply));
+                }
+                match reply {
+                    Reply::NotifyAccepted { max_hold_ms } => {
+                        if !json {
+                            eprintln!("accepted (max_hold_ms={max_hold_ms})");
+                        }
+                    }
+                    Reply::NotifyRelease {
+                        action,
+                        turn_id,
+                        token,
+                        context_note,
+                        draft_text,
+                        readonly,
+                        reason,
+                    } => {
+                        if !json {
+                            match action {
+                                NotifyReleaseAction::ShowRaw => {
+                                    println!(
+                                        "show_raw{}",
+                                        reason
+                                            .as_deref()
+                                            .map(|r| format!(" ({r})"))
+                                            .unwrap_or_default()
+                                    );
+                                }
+                                NotifyReleaseAction::ShowEnriched => {
+                                    println!(
+                                        "show_enriched turn={:?} token={} readonly={}",
+                                        turn_id,
+                                        token.as_deref().unwrap_or(""),
+                                        readonly.unwrap_or(true),
+                                    );
+                                    if let Some(ctx) = context_note {
+                                        println!("context: {ctx}");
+                                    }
+                                    if let Some(draft) = draft_text {
+                                        println!("draft: {draft}");
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    other => return unexpected(other),
+                }
+            }
+        }
+    }
+}
+
+async fn draft_resume_cli(
+    config: &Config,
+    socket: &Path,
+    target: String,
+    action: DraftAction,
+) -> Result<ExitCode> {
+    match ipc::request(
+        socket,
+        &Request::DraftResume {
+            token: target.clone(),
+            action,
+        },
+    )
+    .await
+    {
+        Ok(Reply::DraftResumed {
+            id,
+            status,
+            message,
+            ..
+        }) => {
+            if message.is_empty() {
+                println!("draft #{id}: {status}");
+            } else {
+                println!("draft #{id} ({status}): {message}");
+            }
+            Ok(if status == "expired" {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
+        Ok(other) => unexpected(other),
+        Err(e) if e.downcast_ref::<NotRunning>().is_some() => {
+            let state_dir = config.state_dir()?;
+            let now_ms = store::unix_timestamp_ms();
+            match store::claim_draft_checkpoint(&state_dir, &target, action, now_ms)? {
+                store::CheckpointClaim::NotFound => {
+                    eprintln!("hey-computer: draft `{target}` not found");
+                    Ok(ExitCode::FAILURE)
+                }
+                store::CheckpointClaim::Expired(cp) => {
+                    eprintln!("hey-computer: draft #{} expired", cp.id);
+                    Ok(ExitCode::FAILURE)
+                }
+                store::CheckpointClaim::AlreadyUsed(cp) => {
+                    if action == DraftAction::Edit && cp.status != store::DraftStatus::Dismissed {
+                        let _ =
+                            present::open_draft_editor(&config.present, cp.turn_id, &cp.draft_text)
+                                .await;
+                    }
+                    println!("draft #{} (already_used): {}", cp.id, cp.status);
+                    Ok(ExitCode::SUCCESS)
+                }
+                store::CheckpointClaim::Claimed(cp) => {
+                    match action {
+                        DraftAction::Copy | DraftAction::Paste => {
+                            if !cp.draft_text.is_empty() {
+                                present::copy_to_clipboard(&config.present, &cp.draft_text).await?;
+                            }
+                            println!("copied draft #{} to clipboard", cp.id);
+                        }
+                        DraftAction::Edit => {
+                            if !cp.draft_text.is_empty() && !config.present.clipboard.is_empty() {
+                                let _ = present::copy_to_clipboard(&config.present, &cp.draft_text)
+                                    .await;
+                            }
+                            present::open_draft_editor(&config.present, cp.turn_id, &cp.draft_text)
+                                .await?;
+                            println!("opened draft #{} in viewer", cp.id);
+                        }
+                        DraftAction::Dismiss => {
+                            println!("dismissed draft #{}", cp.id);
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
+        Err(e) => Err(e),
     }
 }
 

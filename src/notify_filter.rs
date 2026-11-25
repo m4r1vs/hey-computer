@@ -113,7 +113,7 @@ impl NotificationsConfig {
             "notifications.max_hold_secs",
             self.max_hold_secs,
             1.0,
-            600.0,
+            300.0,
         )?;
         check_range(
             "notifications.max_turn_secs",
@@ -1054,7 +1054,7 @@ fn is_otp_code_token(raw: &str) -> bool {
     false
 }
 
-fn parse_hh_mm(spec: &str) -> Option<u16> {
+pub fn parse_hh_mm(spec: &str) -> Option<u16> {
     let (h, m) = spec.trim().split_once(':')?;
     if h.len() != 2 || m.len() != 2 {
         return None;
@@ -1068,7 +1068,7 @@ fn parse_hh_mm(spec: &str) -> Option<u16> {
     }
 }
 
-fn is_in_quiet_hours(cur: u16, start: u16, end: u16) -> bool {
+pub fn is_in_quiet_hours(cur: u16, start: u16, end: u16) -> bool {
     if start == end {
         return false;
     }

@@ -7,7 +7,9 @@
 //! shutdown) stay serialized inside `Conductor::run`.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,6 +25,8 @@ use crate::attachments::{self, LoadedAttachment};
 use crate::config::{Config, MAX_RESTART_DELAY_SECS, ResolvedProfile, secs};
 use crate::context::{self, ContextProvider, SystemContext};
 use crate::environment::{self, Paths};
+use crate::icons::{IconResolver, IconTracker};
+use crate::keyring::{DbusKeyringWatcher, KeyringStatus, KeyringWatcher};
 use crate::policy::{LanePolicy, PermissionDecision};
 use crate::present::{Presentation, Presenter, Urgency};
 use crate::protocol::{
@@ -51,6 +55,9 @@ const MAX_EXEMPT_SCHEMA_READS: usize = 64;
 const MAX_SEEDED_HISTORY_TURNS: usize = 12;
 /// Maximum characters injected inside `<untrusted_conversation_history>`.
 const MAX_SEEDED_HISTORY_CHARS: usize = 24_000;
+/// Grace window given to interactive asks while `agent.wait_for_keyring` is locked
+/// (absorbs brief post-PAM unlock races before failing fast with `KeyringLocked`).
+const KEYRING_UNLOCK_GRACE: Duration = Duration::from_millis(1_500);
 
 /// Where a request's result goes.
 pub enum Sink {
@@ -69,6 +76,7 @@ pub struct AskParams {
     pub new: bool,
     pub profile: Option<String>,
     pub background: bool,
+    pub restricted: bool,
     pub suppress_token: Option<String>,
     pub attachments: Vec<LoadedAttachment>,
     pub source: InputSource,
@@ -88,6 +96,7 @@ pub enum Outcome {
         widgets: Vec<WidgetSpec>,
         conversation_id: Option<u64>,
         profile: Option<String>,
+        tool_icons: Vec<String>,
     },
     Failed {
         reason: FailReason,
@@ -112,6 +121,7 @@ impl Outcome {
                 widgets,
                 conversation_id,
                 profile,
+                tool_icons,
             } => Reply::Answer {
                 id,
                 text,
@@ -120,6 +130,7 @@ impl Outcome {
                 widgets,
                 conversation_id,
                 profile,
+                tool_icons,
             },
             Self::Failed { reason, message } => Reply::Failed {
                 id,
@@ -187,6 +198,7 @@ pub struct Ask {
     pub new: bool,
     pub profile: Option<String>,
     pub background: bool,
+    pub restricted: bool,
     pub suppress_token: Option<String>,
     pub attachments: Vec<LoadedAttachment>,
     pub source: InputSource,
@@ -241,6 +253,14 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// Whether the conductor is currently waiting for the login keyring to unlock.
+    pub fn is_locked(&self) -> bool {
+        self.shared
+            .lock()
+            .map(|s| s.agent == AgentState::Locked)
+            .unwrap_or(false)
+    }
+
     /// Validate a requested profile name against the daemon's configuration
     /// before queuing a request (so an unknown profile never supersedes an
     /// active foreground turn).
@@ -252,6 +272,7 @@ impl Handle {
     /// or an error if the background queue is full or `reply_to` does not exist.
     pub fn ask(&self, params: AskParams, sink: Sink) -> std::result::Result<u64, String> {
         let mut effective_profile = params.profile;
+        let mut effective_restricted = params.restricted;
         let mut reply_to_root_conv_id = None;
         if let Some(target_id) = params.reply_to {
             if self.store.is_some()
@@ -260,7 +281,19 @@ impl Handle {
                 let target = store::get_turn(sd, target_id)
                     .map_err(|e| format!("reading turn #{target_id}: {e:#}"))?
                     .ok_or_else(|| format!("turn #{target_id} not found in history"))?;
-                reply_to_root_conv_id = Some(target.conversation_id.unwrap_or(target.id));
+                let root_id = target.conversation_id.unwrap_or(target.id);
+                reply_to_root_conv_id = Some(root_id);
+                // Taint guard: any follow-up replying to a restricted turn or
+                // thread remains pinned to `Lane::Restricted` so untrusted
+                // notification/messenger content can never escalate to standard tools.
+                if target.lane == Lane::Restricted {
+                    effective_restricted = true;
+                } else if root_id != target.id
+                    && let Ok(Some(root_turn)) = store::get_turn(sd, root_id)
+                    && root_turn.lane == Lane::Restricted
+                {
+                    effective_restricted = true;
+                }
                 if effective_profile.is_none()
                     && !target.profile.is_empty()
                     && self.config.resolve_profile(Some(&target.profile)).is_ok()
@@ -285,6 +318,7 @@ impl Handle {
             // there is room in the background queue, place it directly onto
             // `bg_tasks` without superseding an active interactive request.
             if !effective_background
+                && !effective_restricted
                 && self.config.routing.enabled
                 && effective_profile.is_none()
                 && matches!(sink, Sink::Present)
@@ -341,14 +375,18 @@ impl Handle {
             // Barge-in: new interactive requests silence any ongoing TTS playback.
             self.presenter.stop_speech(None);
         }
-        let lane = if effective_background {
+        let lane = if effective_restricted {
+            Lane::Restricted
+        } else if effective_background {
             Lane::Background
         } else {
             Lane::Interactive
         };
         let stored_profile = effective_profile
             .as_deref()
-            .or(if effective_background {
+            .or(if effective_restricted {
+                self.config.notifications.profile.as_deref()
+            } else if effective_background {
                 self.config.tasks.profile.as_deref()
             } else {
                 None
@@ -388,6 +426,7 @@ impl Handle {
             new: params.new,
             profile: effective_profile,
             background: effective_background,
+            restricted: effective_restricted,
             suppress_token: params.suppress_token,
             attachments: params.attachments,
             source: params.source,
@@ -427,6 +466,7 @@ impl Handle {
                 ask,
                 Outcome::failed(FailReason::AgentDown, "the daemon is shutting down"),
                 None,
+                Vec::new(),
             );
         }
         Ok(id)
@@ -572,6 +612,23 @@ pub fn spawn_with_store(
     context: Arc<dyn ContextProvider>,
     store: Option<(Store, u64)>,
 ) -> (Handle, JoinHandle<()>) {
+    spawn_with_deps(
+        config,
+        presenter,
+        context,
+        store,
+        Arc::new(DbusKeyringWatcher),
+    )
+}
+
+/// Start the conductor task with injectable store and keyring watcher (for daemon & tests).
+pub fn spawn_with_deps(
+    config: Arc<Config>,
+    presenter: Arc<dyn Presenter>,
+    context: Arc<dyn ContextProvider>,
+    store: Option<(Store, u64)>,
+    keyring: Arc<dyn KeyringWatcher>,
+) -> (Handle, JoinHandle<()>) {
     let (store, initial_last_id) = match store {
         Some((s, id)) => (Some(s), id),
         None => (None, 0),
@@ -617,6 +674,9 @@ pub fn spawn_with_store(
         config: Arc::clone(&config),
         presenter: Arc::clone(&presenter),
         context,
+        keyring,
+        keyring_locked: false,
+        fg_lock_deadline: None,
         store: store.clone(),
         state_dir: state_dir.clone(),
         shared: Arc::clone(&shared),
@@ -703,6 +763,9 @@ struct Conductor {
     config: Arc<Config>,
     presenter: Arc<dyn Presenter>,
     context: Arc<dyn ContextProvider>,
+    keyring: Arc<dyn KeyringWatcher>,
+    keyring_locked: bool,
+    fg_lock_deadline: Option<Instant>,
     store: Option<Store>,
     state_dir: Option<PathBuf>,
     policy: Arc<LanePolicy>,
@@ -731,6 +794,7 @@ struct Conductor {
 /// How one turn ended.
 struct TurnEnd {
     outcome: Outcome,
+    tool_icons: Vec<String>,
     /// False when the agent stdout closed mid-turn.
     alive: bool,
     /// True when `session/cancel` timed out and the session is wedged.
@@ -761,6 +825,7 @@ struct Budgets {
 
 struct TurnContext<'a> {
     policy: &'a LanePolicy,
+    icons: &'a IconResolver,
     budgets: Budgets,
     progress: Option<&'a Arc<dyn Presenter>>,
     speech: Option<&'a Arc<dyn Presenter>>,
@@ -775,6 +840,7 @@ enum TurnAbort {
     TurnTimeout(Duration),
     ToolLimit(usize),
     RepeatToolLoop { count: usize, tool: String },
+    DeniedTool(String),
     Cancelled(FailReason),
 }
 
@@ -1180,31 +1246,101 @@ pub fn is_suppressed(text: &str, token: &str, denied: &[String]) -> bool {
 }
 
 impl Conductor {
+    async fn ensure_keyring_ready(&mut self) -> bool {
+        if !self.config.agent.wait_for_keyring {
+            return true;
+        }
+        if self.keyring_locked {
+            return false;
+        }
+        match self.keyring.check_locked().await {
+            KeyringStatus::Locked => {
+                self.keyring_locked = true;
+                self.set_agent(AgentState::Locked);
+                tracing::info!("login keyring is locked; waiting before starting the agent");
+                false
+            }
+            KeyringStatus::Unlocked | KeyringStatus::Unavailable => true,
+        }
+    }
+
     async fn run(mut self) {
         let stop = Arc::clone(&self.stop);
         if self.config.agent.warm_start {
             // A start that hangs must not hold up a shutdown; dropping it
             // kills the half-started agent.
-            tokio::select! {
-                () = self.start_warm() => {}
-                _ = stop.cancelled() => {}
+            let ready = tokio::select! {
+                ready = self.ensure_keyring_ready() => ready,
+                _ = stop.cancelled() => false,
+            };
+            if ready && stop.reason().is_none() {
+                tokio::select! {
+                    () = self.start_warm() => {}
+                    _ = stop.cancelled() => {}
+                }
             }
         }
+        let mut keyring_wait: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
         loop {
+            if self.keyring_locked && keyring_wait.is_none() {
+                let kr = Arc::clone(&self.keyring);
+                keyring_wait = Some(Box::pin(async move {
+                    kr.wait_unlocked().await;
+                }));
+            } else if !self.keyring_locked {
+                keyring_wait = None;
+            }
             let restart_at = self.restart_at;
+            let fg_lock_deadline = self.fg_lock_deadline;
             let idle_at = self.idle_deadline();
             let memory_at = self.memory_check_deadline();
             if stop.reason().is_some() {
                 break;
             }
             tokio::select! {
-                // Keep a deterministic biased order: completions, then inbox,
-                // then agent exit, then timers.
+                // Keep a deterministic biased order: completions, keyring unlock,
+                // lock grace, inbox, agent exit, then timers.
                 biased;
                 finished = self.done_rx.recv() => {
                     if let Some(finished) = finished {
                         self.handle_finished(finished).await;
                         self.dispatch_ready().await;
+                    }
+                }
+                () = poll_opt(&mut keyring_wait) => {
+                    keyring_wait = None;
+                    self.keyring_locked = false;
+                    self.fg_lock_deadline = None;
+                    self.set_agent(AgentState::Down);
+                    tracing::info!("login keyring unlocked; resuming agent startup");
+                    if self.config.agent.warm_start
+                        && self.live.is_none()
+                        && self.fg_pending.is_none()
+                        && self.bg_queue.is_empty()
+                    {
+                        tokio::select! {
+                            () = self.start_warm() => {}
+                            _ = stop.cancelled() => {}
+                        }
+                    }
+                    self.dispatch_ready().await;
+                }
+                () = sleep_until(fg_lock_deadline) => {
+                    self.fg_lock_deadline = None;
+                    if self.keyring_locked
+                        && let Some(ask) = self.fg_pending.take()
+                    {
+                        let profile = self.effective_display_profile(&ask);
+                        self.finish_request(
+                            ask,
+                            Outcome::failed(
+                                FailReason::KeyringLocked,
+                                "The login keyring is still locked. Unlock your session and try again.",
+                            ),
+                            profile,
+                            false,
+                            Vec::new(),
+                        );
                     }
                 }
                 message = self.inbox.recv() => match message {
@@ -1241,9 +1377,15 @@ impl Conductor {
                 }
                 () = sleep_until(restart_at) => {
                     self.restart_at = None;
-                    tokio::select! {
-                        () = self.start_warm() => {}
-                        _ = stop.cancelled() => {}
+                    let ready = tokio::select! {
+                        ready = self.ensure_keyring_ready() => ready,
+                        _ = stop.cancelled() => false,
+                    };
+                    if ready && stop.reason().is_none() {
+                        tokio::select! {
+                            () = self.start_warm() => {}
+                            _ = stop.cancelled() => {}
+                        }
                     }
                     self.dispatch_ready().await;
                 }
@@ -1273,11 +1415,23 @@ impl Conductor {
         // Drain anything still waiting in queues or the inbox.
         if let Some(ask) = self.fg_pending.take() {
             let profile = self.effective_display_profile(&ask);
-            self.finish_request(ask, cancelled(FailReason::AgentDown), profile, false);
+            self.finish_request(
+                ask,
+                cancelled(FailReason::AgentDown),
+                profile,
+                false,
+                Vec::new(),
+            );
         }
         while let Some(ask) = self.bg_queue.pop_front() {
             let profile = self.effective_display_profile(&ask);
-            self.finish_request(ask, cancelled(FailReason::AgentDown), profile, true);
+            self.finish_request(
+                ask,
+                cancelled(FailReason::AgentDown),
+                profile,
+                true,
+                Vec::new(),
+            );
         }
         while let Ok(message) = self.inbox.try_recv() {
             if let Message::Ask(ask) = message {
@@ -1288,6 +1442,7 @@ impl Conductor {
                     cancelled(FailReason::AgentDown),
                     profile,
                     was_queued_bg,
+                    Vec::new(),
                 );
             }
         }
@@ -1305,7 +1460,10 @@ impl Conductor {
             if let Some(old) = self.fg_pending.replace(ask) {
                 let reason = old.token.reason().unwrap_or(FailReason::Superseded);
                 let profile = self.effective_display_profile(&old);
-                self.finish_request(old, cancelled(reason), profile, false);
+                self.finish_request(old, cancelled(reason), profile, false, Vec::new());
+            }
+            if self.keyring_locked {
+                self.fg_lock_deadline = Some(Instant::now() + KEYRING_UNLOCK_GRACE);
             }
         }
     }
@@ -1315,14 +1473,15 @@ impl Conductor {
             && let Some(reason) = pending.token.reason()
         {
             let ask = self.fg_pending.take().expect("checked");
+            self.fg_lock_deadline = None;
             let profile = self.effective_display_profile(&ask);
-            self.finish_request(ask, cancelled(reason), profile, false);
+            self.finish_request(ask, cancelled(reason), profile, false, Vec::new());
         }
         let mut remaining = VecDeque::with_capacity(self.bg_queue.len());
         while let Some(ask) = self.bg_queue.pop_front() {
             if let Some(reason) = ask.token.reason() {
                 let profile = self.effective_display_profile(&ask);
-                self.finish_request(ask, cancelled(reason), profile, true);
+                self.finish_request(ask, cancelled(reason), profile, true, Vec::new());
             } else {
                 remaining.push_back(ask);
             }
@@ -1362,7 +1521,36 @@ impl Conductor {
                 return;
             }
 
+            if self.live.is_none() && !self.ensure_keyring_ready().await {
+                // Fail restricted tasks (e.g. notification holds) immediately while
+                // locked; keep regular background/scheduled asks queued until unlock.
+                let mut kept = VecDeque::with_capacity(self.bg_queue.len());
+                while let Some(ask) = self.bg_queue.pop_front() {
+                    if ask.restricted {
+                        let profile = self.effective_display_profile(&ask);
+                        self.finish_request(
+                            ask,
+                            Outcome::failed(
+                                FailReason::KeyringLocked,
+                                "The login keyring is still locked.",
+                            ),
+                            profile,
+                            true,
+                            Vec::new(),
+                        );
+                    } else {
+                        kept.push_back(ask);
+                    }
+                }
+                self.bg_queue = kept;
+                if self.fg_pending.is_some() && self.fg_lock_deadline.is_none() {
+                    self.fg_lock_deadline = Some(Instant::now() + KEYRING_UNLOCK_GRACE);
+                }
+                return;
+            }
+
             if can_fg {
+                self.fg_lock_deadline = None;
                 let ask = self.fg_pending.take().expect("checked");
                 self.launch_ask(ask).await;
             } else if can_bg {
@@ -1387,20 +1575,21 @@ impl Conductor {
     async fn launch_ask(&mut self, mut ask: Ask) {
         if let Some(reason) = ask.token.reason() {
             let display_profile = self.effective_display_profile(&ask);
-            self.finish_request(ask, cancelled(reason), display_profile, false);
+            self.finish_request(ask, cancelled(reason), display_profile, false, Vec::new());
             return;
         }
 
         // Three-tier smart routing (runs only when enabled and caller did not
-        // pass explicit --profile or --background).
+        // pass explicit --profile or --background, and never on restricted turns).
         if self.config.routing.enabled
             && ask.profile.is_none()
             && !ask.background
+            && !ask.restricted
             && !ask.escalated_once
         {
             if let Some(reason) = self.apply_routing(&mut ask).await {
                 let display_profile = self.effective_display_profile(&ask);
-                self.finish_request(ask, cancelled(reason), display_profile, false);
+                self.finish_request(ask, cancelled(reason), display_profile, false, Vec::new());
                 return;
             }
             if ask.background {
@@ -1420,7 +1609,7 @@ impl Conductor {
 
         let display_profile = self.effective_display_profile(&ask);
         if let Some(reason) = ask.token.reason() {
-            self.finish_request(ask, cancelled(reason), display_profile, false);
+            self.finish_request(ask, cancelled(reason), display_profile, false, Vec::new());
             return;
         }
 
@@ -1453,7 +1642,13 @@ impl Conductor {
         };
         tracing::info!(
             "{} {}: {} characters{}{}",
-            if ask.background { "task" } else { "request" },
+            if ask.restricted {
+                "restricted"
+            } else if ask.background {
+                "task"
+            } else {
+                "request"
+            },
             ask.id,
             ask.text.chars().count(),
             display_profile
@@ -1482,7 +1677,7 @@ impl Conductor {
                     result = self.start_agent() => result,
                     reason = stop.cancelled() => {
                         self.set_agent(AgentState::Down);
-                        self.finish_request(ask, cancelled(reason), display_profile, false);
+                        self.finish_request(ask, cancelled(reason), display_profile, false, Vec::new());
                         return;
                     }
                 };
@@ -1496,16 +1691,41 @@ impl Conductor {
                         ),
                         display_profile,
                         false,
+                        Vec::new(),
                     );
                     return;
                 }
                 if let Some(reason) = token.reason() {
-                    self.finish_request(ask, cancelled(reason), display_profile, false);
+                    self.finish_request(ask, cancelled(reason), display_profile, false, Vec::new());
                     return;
                 }
             }
 
-            let session_result = if ask.background {
+            let session_result = if ask.restricted {
+                // Restricted turns always open an isolated fresh ACP session
+                // (closed on finish) and never touch the interactive conversation.
+                let effective_req = ask
+                    .profile
+                    .clone()
+                    .or_else(|| self.config.notifications.profile.clone());
+                let restricted_cid = match ask.reply_to {
+                    Some(target_id) => ask.reply_to_root_conv_id.unwrap_or(target_id),
+                    None => ask.id,
+                };
+                let seeded = match ask.reply_to {
+                    Some(target_id) => self.load_seeded_history(target_id).await,
+                    None => None,
+                };
+                tokio::select! {
+                    res = self.new_restricted_session(effective_req.as_deref()) => {
+                        res.map(|(s, r)| (s, r, Some(restricted_cid), seeded))
+                    }
+                    reason = interrupts.wait() => {
+                        self.finish_request(ask, cancelled(reason), display_profile, false, Vec::new());
+                        return;
+                    }
+                }
+            } else if ask.background {
                 let effective_req = ask
                     .profile
                     .clone()
@@ -1523,7 +1743,7 @@ impl Conductor {
                         res.map(|(s, r)| (s, r, Some(bg_cid), seeded))
                     }
                     reason = interrupts.wait() => {
-                        self.finish_request(ask, cancelled(reason), display_profile, false);
+                        self.finish_request(ask, cancelled(reason), display_profile, false, Vec::new());
                         return;
                     }
                 }
@@ -1537,7 +1757,7 @@ impl Conductor {
                         ask.profile.as_deref(),
                     ) => res,
                     reason = interrupts.wait() => {
-                        self.finish_request(ask, cancelled(reason), display_profile, false);
+                        self.finish_request(ask, cancelled(reason), display_profile, false, Vec::new());
                         return;
                     }
                 }
@@ -1552,7 +1772,7 @@ impl Conductor {
                         (s, r, cid, None)
                     }),
                     reason = interrupts.wait() => {
-                        self.finish_request(ask, cancelled(reason), display_profile, false);
+                        self.finish_request(ask, cancelled(reason), display_profile, false, Vec::new());
                         return;
                     }
                 }
@@ -1575,7 +1795,7 @@ impl Conductor {
                         retried_auth = true;
                         continue;
                     }
-                    self.finish_request(ask, outcome, display_profile, false);
+                    self.finish_request(ask, outcome, display_profile, false, Vec::new());
                     return;
                 }
             }
@@ -1588,6 +1808,7 @@ impl Conductor {
                 Outcome::failed(FailReason::AgentDown, "the assistant exited"),
                 shown,
                 false,
+                Vec::new(),
             );
             return;
         };
@@ -1595,7 +1816,9 @@ impl Conductor {
         let used_profile = resolved.name.clone();
         let shown_profile = self.display_profile_name(used_profile.as_deref());
         if let Some(store) = &self.store {
-            let lane = if ask.background {
+            let lane = if ask.restricted {
+                Lane::Restricted
+            } else if ask.background {
                 Lane::Background
             } else {
                 Lane::Interactive
@@ -1625,33 +1848,69 @@ impl Conductor {
             }
         }
 
-        let budgets = Budgets {
-            inactivity: resolved.inactivity,
-            max_turn: resolved.max_turn,
-            max_tool_calls: resolved.max_tool_calls,
-            max_repeat_tool_calls: resolved.max_repeat_tool_calls,
+        let budgets = if ask.restricted {
+            let notif_turn = secs(self.config.notifications.max_turn_secs);
+            let max_turn = if ask.background {
+                match (resolved.max_turn, notif_turn) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+            } else {
+                resolved.max_turn
+            };
+            let inactivity = max_turn
+                .map(|m| resolved.inactivity.min(m))
+                .unwrap_or(resolved.inactivity);
+            Budgets {
+                inactivity,
+                max_turn,
+                max_tool_calls: Some(self.config.notifications.max_tool_calls),
+                max_repeat_tool_calls: resolved.max_repeat_tool_calls,
+            }
+        } else {
+            Budgets {
+                inactivity: resolved.inactivity,
+                max_turn: resolved.max_turn,
+                max_tool_calls: resolved.max_tool_calls,
+                max_repeat_tool_calls: resolved.max_repeat_tool_calls,
+            }
         };
         let config = Arc::clone(&self.config);
         let context_provider = Arc::clone(&self.context);
-        let policy = Arc::new(
-            self.policy
-                .with_mcp_servers(Some(resolved.mcp_servers.clone())),
-        );
+        let policy = if ask.restricted {
+            Arc::new(
+                LanePolicy::restricted()
+                    .with_known_mcp_servers(self.policy.known_mcp_servers.clone()),
+            )
+        } else {
+            Arc::new(
+                self.policy
+                    .with_mcp_servers(Some(resolved.mcp_servers.clone())),
+            )
+        };
         let presenter = (!ask.background && matches!(ask.sink, Sink::Present))
             .then(|| Arc::clone(&self.presenter));
         let emit_speech = !ask.background
+            && !ask.restricted
             && ask.suppress_token.is_none()
             && matches!(ask.sink, Sink::Present)
             && (ask.source == InputSource::Voice || !self.config.present.speak.voice_only);
         ask.speech_started = emit_speech;
         let speech_presenter = emit_speech.then(|| Arc::clone(&self.presenter));
-        let voice_stop_presenter =
-            (emit_speech || ask.source == InputSource::Voice).then(|| Arc::clone(&self.presenter));
+        let voice_stop_presenter = (emit_speech
+            || (!ask.restricted && ask.source == InputSource::Voice))
+            .then(|| Arc::clone(&self.presenter));
         let stream_tx = match &ask.sink {
             Sink::Stream(tx) => Some(tx.clone()),
             Sink::Present | Sink::Client(_) => None,
         };
-        let agent_dir = self.paths.as_ref().map(|p| p.agent_dir.clone());
+        let real_agent_dir = self.paths.as_ref().map(|p| p.agent_dir.clone());
+        let icon_resolver = Arc::new(IconResolver::from_config(
+            &config,
+            real_agent_dir.as_deref(),
+        ));
+        // Never exempt internal schema reads in `Lane::Restricted` (MCP is disabled).
+        let agent_dir = (!ask.restricted).then_some(real_agent_dir).flatten();
         let done_tx = self.done_tx.clone();
         let stop = Arc::clone(&self.stop);
 
@@ -1668,7 +1927,7 @@ impl Conductor {
                         time: config.context.time,
                         desktop: false,
                     };
-                    let effective_ctx = if ask.background {
+                    let effective_ctx = if ask.background || ask.restricted {
                         &bg_ctx
                     } else {
                         &config.context
@@ -1685,6 +1944,7 @@ impl Conductor {
                                     started,
                                     end: TurnEnd {
                                         outcome: cancelled(reason),
+                                        tool_icons: Vec::new(),
                                         alive: true,
                                         wedged: false,
                                         broken: false,
@@ -1709,7 +1969,9 @@ impl Conductor {
             } else {
                 None
             };
-            let modality_header = context::format_modality(ask.source);
+            let modality_header = (!ask.restricted)
+                .then(|| context::format_modality(ask.source))
+                .flatten();
             let mut header_parts: Vec<&str> = Vec::new();
             if let Some(b) = budget_header.as_deref() {
                 header_parts.push(b);
@@ -1736,6 +1998,7 @@ impl Conductor {
             let blocks = attachments::build_prompt_blocks(&prompt, &ask.attachments);
             let ctx = TurnContext {
                 policy: &policy,
+                icons: &icon_resolver,
                 budgets,
                 progress: presenter.as_ref(),
                 speech: speech_presenter.as_ref(),
@@ -1834,7 +2097,7 @@ impl Conductor {
                 } else if let Some(live) = &mut self.live {
                     live.draining = true;
                 }
-            } else if ask.background {
+            } else if ask.background || ask.restricted {
                 if let Some(live) = &self.live {
                     drop(
                         live.conn
@@ -1916,6 +2179,7 @@ impl Conductor {
             && ask.token.reason().is_none()
             && self.config.routing.deep_profile != self.config.routing.fast_profile
             && !ask.background
+            && !ask.restricted
             && self.fg_pending.is_none()
             && matches!(
                 end.outcome,
@@ -1935,6 +2199,7 @@ impl Conductor {
                 let _ = tx.send(Reply::Reset { id: ask.id });
             }
             let mut retry = ask;
+            retry.pre_progress_shown = false;
             retry.speech_started = false;
             retry.escalated_once = true;
             retry.auto_routed_fast = false;
@@ -1949,7 +2214,7 @@ impl Conductor {
         self.last_used = Instant::now();
         log_outcome(ask.id, &end.outcome, started);
         let display_profile = self.display_profile_name(used_profile.as_deref());
-        self.finish_request(ask, end.outcome, display_profile, false);
+        self.finish_request(ask, end.outcome, display_profile, false, end.tool_icons);
     }
 
     /// Apply Tier 1 heuristics and (for non-voice unsure new turns) Tier 3
@@ -2137,6 +2402,7 @@ impl Conductor {
         let sub = client.subscribe(&session);
         let timeout = Duration::from_secs_f64(self.config.routing.triage_timeout_secs.max(0.2));
         let restricted = LanePolicy::restricted();
+        let no_icons = IconResolver::from_config(&Config::default(), None);
         let budgets = Budgets {
             inactivity: timeout,
             max_turn: Some(timeout),
@@ -2145,6 +2411,7 @@ impl Conductor {
         };
         let ctx = TurnContext {
             policy: &restricted,
+            icons: &no_icons,
             budgets,
             progress: None,
             speech: None,
@@ -2216,6 +2483,7 @@ impl Conductor {
         outcome: Outcome,
         profile: Option<String>,
         was_queued_bg: bool,
+        tool_icons: Vec<String>,
     ) {
         ask.token.finish();
         if let Ok(mut shared) = self.shared.lock() {
@@ -2273,7 +2541,7 @@ impl Conductor {
                 }
             }
         }
-        deliver(Some(&self.presenter), ask, outcome, profile);
+        deliver(Some(&self.presenter), ask, outcome, profile, tool_icons);
     }
 
     fn display_profile_name(&self, name: Option<&str>) -> Option<String> {
@@ -2557,6 +2825,7 @@ impl Conductor {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     async fn new_background_session(
         &mut self,
         requested: Option<&str>,
@@ -2569,8 +2838,22 @@ impl Conductor {
         Ok((session, resolved))
     }
 
+    #[allow(clippy::result_large_err)]
+    async fn new_restricted_session(
+        &mut self,
+        requested: Option<&str>,
+    ) -> Result<(String, ResolvedProfile), Outcome> {
+        let resolved = self
+            .config
+            .resolve_profile(requested)
+            .map_err(|e| Outcome::failed(FailReason::AgentError, e))?;
+        let session = self.new_session(&resolved, false).await?;
+        Ok((session, resolved))
+    }
+
     /// The session this interactive request continues (with any mid-conversation
     /// profile switch applied), or a new one.
+    #[allow(clippy::result_large_err)]
     async fn session_for(
         &mut self,
         turn_id: u64,
@@ -2704,6 +2987,7 @@ impl Conductor {
     ///   and its latest completed turn is `target_id` (even past `follow_up_secs`).
     /// - Path B: otherwise load `history.db` turns up to `target_id`, open a fresh
     ///   ACP session linked to `root_conv_id`, and seed `<untrusted_conversation_history>`.
+    #[allow(clippy::result_large_err)]
     async fn session_for_reply_to(
         &mut self,
         _turn_id: u64,
@@ -2835,6 +3119,7 @@ impl Conductor {
         Ok((session, resolved, Some(root_conv_id), seeded))
     }
 
+    #[allow(clippy::result_large_err)]
     async fn apply_profile_switch(
         &mut self,
         session: &str,
@@ -2905,6 +3190,7 @@ impl Conductor {
         Ok(true)
     }
 
+    #[allow(clippy::result_large_err)]
     async fn new_session(
         &mut self,
         resolved: &ResolvedProfile,
@@ -3034,6 +3320,7 @@ fn deliver(
     ask: Ask,
     outcome: Outcome,
     profile: Option<String>,
+    tool_icons: Vec<String>,
 ) {
     match ask.sink {
         Sink::Client(reply) => {
@@ -3061,8 +3348,14 @@ fn deliver(
                     text,
                     denied,
                     widgets,
+                    tool_icons: answer_icons,
                     ..
                 } => {
+                    let icons = if answer_icons.is_empty() {
+                        tool_icons
+                    } else {
+                        answer_icons
+                    };
                     if ask.speech_started {
                         presenter.present(Presentation::SpeechFinish {
                             id: ask.id,
@@ -3078,7 +3371,7 @@ fn deliver(
                             denied,
                             profile,
                             widgets,
-                            icons: Vec::new(),
+                            icons,
                         });
                     } else {
                         presenter.present(Presentation::Answer {
@@ -3087,7 +3380,7 @@ fn deliver(
                             denied,
                             profile,
                             widgets,
-                            icons: Vec::new(),
+                            icons,
                         });
                     }
                 }
@@ -3101,7 +3394,7 @@ fn deliver(
                         message,
                         profile,
                         background: ask.background,
-                        icons: Vec::new(),
+                        icons: tool_icons,
                     });
                 }
             }
@@ -3213,6 +3506,13 @@ async fn sleep_until(at: Option<Instant>) {
     }
 }
 
+async fn poll_opt(fut: &mut Option<Pin<Box<dyn Future<Output = ()> + Send>>>) {
+    match fut.as_mut() {
+        Some(f) => f.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
 fn parse_mcp_ui_widget(
     tool_name: &str,
     args: &Value,
@@ -3255,33 +3555,51 @@ async fn turn(
     let mut widgets: Vec<WidgetSpec> = Vec::new();
     let mut widget_seq: usize = 0;
     let mut tracker = ToolTracker::new(ctx.agent_dir.map(Path::to_path_buf));
+    let mut icon_tracker = IconTracker::new();
+    let mut denied_call_ids: HashSet<String> = HashSet::new();
     let mut last_progress: Option<String> = None;
+    let mut last_emitted_icons_len: usize = 0;
     let mut first_text: Option<Duration> = None;
     let mut deadline = Instant::now() + budgets.inactivity;
     let turn_deadline = budgets.max_turn.and_then(|d| started.checked_add(d));
     let turn_sleep = sleep_until(turn_deadline);
     tokio::pin!(turn_sleep);
     let at = || started.elapsed().as_secs_f64();
-    let emit_progress = |last: &mut Option<String>, status: Option<String>| {
+    let emit_progress = |last: &mut Option<String>,
+                         last_icons_len: &mut usize,
+                         status: Option<String>,
+                         icons: &[String]| {
         if ctx.progress.is_none() && ctx.stream_tx.is_none() {
             return;
         }
-        let Some(status) = status else {
-            return;
-        };
-        if last.as_deref() == Some(status.as_str()) {
+        let status_changed = status
+            .as_deref()
+            .is_some_and(|s| !s.is_empty() && last.as_deref() != Some(s));
+        let icons_changed = icons.len() != *last_icons_len;
+        if !status_changed && !icons_changed {
             return;
         }
-        *last = Some(status.clone());
+        if status_changed {
+            *last = status.clone();
+        }
+        *last_icons_len = icons.len();
+        let status_text = if status_changed {
+            status.unwrap_or_default()
+        } else {
+            String::new()
+        };
         if let Some(presenter) = ctx.progress {
             presenter.present(Presentation::ProgressUpdate {
                 id,
-                status: status.clone(),
-                icons: Vec::new(),
+                status: status_text.clone(),
+                icons: icons.to_vec(),
             });
         }
-        if let Some(tx) = ctx.stream_tx {
-            let _ = tx.send(Reply::Progress { id, status });
+        if status_changed && let Some(tx) = ctx.stream_tx {
+            let _ = tx.send(Reply::Progress {
+                id,
+                status: status_text,
+            });
         }
     };
     let stage_widget = |call: &Value,
@@ -3350,6 +3668,7 @@ async fn turn(
                         FailReason::AgentDown,
                         "The assistant exited in the middle of the request",
                     ),
+                    tool_icons: icon_tracker.into_icons(),
                     alive: false,
                     wedged: false,
                     broken: true,
@@ -3408,7 +3727,21 @@ async fn turn(
                                     tool: tracker.last_tool_name(),
                                 });
                             }
-                            if !policy.will_deny_update(&update) {
+                            if let Some((tag, detail)) = policy.denied_update_detail(&update) {
+                                // Auto-executed denied-tool abort guard: if the agent runs a
+                                // policy-denied tool without sending `session/request_permission`
+                                // (status `in_progress` / `completed`), cancel the turn at once.
+                                if matches!(
+                                    update.get("status").and_then(Value::as_str),
+                                    Some("in_progress" | "completed")
+                                ) {
+                                    tracing::warn!(
+                                        "request {id}: +{:.2} s aborted auto-executed denied {tag} call",
+                                        at()
+                                    );
+                                    break Err(TurnAbort::DeniedTool(detail));
+                                }
+                            } else {
                                 stage_widget(
                                     &update,
                                     &mut ui_calls,
@@ -3425,8 +3758,14 @@ async fn turn(
                                         &mut widgets,
                                     );
                                 }
+                                icon_tracker.observe_update(ctx.icons, &update);
                                 if !tracker.is_exempt_call(&update) {
-                                    emit_progress(&mut last_progress, acp::tool_progress(&update));
+                                    emit_progress(
+                                        &mut last_progress,
+                                        &mut last_emitted_icons_len,
+                                        acp::tool_progress(&update),
+                                        icon_tracker.icons(),
+                                    );
                                 }
                             }
                         }
@@ -3444,6 +3783,21 @@ async fn turn(
                                     count: tracker.repeat_streak(),
                                     tool: tracker.last_tool_name(),
                                 });
+                            }
+                            let is_denied_call = acp::tool_call_id(&update)
+                                .is_some_and(|tc_id| denied_call_ids.contains(tc_id));
+                            if !is_denied_call
+                                && let Some((tag, detail)) = policy.denied_update_detail(&update)
+                                && matches!(
+                                    update.get("status").and_then(Value::as_str),
+                                    Some("in_progress" | "completed")
+                                )
+                            {
+                                tracing::warn!(
+                                    "request {id}: +{:.2} s aborted auto-executed denied {tag} call",
+                                    at()
+                                );
+                                break Err(TurnAbort::DeniedTool(detail));
                             }
                             stage_widget(
                                 &update,
@@ -3469,8 +3823,16 @@ async fn turn(
                                 }
                                 _ => {}
                             }
-                            if !tracker.is_exempt_call(&update) {
-                                emit_progress(&mut last_progress, acp::tool_progress(&update));
+                            if !is_denied_call && !policy.will_deny_update(&update) {
+                                icon_tracker.observe_followup(ctx.icons, &update);
+                                if !tracker.is_exempt_call(&update) {
+                                    emit_progress(
+                                        &mut last_progress,
+                                        &mut last_emitted_icons_len,
+                                        acp::tool_progress(&update),
+                                        icon_tracker.icons(),
+                                    );
+                                }
                             }
                         }
                         _ => {}
@@ -3512,6 +3874,7 @@ async fn turn(
                     PermissionDecision::Deny { tag, detail } => {
                         tracing::info!("request {id}: +{:.2} s refused a {tag} call", at());
                         if let Some(tc_id) = params.get("toolCall").and_then(acp::tool_call_id) {
+                            denied_call_ids.insert(tc_id.to_string());
                             pending_widgets.remove(tc_id);
                             ui_calls.remove(tc_id);
                         }
@@ -3526,9 +3889,12 @@ async fn turn(
                         if let Some(tc) = params.get("toolCall") {
                             stage_widget(tc, &mut ui_calls, &mut pending_widgets, &mut widget_seq);
                         }
+                        icon_tracker.observe_permission(ctx.icons, params.get("toolCall"));
                         emit_progress(
                             &mut last_progress,
+                            &mut last_emitted_icons_len,
                             params.get("toolCall").and_then(acp::tool_progress),
+                            icon_tracker.icons(),
                         );
                         acp::permission_outcome(&params, &["allow_once", "allow_always"])
                     }
@@ -3608,10 +3974,18 @@ async fn turn(
                         true,
                     )
                 }
+                TurnAbort::DeniedTool(detail) => (
+                    FailReason::Denied,
+                    format!(
+                        "The assistant attempted a denied tool (`{detail}`) in a restricted lane and was stopped."
+                    ),
+                    true,
+                ),
                 TurnAbort::Cancelled(reason) => (reason, cancel_message(reason).to_string(), false),
             };
             return TurnEnd {
                 outcome: Outcome::failed(reason, message),
+                tool_icons: icon_tracker.into_icons(),
                 alive,
                 wedged,
                 broken: broken || wedged,
@@ -3633,6 +4007,7 @@ async fn turn(
         );
     }
 
+    let tool_icons = icon_tracker.into_icons();
     let stop = match result {
         Ok(Ok(result)) => result
             .get("stopReason")
@@ -3644,6 +4019,7 @@ async fn turn(
             let auth_required = is_auth_required(&e);
             return TurnEnd {
                 outcome: Outcome::failed(FailReason::AgentError, agent_error_message(&e)),
+                tool_icons,
                 alive: true,
                 wedged: false,
                 broken: true,
@@ -3656,6 +4032,7 @@ async fn turn(
                     FailReason::AgentDown,
                     "The assistant exited in the middle of the request",
                 ),
+                tool_icons,
                 alive: false,
                 wedged: false,
                 broken: true,
@@ -3674,6 +4051,7 @@ async fn turn(
             widgets,
             conversation_id: None,
             profile: None,
+            tool_icons: tool_icons.clone(),
         },
         _ if !denied.is_empty() => {
             let verb = if denied.len() == 1 { "is" } else { "are" };
@@ -3693,6 +4071,7 @@ async fn turn(
     };
     TurnEnd {
         outcome,
+        tool_icons,
         alive: true,
         wedged: false,
         broken: false,
@@ -3764,6 +4143,7 @@ pub async fn ask_once(
                 new: true,
                 profile,
                 background: false,
+                restricted: false,
                 suppress_token: None,
                 attachments: loaded,
                 source: InputSource::Cli,
@@ -3786,6 +4166,7 @@ pub async fn ask_once(
             widgets,
             conversation_id,
             profile,
+            tool_icons,
             ..
         } => Outcome::Answer {
             text,
@@ -3794,6 +4175,7 @@ pub async fn ask_once(
             widgets,
             conversation_id,
             profile,
+            tool_icons,
         },
         Reply::Failed {
             reason, message, ..
@@ -4170,6 +4552,7 @@ mod tests {
                     new: false,
                     profile: None,
                     background: false,
+                    restricted: false,
                     suppress_token: None,
                     attachments: vec![],
                     source: InputSource::Typed,
@@ -4191,6 +4574,7 @@ mod tests {
                     new: false,
                     profile: None,
                     background: true,
+                    restricted: false,
                     suppress_token: None,
                     attachments: vec![],
                     source: InputSource::Typed,
@@ -4209,6 +4593,7 @@ mod tests {
                     new: true,
                     profile: None,
                     background: true,
+                    restricted: false,
                     suppress_token: None,
                     attachments: vec![],
                     source: InputSource::Cli,
@@ -4227,6 +4612,7 @@ mod tests {
                     new: true,
                     profile: None,
                     background: true,
+                    restricted: false,
                     suppress_token: None,
                     attachments: vec![],
                     source: InputSource::Cli,

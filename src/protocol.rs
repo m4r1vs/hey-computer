@@ -98,6 +98,14 @@ pub enum DraftAction {
     Dismiss,
 }
 
+/// Release action sent back to SwayNC (or CLI) for a held desktop notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyReleaseAction {
+    ShowRaw,
+    ShowEnriched,
+}
+
 impl DraftAction {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -198,6 +206,36 @@ pub enum Request {
     ScheduleRun {
         target: String,
     },
+    /// Hold-and-enrich an incoming desktop notification (sent by SwayNC's
+    /// `hcHold.vala` or `hey-computer draft hold`). Streams `NotifyAccepted`
+    /// (when held) followed by `NotifyRelease`.
+    NotifyHold {
+        #[serde(default)]
+        noti_id: u32,
+        #[serde(default)]
+        replaces_id: u32,
+        app_name: String,
+        #[serde(default)]
+        desktop_entry: String,
+        #[serde(default)]
+        summary: String,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        category: String,
+        #[serde(default)]
+        urgency: String,
+        #[serde(default)]
+        has_default_action: bool,
+        #[serde(default)]
+        dnd: bool,
+    },
+    /// Atomically claim and resume a persisted notification draft checkpoint
+    /// by single-use resume token (or numeric `#id` / `id`).
+    DraftResume {
+        token: String,
+        action: DraftAction,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -244,6 +282,9 @@ pub enum Reply {
         /// Effective profile name (when non-default).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile: Option<String>,
+        /// Sequential Nerd Font tool/MCP icons collected during this turn.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tool_icons: Vec<String>,
     },
     Failed {
         id: u64,
@@ -270,6 +311,36 @@ pub enum Reply {
     },
     /// Generic acknowledgement for control requests (`schedule_reload`, `schedule_run`).
     Ok {
+        message: String,
+    },
+    /// Accepted a held desktop notification for restricted-lane enrichment.
+    NotifyAccepted {
+        max_hold_ms: u64,
+    },
+    /// Final release decision for a held desktop notification.
+    NotifyRelease {
+        action: NotifyReleaseAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_note: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        draft_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        readonly: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Result of resuming a persisted notification draft checkpoint.
+    DraftResumed {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<u64>,
+        action: DraftAction,
+        status: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         message: String,
     },
     Error {
@@ -480,6 +551,22 @@ mod tests {
             Request::ScheduleRun {
                 target: "ci-watch".to_string(),
             },
+            Request::NotifyHold {
+                noti_id: 42,
+                replaces_id: 0,
+                app_name: "Signal".to_string(),
+                desktop_entry: "signal".to_string(),
+                summary: "Alice".to_string(),
+                body: "Dinner at 7?".to_string(),
+                category: "im.received".to_string(),
+                urgency: "normal".to_string(),
+                has_default_action: true,
+                dnd: false,
+            },
+            Request::DraftResume {
+                token: "hc_d_0123456789abcdef0123456789abcdef".to_string(),
+                action: DraftAction::Copy,
+            },
         ] {
             let line = encode(&request);
             assert!(!line.contains('\n'));
@@ -517,6 +604,7 @@ mod tests {
                 widgets: vec![],
                 conversation_id: Some(3),
                 profile: None,
+                tool_icons: vec![],
             },
             Reply::Answer {
                 id: 4,
@@ -526,6 +614,7 @@ mod tests {
                 widgets: vec![],
                 conversation_id: None,
                 profile: Some("deep".to_string()),
+                tool_icons: vec!["\u{e8a4}".to_string()],
             },
             Reply::Failed {
                 id: 5,
@@ -557,6 +646,32 @@ mod tests {
             },
             Reply::SpeakStarted { id: 1_000_000_001 },
             Reply::SpeakFinished { id: 1_000_000_001 },
+            Reply::NotifyAccepted { max_hold_ms: 60000 },
+            Reply::NotifyRelease {
+                action: NotifyReleaseAction::ShowRaw,
+                turn_id: None,
+                token: None,
+                context_note: None,
+                draft_text: None,
+                readonly: None,
+                reason: Some("quiet_hours".to_string()),
+            },
+            Reply::NotifyRelease {
+                action: NotifyReleaseAction::ShowEnriched,
+                turn_id: Some(9),
+                token: Some("hc_d_abcdef".to_string()),
+                context_note: Some("Dinner invite".to_string()),
+                draft_text: Some("Sounds good!".to_string()),
+                readonly: Some(true),
+                reason: None,
+            },
+            Reply::DraftResumed {
+                id: 5,
+                turn_id: Some(9),
+                action: DraftAction::Copy,
+                status: "claimed".to_string(),
+                message: "copied".to_string(),
+            },
             Reply::Error {
                 message: "bad".to_string(),
             },
@@ -627,6 +742,56 @@ mod tests {
             );
             assert_eq!(DraftAction::parse(action.as_str()), Some(action));
         }
+
+        // Exact SwayNC hcHold.vala wire compatibility checks:
+        let swaync_hold = r#"{"type":"notify_hold","noti_id":7,"replaces_id":0,"app_name":"Signal","desktop_entry":"signal","summary":"Alice","body":"Ping","category":"im.received","urgency":"normal","has_default_action":true,"dnd":false}"#;
+        assert!(matches!(
+            serde_json::from_str::<Request>(swaync_hold).unwrap(),
+            Request::NotifyHold {
+                noti_id: 7,
+                has_default_action: true,
+                dnd: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            encode(&Reply::NotifyAccepted { max_hold_ms: 60000 }),
+            r#"{"type":"notify_accepted","max_hold_ms":60000}"#
+        );
+        assert_eq!(
+            encode(&Reply::NotifyRelease {
+                action: NotifyReleaseAction::ShowRaw,
+                turn_id: None,
+                token: None,
+                context_note: None,
+                draft_text: None,
+                readonly: None,
+                reason: None,
+            }),
+            r#"{"type":"notify_release","action":"show_raw"}"#
+        );
+        assert_eq!(
+            encode(&Reply::NotifyRelease {
+                action: NotifyReleaseAction::ShowEnriched,
+                turn_id: Some(42),
+                token: Some("hc_d_123".to_string()),
+                context_note: Some("Context".to_string()),
+                draft_text: Some("Draft".to_string()),
+                readonly: Some(true),
+                reason: None,
+            }),
+            r#"{"type":"notify_release","action":"show_enriched","turn_id":42,"token":"hc_d_123","context_note":"Context","draft_text":"Draft","readonly":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(
+                r#"{"type":"draft_resume","token":"hc_d_123","action":"copy"}"#
+            )
+            .unwrap(),
+            Request::DraftResume {
+                token: "hc_d_123".to_string(),
+                action: DraftAction::Copy,
+            }
+        );
     }
 
     #[test]
