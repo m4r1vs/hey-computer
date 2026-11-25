@@ -231,13 +231,18 @@ struct TmuxState {
     session: String,
     window: String,
     pane: String,
+    pane_path: Option<String>,
     pane_command: Option<String>,
     window_panes: Option<String>,
+    focused: bool,
 }
 
 impl DesktopState {
     fn is_empty(&self) -> bool {
-        self.workspace.is_none() && self.class.is_none() && self.title.is_none()
+        self.workspace.is_none()
+            && self.class.is_none()
+            && self.title.is_none()
+            && self.tmux.is_none()
     }
 }
 
@@ -280,30 +285,41 @@ fn format_block(time: Option<&str>, desktop: Option<&DesktopState>) -> Option<St
             {
                 lines.push(format!("active_window_cwd: {cwd}"));
             }
-            if let Some(tmux) = &desktop.tmux {
-                if let Some(session) = sanitize_field(&tmux.session, MAX_TMUX_FIELD_CHARS) {
-                    lines.push(format!("tmux_session: {session}"));
-                }
-                if let Some(window) = sanitize_field(&tmux.window, MAX_TMUX_FIELD_CHARS) {
-                    lines.push(format!("tmux_window: {window}"));
-                }
-                if let Some(pane) = sanitize_field(&tmux.pane, MAX_TMUX_FIELD_CHARS) {
-                    lines.push(format!("tmux_pane: {pane}"));
-                }
-                if let Some(cmd) = tmux
-                    .pane_command
+        }
+        if let Some(tmux) = &desktop.tmux {
+            if !tmux.focused {
+                lines.push("tmux_focused: false".to_string());
+            }
+            if let Some(session) = sanitize_field(&tmux.session, MAX_TMUX_FIELD_CHARS) {
+                lines.push(format!("tmux_session: {session}"));
+            }
+            if let Some(window) = sanitize_field(&tmux.window, MAX_TMUX_FIELD_CHARS) {
+                lines.push(format!("tmux_window: {window}"));
+            }
+            if let Some(pane) = sanitize_field(&tmux.pane, MAX_TMUX_FIELD_CHARS) {
+                lines.push(format!("tmux_pane: {pane}"));
+            }
+            if (!tmux.focused || desktop.cwd.is_none())
+                && let Some(path) = tmux
+                    .pane_path
                     .as_deref()
-                    .and_then(|s| sanitize_field(s, MAX_TMUX_FIELD_CHARS))
-                {
-                    lines.push(format!("tmux_pane_command: {cmd}"));
-                }
-                if let Some(panes) = tmux
-                    .window_panes
-                    .as_deref()
-                    .and_then(|s| sanitize_field(s, MAX_TMUX_PANES_CHARS))
-                {
-                    lines.push(format!("tmux_window_panes: {panes}"));
-                }
+                    .and_then(|s| sanitize_field(s, MAX_CWD_CHARS))
+            {
+                lines.push(format!("tmux_pane_path: {path}"));
+            }
+            if let Some(cmd) = tmux
+                .pane_command
+                .as_deref()
+                .and_then(|s| sanitize_field(s, MAX_TMUX_FIELD_CHARS))
+            {
+                lines.push(format!("tmux_pane_command: {cmd}"));
+            }
+            if let Some(panes) = tmux
+                .window_panes
+                .as_deref()
+                .and_then(|s| sanitize_field(s, MAX_TMUX_PANES_CHARS))
+            {
+                lines.push(format!("tmux_window_panes: {panes}"));
             }
         }
     }
@@ -509,27 +525,31 @@ async fn run_program(program: &str, args: &[&str]) -> RunResult {
 async fn query_desktop_inner(hyprctl: &str, tmux: &str, proc_root: &Path) -> Option<DesktopState> {
     let mut instance: Option<String> = None;
     let raw = match run_program(hyprctl, &["-j", "activewindow"]).await {
-        RunResult::Ok(bytes) => bytes,
-        RunResult::NotFound => return None,
+        RunResult::Ok(bytes) => Some(bytes),
+        RunResult::NotFound => None,
         RunResult::Failed => {
             // HYPRLAND_INSTANCE_SIGNATURE may be stale or missing; find the
             // live instance and retry once.
-            let RunResult::Ok(instances) = run_program(hyprctl, &["instances", "-j"]).await else {
-                return None;
-            };
-            let sig = pick_instance(&instances, std::env::var("WAYLAND_DISPLAY").ok().as_deref())?;
-            let RunResult::Ok(bytes) =
-                run_program(hyprctl, &["--instance", &sig, "-j", "activewindow"]).await
-            else {
-                return None;
-            };
-            instance = Some(sig);
-            bytes
+            if let RunResult::Ok(instances) = run_program(hyprctl, &["instances", "-j"]).await
+                && let Some(sig) =
+                    pick_instance(&instances, std::env::var("WAYLAND_DISPLAY").ok().as_deref())
+                && let RunResult::Ok(bytes) =
+                    run_program(hyprctl, &["--instance", &sig, "-j", "activewindow"]).await
+            {
+                instance = Some(sig);
+                Some(bytes)
+            } else {
+                None
+            }
         }
     };
 
-    let mut state = parse_active_window(&raw)?;
-    if state.is_empty() {
+    let mut state = raw
+        .as_deref()
+        .and_then(parse_active_window)
+        .unwrap_or_default();
+
+    if raw.is_some() && state.is_empty() {
         let ws_raw = match instance.as_deref() {
             Some(sig) => run_program(hyprctl, &["--instance", sig, "-j", "activeworkspace"]).await,
             None => run_program(hyprctl, &["-j", "activeworkspace"]).await,
@@ -537,12 +557,16 @@ async fn query_desktop_inner(hyprctl: &str, tmux: &str, proc_root: &Path) -> Opt
         if let RunResult::Ok(bytes) = ws_raw {
             state.workspace = parse_active_workspace(&bytes);
         }
-    } else if let (Some(pid), Some(class)) = (state.pid, state.class.as_deref()) {
+    }
+
+    let mut descendants: Option<Vec<Descendant>> = None;
+    let mut focused_term_pids: Option<HashSet<u32>> = None;
+    if let (Some(pid), Some(class)) = (state.pid, state.class.as_deref()) {
         let is_term = is_terminal_class(class);
         let is_ed = is_editor_class(class);
         if is_term || is_ed {
             let proc_root_owned = proc_root.to_path_buf();
-            let descendants =
+            let list =
                 tokio::task::spawn_blocking(move || collect_descendants(&proc_root_owned, pid))
                     .await
                     .unwrap_or_else(|_| {
@@ -552,34 +576,39 @@ async fn query_desktop_inner(hyprctl: &str, tmux: &str, proc_root: &Path) -> Opt
                             surface_pid: pid,
                         }]
                     });
-
-            let mut unfocused_tmux_roots = HashSet::new();
             if is_term {
-                let pid_set: HashSet<u32> = descendants.iter().map(|d| d.pid).collect();
-                let (matched_tmux, unfocused) = query_tmux(tmux, &pid_set).await;
-                unfocused_tmux_roots = unfocused;
-                if let Some((cwd, tmux_state)) = matched_tmux {
-                    state.cwd = cwd;
-                    state.tmux = Some(tmux_state);
-                }
+                focused_term_pids = Some(list.iter().map(|d| d.pid).collect());
             }
-            if state.cwd.is_none() {
-                let proc_root_owned = proc_root.to_path_buf();
-                let win_title = state.title.clone();
-                state.cwd = tokio::task::spawn_blocking(move || {
-                    resolve_cwd(
-                        &proc_root_owned,
-                        &descendants,
-                        &unfocused_tmux_roots,
-                        win_title.as_deref(),
-                    )
-                })
-                .await
-                .ok()
-                .flatten();
-            }
+            descendants = Some(list);
         }
     }
+
+    let (matched_tmux, unfocused_tmux_roots) = query_tmux(tmux, focused_term_pids.as_ref()).await;
+    if let Some(tmux_state) = matched_tmux {
+        if tmux_state.focused {
+            state.cwd = tmux_state.pane_path.clone();
+        }
+        state.tmux = Some(tmux_state);
+    }
+
+    if state.cwd.is_none()
+        && let Some(descendants) = descendants
+    {
+        let proc_root_owned = proc_root.to_path_buf();
+        let win_title = state.title.clone();
+        state.cwd = tokio::task::spawn_blocking(move || {
+            resolve_cwd(
+                &proc_root_owned,
+                &descendants,
+                &unfocused_tmux_roots,
+                win_title.as_deref(),
+            )
+        })
+        .await
+        .ok()
+        .flatten();
+    }
+
     (!state.is_empty()).then_some(state)
 }
 
@@ -812,23 +841,21 @@ fn resolve_cwd(
 
 async fn query_tmux(
     tmux: &str,
-    pids: &HashSet<u32>,
-) -> (Option<(Option<String>, TmuxState)>, HashSet<u32>) {
+    focused_pids: Option<&HashSet<u32>>,
+) -> (Option<TmuxState>, HashSet<u32>) {
     const CLIENT_FMT: &str = "#{client_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_current_path}\t#{pane_current_command}\t#{client_flags}\t#{client_termfeatures}\t#{client_activity}";
     let mut unfocused_pids = HashSet::new();
     let RunResult::Ok(raw) = run_program(tmux, &["list-clients", "-F", CLIENT_FMT]).await else {
         return (None, unfocused_pids);
     };
     let text = String::from_utf8_lossy(&raw);
-    let mut best: Option<((bool, u64), Option<String>, TmuxState)> = None;
+    let mut focused_best: Option<((bool, u64), TmuxState)> = None;
+    let mut fallback_best: Option<((bool, u64), TmuxState)> = None;
     for line in text.lines() {
         let mut fields = line.split('\t');
         let Some(client_pid) = fields.next().and_then(|s| s.trim().parse::<u32>().ok()) else {
             continue;
         };
-        if !pids.contains(&client_pid) {
-            continue;
-        }
         let session = fields.next().unwrap_or("").trim().to_string();
         let win_idx = fields.next().unwrap_or("").trim();
         let win_name = fields.next().unwrap_or("").trim();
@@ -846,34 +873,48 @@ async fn query_tmux(
         }
         let has_focus_events = termfeatures.split(',').any(|f| f == "focus");
         let is_focused = flags.split(',').any(|f| f == "focused");
-        // Single-PID terminals (Ghostty, Kitty, WezTerm, Foot) report `focus`
-        // in `client_termfeatures`; an unfocused client belongs to a different
-        // window/tab than the currently focused one.
-        if has_focus_events && !is_focused {
-            unfocused_pids.insert(client_pid);
-            continue;
-        }
         let window = if win_name.is_empty() {
             win_idx.to_string()
         } else {
             format!("{win_idx}:{win_name}")
         };
-        let cwd = (!path.is_empty()).then(|| path.to_string());
+        let pane_path = (!path.is_empty()).then(|| path.to_string());
         let pane_command = (!cmd.is_empty()).then(|| cmd.to_string());
         let priority = (is_focused, activity);
         let state = TmuxState {
             session,
             window,
             pane,
+            pane_path,
             pane_command,
             window_panes: None,
+            focused: false,
         };
-        if best.as_ref().is_none_or(|(p, _, _)| priority > *p) {
-            best = Some((priority, cwd, state));
+
+        if fallback_best.as_ref().is_none_or(|(p, _)| priority > *p) {
+            fallback_best = Some((priority, state.clone()));
+        }
+
+        if focused_pids.is_some_and(|pids| pids.contains(&client_pid)) {
+            // Single-PID terminals (Ghostty, Kitty, WezTerm, Foot) report `focus`
+            // in `client_termfeatures`; an unfocused client belongs to a different
+            // window/tab than the currently focused one and must not claim
+            // `active_window_cwd`, though it remains eligible as background tmux context.
+            if has_focus_events && !is_focused {
+                unfocused_pids.insert(client_pid);
+                continue;
+            }
+            let mut focused_state = state;
+            focused_state.focused = true;
+            if focused_best.as_ref().is_none_or(|(p, _)| priority > *p) {
+                focused_best = Some((priority, focused_state));
+            }
         }
     }
-    let Some((_, cwd, mut state)) = best else {
-        return (None, unfocused_pids);
+    let Some((_, mut state)) = focused_best.or(fallback_best) else {
+        // Server is running (`list-clients` succeeded) with no attached clients;
+        // fall back to the most recently active detached session.
+        return (query_tmux_detached(tmux).await, unfocused_pids);
     };
     if is_valid_pane_id(&state.pane) {
         const PANE_FMT: &str = "#{pane_id}\t#{pane_active}\t#{pane_current_command}";
@@ -883,12 +924,115 @@ async fn query_tmux(
             state.window_panes = format_tmux_panes(&String::from_utf8_lossy(&panes_raw));
         }
     }
-    (Some((cwd, state)), unfocused_pids)
+    (Some(state), unfocused_pids)
+}
+
+async fn query_tmux_detached(tmux: &str) -> Option<TmuxState> {
+    const ALL_PANES_FMT: &str = "#{session_activity}\t#{session_name}\t#{window_active}\t#{window_index}\t#{window_name}\t#{pane_active}\t#{pane_id}\t#{pane_current_path}\t#{pane_current_command}";
+    let RunResult::Ok(raw) = run_program(tmux, &["list-panes", "-a", "-F", ALL_PANES_FMT]).await
+    else {
+        return None;
+    };
+    struct PaneRow {
+        session_activity: u64,
+        session: String,
+        window_active: bool,
+        win_idx: String,
+        win_name: String,
+        pane_active: bool,
+        pane_id: String,
+        path: Option<String>,
+        cmd: Option<String>,
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split('\t');
+        let session_activity = fields
+            .next()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let session = fields.next().unwrap_or("").trim().to_string();
+        let window_active = fields.next().unwrap_or("").trim() == "1";
+        let win_idx = fields.next().unwrap_or("").trim().to_string();
+        let win_name = fields.next().unwrap_or("").trim().to_string();
+        let pane_active = fields.next().unwrap_or("").trim() == "1";
+        let pane_id = fields.next().unwrap_or("").trim().to_string();
+        let path = fields.next().unwrap_or("").trim();
+        let cmd = fields.next().unwrap_or("").trim();
+        if session.is_empty() || pane_id.is_empty() {
+            continue;
+        }
+        rows.push(PaneRow {
+            session_activity,
+            session,
+            window_active,
+            win_idx,
+            win_name,
+            pane_active,
+            pane_id,
+            path: (!path.is_empty()).then(|| path.to_string()),
+            cmd: (!cmd.is_empty()).then(|| cmd.to_string()),
+        });
+    }
+    let best_idx = rows
+        .iter()
+        .enumerate()
+        .max_by_key(|(idx, r)| {
+            (
+                r.window_active && r.pane_active,
+                r.session_activity,
+                std::cmp::Reverse(*idx),
+            )
+        })
+        .map(|(idx, _)| idx)?;
+    let best = &rows[best_idx];
+    let window = if best.win_name.is_empty() {
+        best.win_idx.clone()
+    } else {
+        format!("{}:{}", best.win_idx, best.win_name)
+    };
+    let sibling_entries: Vec<String> = rows
+        .iter()
+        .filter(|r| r.session == best.session && r.win_idx == best.win_idx)
+        .map(|r| format_pane_entry(&r.pane_id, r.pane_active, r.cmd.as_deref().unwrap_or("")))
+        .collect();
+    Some(TmuxState {
+        session: best.session.clone(),
+        window,
+        pane: best.pane_id.clone(),
+        pane_path: best.path.clone(),
+        pane_command: best.cmd.clone(),
+        window_panes: join_tmux_pane_entries(sibling_entries),
+        focused: false,
+    })
 }
 
 fn is_valid_pane_id(pane: &str) -> bool {
     pane.strip_prefix('%')
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn format_pane_entry(id: &str, active: bool, cmd: &str) -> String {
+    let mark = if active { "*" } else { "" };
+    if cmd.is_empty() {
+        format!("{id}{mark}")
+    } else {
+        format!("{id}{mark}({cmd})")
+    }
+}
+
+fn join_tmux_pane_entries(entries: Vec<String>) -> Option<String> {
+    if entries.len() <= 1 {
+        return None;
+    }
+    let total = entries.len();
+    let shown: Vec<String> = entries.into_iter().take(MAX_TMUX_PANES).collect();
+    let mut out = shown.join(", ");
+    if total > MAX_TMUX_PANES {
+        out.push_str(&format!(", +{} more", total - MAX_TMUX_PANES));
+    }
+    Some(out)
 }
 
 fn format_tmux_panes(raw: &str) -> Option<String> {
@@ -901,24 +1045,9 @@ fn format_tmux_panes(raw: &str) -> Option<String> {
         if id.is_empty() {
             continue;
         }
-        let mark = if active { "*" } else { "" };
-        let label = if cmd.is_empty() {
-            format!("{id}{mark}")
-        } else {
-            format!("{id}{mark}({cmd})")
-        };
-        entries.push(label);
+        entries.push(format_pane_entry(id, active, cmd));
     }
-    if entries.len() <= 1 {
-        return None;
-    }
-    let total = entries.len();
-    let shown: Vec<String> = entries.into_iter().take(MAX_TMUX_PANES).collect();
-    let mut out = shown.join(", ");
-    if total > MAX_TMUX_PANES {
-        out.push_str(&format!(", +{} more", total - MAX_TMUX_PANES));
-    }
-    Some(out)
+    join_tmux_pane_entries(entries)
 }
 
 fn pick_instance(raw: &[u8], wayland_display: Option<&str>) -> Option<String> {
@@ -1125,8 +1254,10 @@ mod tests {
                 session: "dev".to_string(),
                 window: "1:code".to_string(),
                 pane: "%3".to_string(),
+                pane_path: Some("/home/alice/project".to_string()),
                 pane_command: Some("nvim".to_string()),
                 window_panes: Some("%3*(nvim), %4(zsh)".to_string()),
+                focused: true,
             }),
         };
         let block = format_block(None, Some(&with_tmux)).unwrap();
@@ -1134,12 +1265,37 @@ mod tests {
             block.contains("active_window_cwd: /home/alice/project\n"),
             "{block}"
         );
+        assert!(!block.contains("tmux_focused:"), "{block}");
+        assert!(!block.contains("tmux_pane_path:"), "{block}");
         assert!(block.contains("tmux_session: dev\n"), "{block}");
         assert!(block.contains("tmux_window: 1:code\n"), "{block}");
         assert!(block.contains("tmux_pane: %3\n"), "{block}");
         assert!(block.contains("tmux_pane_command: nvim\n"), "{block}");
         assert!(
             block.contains("tmux_window_panes: %3*(nvim), %4(zsh)\n"),
+            "{block}"
+        );
+
+        let bg_tmux_empty_ws = DesktopState {
+            workspace: Some("4".to_string()),
+            tmux: Some(TmuxState {
+                session: "dev".to_string(),
+                window: "1:code".to_string(),
+                pane: "%3".to_string(),
+                pane_path: Some("/home/alice/project".to_string()),
+                pane_command: Some("nvim".to_string()),
+                window_panes: None,
+                focused: false,
+            }),
+            ..DesktopState::default()
+        };
+        let block = format_block(None, Some(&bg_tmux_empty_ws)).unwrap();
+        assert!(block.contains("active_workspace: 4\n"), "{block}");
+        assert!(block.contains("active_window: none\n"), "{block}");
+        assert!(block.contains("tmux_focused: false\n"), "{block}");
+        assert!(block.contains("tmux_session: dev\n"), "{block}");
+        assert!(
+            block.contains("tmux_pane_path: /home/alice/project\n"),
             "{block}"
         );
 
@@ -1193,8 +1349,8 @@ mod tests {
             r#"
 case "$1" in
   list-clients)
-    printf '999\tother\t0\tshell\t%%1\t/tmp\tbash\n'
-    printf '102\tdev\t2\teditor\t%%7\t/home/alice/repo\tnvim\n'
+    printf '999\tother\t0\tshell\t%%1\t/tmp\tbash\tattached\t\t1700000001\n'
+    printf '102\tdev\t2\teditor\t%%7\t/home/alice/repo\tnvim\tattached\t\t1700000050\n'
     ;;
   list-panes)
     printf '%%7\t1\tnvim\n%%8\t0\tcargo\n'
@@ -1207,9 +1363,11 @@ esac
             .unwrap();
         assert_eq!(state.cwd.as_deref(), Some("/home/alice/repo"));
         let tm = state.tmux.expect("tmux matched");
+        assert!(tm.focused);
         assert_eq!(tm.session, "dev");
         assert_eq!(tm.window, "2:editor");
         assert_eq!(tm.pane, "%7");
+        assert_eq!(tm.pane_path.as_deref(), Some("/home/alice/repo"));
         assert_eq!(tm.pane_command.as_deref(), Some("nvim"));
         assert_eq!(tm.window_panes.as_deref(), Some("%7*(nvim), %8(cargo)"));
 
@@ -1228,7 +1386,8 @@ esac
             Some(work_b.to_string_lossy().as_ref())
         );
 
-        // 3. Non-terminal/editor (firefox) skips cwd & tmux lookup.
+        // 3. Non-terminal/editor (firefox) skips window cwd lookup, but STILL
+        //    exposes the most recently active tmux client as background context.
         let hypr_ff = write_script(
             &dir,
             "hypr-ff",
@@ -1238,11 +1397,28 @@ esac
             .await
             .unwrap();
         assert!(state.cwd.is_none());
-        assert!(state.tmux.is_none());
+        let tm = state.tmux.as_ref().expect("tmux available from firefox");
+        assert!(!tm.focused);
+        assert_eq!(tm.session, "dev");
+        assert_eq!(tm.pane, "%7");
+        assert_eq!(tm.pane_path.as_deref(), Some("/home/alice/repo"));
+        assert_eq!(tm.window_panes.as_deref(), Some("%7*(nvim), %8(cargo)"));
+        let ff_block = format_block(None, Some(&state)).unwrap();
+        assert!(
+            ff_block.contains("active_window_class: firefox\n"),
+            "{ff_block}"
+        );
+        assert!(!ff_block.contains("active_window_cwd:"), "{ff_block}");
+        assert!(ff_block.contains("tmux_focused: false\n"), "{ff_block}");
+        assert!(
+            ff_block.contains("tmux_pane_path: /home/alice/repo\n"),
+            "{ff_block}"
+        );
 
         // 4. Multi-window single-PID Ghostty: unfocused `focus`-capable tmux
-        //    client on surface 101 must NOT bleed into focused plain-shell
-        //    surface 103 (whose window title matches `work-c`).
+        //    client on surface 101 must NOT overwrite focused plain-shell
+        //    `active_window_cwd` (`work-c`), while remaining available as
+        //    unfocused background tmux context.
         let work_c = dir.join("work-c");
         std::fs::create_dir_all(&work_c).unwrap();
         make_proc(103, 100, "zsh", &work_c);
@@ -1270,14 +1446,67 @@ esac
         )
         .await
         .unwrap();
-        assert!(
-            state.tmux.is_none(),
-            "unfocused Ghostty tmux client bled across windows: {:?}",
-            state.tmux
-        );
         assert_eq!(
             state.cwd.as_deref(),
             Some(work_c.to_string_lossy().as_ref())
+        );
+        let tm = state.tmux.expect("unfocused tmux still exposed");
+        assert!(!tm.focused);
+        assert_eq!(tm.session, "dev");
+        assert_eq!(tm.pane_path.as_deref(), Some("/home/alice/repo"));
+
+        // 5. Detached tmux sessions (empty `list-clients` output) fall back to
+        //    `list-panes -a` and pick the most recently active session's active pane.
+        let tmux_detached = write_script(
+            &dir,
+            "tmux-detached",
+            r#"
+case "$1" in
+  list-clients)
+    exit 0
+    ;;
+  list-panes)
+    printf '1700000010\told\t1\t0\tshell\t1\t%%1\t/tmp\tbash\n'
+    printf '1700000090\twork\t1\t1\tcode\t1\t%%5\t/home/alice/work\tnvim\n'
+    printf '1700000090\twork\t1\t1\tcode\t0\t%%6\t/home/alice/work\tcargo\n'
+    printf '1700000090\twork\t0\t2\tlogs\t1\t%%9\t/var/log\ttail\n'
+    ;;
+esac
+"#,
+        );
+        let state =
+            query_desktop_with(&hypr_ff, &tmux_detached, &proc_root, Duration::from_secs(2))
+                .await
+                .unwrap();
+        let tm = state.tmux.expect("detached tmux session discovered");
+        assert!(!tm.focused);
+        assert_eq!(tm.session, "work");
+        assert_eq!(tm.window, "1:code");
+        assert_eq!(tm.pane, "%5");
+        assert_eq!(tm.pane_path.as_deref(), Some("/home/alice/work"));
+        assert_eq!(tm.pane_command.as_deref(), Some("nvim"));
+        assert_eq!(tm.window_panes.as_deref(), Some("%5*(nvim), %6(cargo)"));
+
+        // 6. Missing hyprctl still exposes running tmux context.
+        let state = query_desktop_with(
+            "/nonexistent/hyprctl",
+            &tmux,
+            &proc_root,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(state.workspace.is_none());
+        assert!(state.class.is_none());
+        let tm = state.tmux.as_ref().expect("tmux works without hyprctl");
+        assert!(!tm.focused);
+        assert_eq!(tm.session, "dev");
+        let block = format_block(None, Some(&state)).unwrap();
+        assert!(block.contains("tmux_focused: false\n"), "{block}");
+        assert!(block.contains("tmux_session: dev\n"), "{block}");
+        assert!(
+            block.contains("tmux_pane_path: /home/alice/repo\n"),
+            "{block}"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();

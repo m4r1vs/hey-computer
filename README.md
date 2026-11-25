@@ -500,7 +500,7 @@ told about Obsidian.
 | `openhue.enable` | false | puts `openhue` on the agent's PATH and links the bundled `openhue` skill |
 | `openhue.package` | `pkgs.openhue-cli` | the openhue CLI package |
 | `recall.enable` | true | links the bundled `recall` skill (uses `hey-computer recall` from the agent's PATH) |
-| `tmux.enable` | true | puts `tmux` on the daemon/agent PATH (for `context.desktop` Ghostty/terminal context) and links the bundled `tmux` skill |
+| `tmux.enable` | true | puts `tmux` on the daemon/agent PATH (for `context.desktop` live tmux context) and links the bundled `tmux` skill |
 | `tmux.package` | `pkgs.tmux` | the tmux package |
 | `schedule.enable` | true | links the bundled `schedule` skill (uses `hey-computer schedule` from the agent's PATH) |
 | `mcp.servers` | `{}` | MCP server definitions written to `config/mcp_config.json` and gated per profile; `{ file = "/abs/path"; }` entries in `env` or `headers` are lowered into `env_files` / `header_files` so secrets stay out of `/nix/store` |

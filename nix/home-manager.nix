@@ -366,7 +366,7 @@ in {
         default = true;
         description = ''
           Put `tmux` on the daemon/agent PATH (used by `context.desktop` for
-          Ghostty/terminal ambient context) and link the bundled `tmux` skill
+          live tmux ambient context) and link the bundled `tmux` skill
           when {option}`skills.enable` is set.
         '';
       };

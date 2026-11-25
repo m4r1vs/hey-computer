@@ -5,7 +5,7 @@ description: Inspects live tmux sessions, windows, panes, and scrollback read-on
 
 # tmux Inspection (Read-Only)
 
-When ambient `<untrusted_desktop_context>` includes `tmux_session`, `tmux_window`, `tmux_pane`, `tmux_window_panes`, or `active_window_cwd`, use those values directly instead of guessing.
+When ambient `<untrusted_desktop_context>` includes `tmux_session`, `tmux_window`, `tmux_pane`, `tmux_pane_path`, `tmux_window_panes`, or `active_window_cwd`, use those values directly instead of guessing. Live `tmux` metadata is included whenever a `tmux` server has a session, even when a non-terminal window is focused (`tmux_focused: false` indicates the focused desktop window is not that tmux client).
 
 ## Commands
 
@@ -29,7 +29,7 @@ wc -c "$out"
 
 When a pane runs `nvim`, `vim`, `hx`, or another editor:
 
-1. Check `active_window_cwd` (or `#{pane_current_path}` from `tmux list-panes`) and capture the visible pane (`tmux capture-pane -p -t "$PANE_ID"`) to identify the file path and cursor/line context from the buffer statusline, tabline, or visible snippet.
+1. Check `tmux_pane_path` / `active_window_cwd` (or `#{pane_current_path}` from `tmux list-panes`) and capture the visible pane (`tmux capture-pane -p -t "$PANE_ID"`) to identify the file path and cursor/line context from the buffer statusline, tabline, or visible snippet.
 2. Read the complete file directly from disk with `read_file` (or search the project with `rg`) rather than relying on partial terminal text or screenshots.
 
 ## Rules

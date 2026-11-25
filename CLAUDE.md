@@ -84,9 +84,10 @@ socket; every other subcommand is a client.
   automatically refreshed when idle outside follow-up windows if memory files change).
   Rewritten before every agent start.
 - `context`: opt-in per-turn ambient time (`localtime_r`), Hyprland active
-  window/workspace, focused terminal/editor `/proc` CWD, and focus-aware Ghostty/terminal
-  `tmux` session/window/pane metadata prepended inside `<untrusted_desktop_context>`,
-  plus authoritative per-turn `<budget>` headers.
+  window/workspace, focused terminal/editor `/proc` CWD, and live `tmux`
+  session/window/pane metadata (always included when a tmux session exists,
+  preferring the focused terminal client) prepended inside
+  `<untrusted_desktop_context>`, plus authoritative per-turn `<budget>` headers.
 - `store`: private `0600` SQLite WAL + FTS5 database at
   `<state_dir>/history.db` (schema v3 with `turns` + `schedules` including
   declarative `managed` jobs, `PRAGMA secure_delete = ON`, automatic FTS5/SQLite
