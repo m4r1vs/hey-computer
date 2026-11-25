@@ -884,6 +884,12 @@ in {
       source = bridgeConfigFile;
     };
 
+    home.activation.heyComputerMessengerBridgeStateDir = mkIf cfg.messengerBridge.enable (
+      lib.hm.dag.entryAfter ["writeBoundary"] ''
+        run install -d -m 700 ${lib.escapeShellArg cfg.messengerBridge.stateDir}
+      ''
+    );
+
     systemd.user.services.hey-computer = mkIf cfg.service.enable {
       Unit = {
         Description = "hey-computer voice assistant";
@@ -918,7 +924,7 @@ in {
         X-Restart-Triggers = ["${bridgeConfigFile}"];
       };
       Service = {
-        ExecStart = "${lib.getExe cfg.messengerBridge.package} daemon";
+        ExecStart = "${lib.getExe cfg.messengerBridge.package} --config ${bridgeConfigFile} daemon";
         Restart = "on-failure";
         RestartSec = 5;
         UMask = "0077";
@@ -926,10 +932,10 @@ in {
         PrivateTmp = true;
         ProtectSystem = "strict";
         ProtectHome = "tmpfs";
-        BindPaths = [cfg.messengerBridge.stateDir];
-        BindReadOnlyPaths =
-          ["${config.xdg.configHome}/hey-computer/bridge.toml"]
-          ++ cfg.messengerBridge.extraBindReadOnlyPaths;
+        BindPaths = ["-${cfg.messengerBridge.stateDir}" "%t"];
+        BindReadOnlyPaths = mkIf (cfg.messengerBridge.extraBindReadOnlyPaths != []) (
+          map (p: "-${p}") cfg.messengerBridge.extraBindReadOnlyPaths
+        );
       };
       Install.WantedBy = ["graphical-session.target"];
     };
