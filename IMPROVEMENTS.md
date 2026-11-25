@@ -104,13 +104,15 @@ tooling are mature.
 
     *Implementation notes from codebase review:*
     - Namespace `$XDG_RUNTIME_DIR/hey-computer/` viewer/answer Markdown files per
-      instance (`daemon.rs`, `main.rs`) so `work` and `personal` answer files do
-      not collide or prune each other.
+      instance (`daemon.rs`, `present.rs`, `main.rs`) and pass instance-aware
+      `--socket` / `--state-dir` to `hey-computer-viewer` so `work` and
+      `personal` windows, follow-ups, and answer files never collide or prune
+      each other.
     - Export `HEY_COMPUTER_SOCKET` and `HEY_COMPUTER_CONFIG` alongside
       `HEY_COMPUTER_STATE_DIR` in `acp.rs` and `scheduler.rs` so
-      `hey-computer schedule|recall|tasks` invoked by skills inside
-      `hey-computer@work` vs `hey-computer@personal` hit the matching daemon
-      socket and config.
+      `hey-computer schedule|recall|tasks|distill|speak|view` invoked by skills
+      or jobs inside `hey-computer@work` vs `hey-computer@personal` hit the
+      matching daemon socket and config.
     - Splitting stdio MCP servers across `work` (`gitlab`, `linear`, `slack`,
       work Calendar/Drive) and `personal` (`gmail`, personal
       Calendar/Contacts/Drive/Tasks, `gh`, `openhue`) will also roughly halve
@@ -140,8 +142,8 @@ tooling are mature.
       `"fetch"` and `"search"` tool kinds—in addition to
       `["execute", "edit", "delete", "move"]` + `mcp`—so untrusted incoming
       notification or message text cannot combine `read_file` with web fetch to
-      exfiltrate local files; also expose `restricted` in `LaneFilter` in
-      `src/main.rs`.)*
+      exfiltrate local files; `LaneFilter::Restricted` in `src/main.rs` is
+      already wired as of `69fd4ea`.)*
     - **Cost and noise.** A cheap filter decides first whether a message
       deserves a model at all (sender allowlist, group chats off, quiet hours),
       with `HEARTBEAT_OK`-style suppression (#17) and a rate limit.
@@ -223,33 +225,41 @@ tooling are mature.
   audio stays local until the hotword fires; a visible mic indicator (Waybar); a
   mute toggle; pausing while another app has the mic (calls) or while media is
   playing, to avoid false triggers; and **barge-in** interrupting active TTS
-  playback (#32) immediately once speaking/wake-word fires (gated via PipeWire
-  `module-echo-cancel` / headphones or wake-word-only detection while TTS plays
-  to avoid speaker self-triggers). Measure the false-accept rate on real speech
-  in both languages before trusting it.
+  playback (#32) immediately once speaking/wake-word fires by calling
+  `hey-computer cancel` / `quiet-speech` (post-turn TTS cancellation and
+  push-to-talk key-down silence are already wired in `e5decb7` and `NixConfig
+  4a170cd`; hotword barge-in should be gated via PipeWire `module-echo-cancel` /
+  headphones or wake-word-only detection while TTS plays to avoid speaker
+  self-triggers). Measure the false-accept rate on real speech in both languages
+  before trusting it.
 
 ## Done
 
-- `[Important]` `[Upstream]` `[Done: e5decb7, 69fd4ea, 0cb1a36, aeb64fc]` **GTK4 + WebKitGTK 6.0 answer viewer
-  (`hey-computer-viewer`), `mcp-ui` widgets & template skills, `hey-computer
-  distill`, & voice-matched DE/EN streaming TTS (#29, #30, #31, #32).**
-  Promoted the `poc/viewer` prototype into the production `hey-computer-viewer`
-  binary (`application_id = "hey-computer.answer"`, `NON_UNIQUE`, `hc://`
-  disarmed asset scheme, Flexoki dual-theme `syntect`/`two-face` code blocks with
-  inline `▶ Run`, `pulldown-latex` MathML Core, Morning Brief auto drop-caps,
-  `Info` (`i`) toggle, `inert`-hardened SQLite FTS5 Recall drawer (`h`),
-  local-date Vault Journal save (`v`), and live `~/.theme/{mode,palette.json}`
-  `inotify` sync) and removed Marker and `poc/viewer/`. Bumped `history.db` to
-  schema v4 (`widgets_json`, `origin`, `schedule_id`), added `reply_to` live/DB
-  session resumption and `stream: true` socket streaming, added internal stdio
+- `[Important]` `[Upstream + Config]` `[Done: e5decb7, 69fd4ea, 0cb1a36, aeb64fc, 3761c65, NixConfig b8b4d27, 4a170cd]`
+  **GTK4 + WebKitGTK 6.0 answer viewer (`hey-computer-viewer`), `mcp-ui` widgets
+  & template skills, `hey-computer distill`, & voice-matched DE/EN streaming TTS
+  (#29, #30, #31, #32).** Promoted the `poc/viewer` prototype into the
+  production `hey-computer-viewer` binary (`application_id =
+  "hey-computer.answer"`, `NON_UNIQUE`, `hc://` disarmed asset scheme, Flexoki
+  dual-theme `syntect`/`two-face` code blocks with inline `▶ Run`,
+  `pulldown-latex` MathML Core, Morning Brief auto drop-caps, `Info` (`i`)
+  toggle, `inert`-hardened SQLite FTS5 Recall drawer (`h`), local-date Vault
+  Journal save (`v`), and live `~/.theme/{mode,palette.json}` `inotify` sync)
+  and removed Marker and `poc/viewer/`. Bumped `history.db` to schema v4
+  (`widgets_json`, `origin`, `schedule_id`), added `reply_to` live/DB session
+  resumption and `stream: true` socket streaming, added internal stdio
   `hey-computer mcp-ui` (`show_widget` and `propose_widget_template` with
   user-skill linking + idle reload), added `hey-computer distill` with two-tier
-  read-only + mutable `memory_files` budgeting and scheduled-turn exclusion,
-  added short-answer `Copy`/`Reply`/`Open` notifications with `--replace-id` and
-  LRU waiter eviction, and added `[present.speak]` / `hey-computer speak`
-  (`programs.hey-computer.speak`) with voice-only modality matching, widget
-  restraint on voice queries, sentence-streamed DE/EN TTS, media ducking,
-  earcons, Tier 2 escalation flush, and post-turn `cancel`.
+  read-only + mutable `memory_files` budgeting and scheduled-turn exclusion
+  (plus a weekly `weekly-distill` scheduler job in `NixConfig`), added
+  short-answer `Copy`/`Reply`/`Open` notifications with `--replace-id`, LRU
+  waiter eviction, and `present.reply_command` (`rofi-ask --reply-to {id}`), and
+  added `[present.speak]` / `hey-computer speak` (`programs.hey-computer.speak`
+  with pinned `en_US-lessac-medium` + `de_DE-thorsten-high` Piper voices, Waybar
+  middle-click / Rofi / voice toggles, and `SUPER + ALT + v` talk-key TTS
+  silence) with voice-only modality matching, widget restraint on voice queries,
+  sentence-streamed DE/EN TTS, media ducking, earcons, Tier 2 escalation flush,
+  and post-turn `cancel`.
 - `[Important]` `[Upstream + Config]` `[Done: 8dc667d, NixConfig c7f1428, f8cb9b8]`
   **Post-Phase-4 review hardening, declarative scheduler jobs, multi-file memory
   auto-reload, & UX polish (#8, #9, #17, #23, #26, #27, #28).** Added
