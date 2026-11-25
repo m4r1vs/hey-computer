@@ -8,10 +8,11 @@
 }: let
   inherit (pkgs) lib;
 
-  # Stand-ins for the unfree agent, Obsidian, and openhue packages.
+  # Stand-ins for the unfree agent, Obsidian, openhue, and piper packages.
   stubAgent = pkgs.writeShellScriptBin "agy" ''echo "agy stub: $*"'';
   stubObsidian = pkgs.writeShellScriptBin "obsidian-cli" ''echo "obsidian-cli stub: $*"'';
   stubOpenhue = pkgs.writeShellScriptBin "openhue" ''echo "openhue stub: $*"'';
+  stubPiper = pkgs.writeShellScriptBin "piper" ''cat >/dev/null'';
 
   evaluate = settings:
     (home-manager.lib.homeManagerConfiguration {
@@ -141,6 +142,15 @@
       file = toString memorySample;
       extraFiles = [memoryExtra];
     };
+    speak = {
+      enable = true;
+      defaultOn = false;
+      voiceOnly = true;
+      package = stubPiper;
+      voiceEn = "/var/lib/piper/en.onnx";
+      voiceDe = "/var/lib/piper/de.onnx";
+      mediaDuck = "pause";
+    };
     settings = {
       agent.mcp_servers = [];
       scheduler.jobs.daily-check = {
@@ -157,8 +167,12 @@
   evaluated = assert lib.assertMsg service.NoNewPrivileges "the service must set NoNewPrivileges";
   assert lib.assertMsg (lib.hasSuffix "/bin/systemd-run" (lib.head (settingsOf full).present.viewer))
   "the viewer must start in a scope of its own";
-  assert lib.assertMsg (lib.elem "--name=hey-computer.answer" (settingsOf full).present.viewer)
-  "the default viewer sets the app id";
+  assert lib.assertMsg (lib.any (lib.hasSuffix "/bin/hey-computer-viewer") (settingsOf full).present.viewer)
+  "the default viewer uses hey-computer-viewer";
+  assert lib.assertMsg (lib.elem "{id}" (settingsOf full).present.viewer)
+  "the default viewer passes the turn id placeholder";
+  assert lib.assertMsg ((settingsOf withMemory).present.speak.voice_only == true)
+  "speak defaults to voice_only = true";
   assert lib.assertMsg (lib.length (settingsOf full).instructions.skills == 9)
   "nine skills with a vault and openhue: hyprland-desktop, recall, tmux, schedule, four from obsidian-skills, and openhue";
   assert lib.assertMsg ((settingsOf full).instructions.memory_file == "/home/alice/.config/hey-computer/memory.md")
@@ -190,6 +204,8 @@ in
     pkgs.runCommand "hey-computer-module-check" {} ''
       set -euo pipefail
       hc=${lib.getExe package}
+      test -x "${package}/bin/hey-computer-viewer" || { echo "missing hey-computer-viewer binary" >&2; exit 1; }
+      test -f "${package}/share/hey-computer/assets/viewer.css" || { echo "missing viewer.css asset" >&2; exit 1; }
 
       $hc --config ${configFile} debug config > /dev/null
       $hc --config ${bareConfig} debug config > /dev/null

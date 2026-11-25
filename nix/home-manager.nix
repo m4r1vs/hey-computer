@@ -92,6 +92,29 @@
     "--"
   ];
 
+  mkPiperScript = lang: model: rate:
+    pkgs.writeShellScript "hey-computer-speak-${lang}" ''
+      set -euo pipefail
+      ${lib.getExe' cfg.speak.package "piper"} --model ${lib.escapeShellArg (toString model)} --output-raw \
+        | ${lib.getExe' pkgs.pipewire "pw-play"} --raw --rate ${toString rate} --channels 1 --format s16 -
+    '';
+
+  speakCommandEn =
+    if cfg.speak.commandEn != []
+    then cfg.speak.commandEn
+    else
+      lib.optionals (cfg.speak.package != null && cfg.speak.voiceEn != null) [
+        "${mkPiperScript "en" cfg.speak.voiceEn cfg.speak.sampleRateEn}"
+      ];
+
+  speakCommandDe =
+    if cfg.speak.commandDe != []
+    then cfg.speak.commandDe
+    else
+      lib.optionals (cfg.speak.package != null && cfg.speak.voiceDe != null) [
+        "${mkPiperScript "de" cfg.speak.voiceDe cfg.speak.sampleRateDe}"
+      ];
+
   # Translate programs.hey-computer.mcp.servers into settings.mcp.<name>,
   # routing `{ file = "/abs/path"; }` entries into env_files / header_files so
   # secrets never land in config.toml or /nix/store. Tolerates explicit `null`
@@ -430,36 +453,140 @@ in {
     viewer = {
       package = mkOption {
         type = types.nullOr types.package;
-        default = pkgs.marker;
-        defaultText = literalExpression "pkgs.marker";
-        description = "Installed for the viewer command; null installs nothing.";
+        default = null;
+        defaultText = literalExpression "null";
+        description = ''
+          Optional external viewer package installed into `home.packages`. Null
+          uses the built-in GTK4 + WebKitGTK 6.0 `hey-computer-viewer` shipped
+          in {option}`package`.
+        '';
       };
 
       command = mkOption {
         type = types.listOf types.str;
-        default = lib.optionals (cfg.viewer.package != null) [
-          "${pkgs.coreutils}/bin/env"
-          # Marker is a unique GApplication: with a session bus, a second
-          # answer would land in the first window as an editor tab. Without
-          # one, every answer gets its own preview window.
-          "DBUS_SESSION_BUS_ADDRESS=disabled:"
-          (lib.getExe' cfg.viewer.package "marker")
-          # The window's Wayland app id, for a window rule.
-          "--name=hey-computer.answer"
-          "--preview"
-          "{file}"
-        ];
+        default =
+          if cfg.viewer.package == null
+          then [
+            (lib.getExe' cfg.package "hey-computer-viewer")
+            "--turn-id"
+            "{id}"
+            "{file}"
+          ]
+          else [
+            (lib.getExe cfg.viewer.package)
+            "{file}"
+          ];
         defaultText = literalExpression ''
-          ["''${pkgs.coreutils}/bin/env" "DBUS_SESSION_BUS_ADDRESS=disabled:"
-           "''${cfg.viewer.package}/bin/marker" "--name=hey-computer.answer" "--preview" "{file}"]
+          ["''${cfg.package}/bin/hey-computer-viewer" "--turn-id" "{id}" "{file}"]
         '';
         description = ''
-          Opens a long answer: program and arguments, `{file}` is the
-          Markdown file. It is started in a systemd scope of its own, so the
-          window outlives a restart of the daemon. Empty shows the file's path
-          in a notification instead. With the default, the window's app id is
-          `hey-computer.answer`.
+          Opens a long or rich answer: program and arguments (`{file}` is the
+          HTML-disarmed Markdown file and `{id}` is the SQLite turn ID). Started
+          in a systemd user scope of its own so the window outlives daemon
+          restarts. Empty shows the file's path in a notification instead. With
+          the built-in viewer, the Wayland app id is `hey-computer.answer`.
         '';
+      };
+    };
+
+    speak = {
+      enable = mkEnableOption "optional spoken voice answers and audio cues (`present.speak`)";
+
+      defaultOn = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Initial spoken-answer state when no runtime toggle file exists yet at
+          `$XDG_STATE_HOME/hey-computer/speak_enabled`. Toggle anytime via
+          `hey-computer speak toggle` (Waybar click or voice command).
+        '';
+      };
+
+      voiceOnly = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Speak responses only when the request arrived via voice (`--voice` /
+          `source = "voice"`), keeping typed and CLI requests text-only.
+        '';
+      };
+
+      package = mkOption {
+        type = types.nullOr types.package;
+        default = pkgs.piper-tts;
+        defaultText = literalExpression "pkgs.piper-tts";
+        description = "TTS engine package (`piper`) used when `voiceEn` or `voiceDe` is set.";
+      };
+
+      voiceEn = mkOption {
+        type = types.nullOr (types.either types.path types.str);
+        default = null;
+        example = "/var/lib/piper/en_US-lessac-medium.onnx";
+        description = "Path to an English Piper `.onnx` model for auto-generated `command_en`.";
+      };
+
+      voiceDe = mkOption {
+        type = types.nullOr (types.either types.path types.str);
+        default = null;
+        example = "/var/lib/piper/de_DE-thorsten-high.onnx";
+        description = "Path to a German Piper `.onnx` model for auto-generated `command_de`.";
+      };
+
+      sampleRateEn = mkOption {
+        type = types.ints.positive;
+        default = 22050;
+        description = "Raw PCM sample rate in Hz for `voiceEn` playback via `pw-play`.";
+      };
+
+      sampleRateDe = mkOption {
+        type = types.ints.positive;
+        default = 22050;
+        description = "Raw PCM sample rate in Hz for `voiceDe` playback via `pw-play`.";
+      };
+
+      command = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        description = ''
+          Fallback TTS command fed one sentence on stdin (`{lang}` replaced by
+          `en` or `de`).
+        '';
+      };
+
+      commandEn = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        description = "Explicit English TTS command override (fed one sentence on stdin).";
+      };
+
+      commandDe = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        description = "Explicit German TTS command override (fed one sentence on stdin).";
+      };
+
+      mediaDuck = mkOption {
+        type = types.enum ["none" "pause" "lower"];
+        default = "pause";
+        description = "Pause playing MPRIS media (`pause`), lower sink volume (`lower`), or do nothing (`none`) while speaking.";
+      };
+
+      earcons = {
+        start = mkOption {
+          type = types.listOf types.str;
+          default = [];
+          description = "Optional audio cue command played when a voice turn begins.";
+        };
+        done = mkOption {
+          type = types.listOf types.str;
+          default = [];
+          description = "Optional audio cue command played when spoken playback completes.";
+        };
+        cancel = mkOption {
+          type = types.listOf types.str;
+          default = [];
+          description = "Optional audio cue command played when speech or a turn is cancelled.";
+        };
       };
     };
 
@@ -485,6 +612,17 @@ in {
       present = {
         viewer = mkIf (cfg.viewer.command != []) (mkDefault (viewerLauncher ++ cfg.viewer.command));
         clipboard = mkDefault [(lib.getExe' pkgs.wl-clipboard "wl-copy")];
+        speak = mkIf cfg.speak.enable {
+          enabled = mkDefault cfg.speak.defaultOn;
+          voice_only = mkDefault cfg.speak.voiceOnly;
+          media_duck = mkDefault cfg.speak.mediaDuck;
+          command = mkIf (cfg.speak.command != []) (mkDefault cfg.speak.command);
+          command_en = mkIf (speakCommandEn != []) (mkDefault speakCommandEn);
+          command_de = mkIf (speakCommandDe != []) (mkDefault speakCommandDe);
+          earcon_start = mkIf (cfg.speak.earcons.start != []) (mkDefault cfg.speak.earcons.start);
+          earcon_done = mkIf (cfg.speak.earcons.done != []) (mkDefault cfg.speak.earcons.done);
+          earcon_cancel = mkIf (cfg.speak.earcons.cancel != []) (mkDefault cfg.speak.earcons.cancel);
+        };
       };
     };
 
