@@ -355,7 +355,8 @@ in {
       default = true;
       description = ''
         Link the bundled `recall` skill (when {option}`skills.enable` is set)
-        so the agent can search past turns via `hey-computer recall`.
+        so the agent can search past turns via `hey-computer recall` and open
+        past conversations or schedules in the viewer via `hey-computer view --detach`.
       '';
     };
 

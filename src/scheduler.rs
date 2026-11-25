@@ -641,6 +641,7 @@ pub struct SchedulerHandle {
     wake: Arc<Notify>,
     run_tx: mpsc::UnboundedSender<(String, oneshot::Sender<std::result::Result<String, String>>)>,
     stop: watch::Sender<bool>,
+    running: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl SchedulerHandle {
@@ -660,6 +661,17 @@ impl SchedulerHandle {
             .unwrap_or_else(|_| Err("the scheduler stopped before starting the job".to_string()))
     }
 
+    /// IDs of scheduled jobs currently executing (sorted ascending).
+    pub fn running_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .running
+            .lock()
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Stop the scheduler loop.
     pub fn shutdown(&self) {
         let _ = self.stop.send(true);
@@ -676,17 +688,20 @@ pub fn spawn(
     let wake = Arc::new(Notify::new());
     let (stop_tx, stop_rx) = watch::channel(false);
     let (run_tx, run_rx) = mpsc::unbounded_channel();
+    let running: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
     let handle = SchedulerHandle {
         wake: Arc::clone(&wake),
         run_tx,
         stop: stop_tx,
+        running: Arc::clone(&running),
     };
     let task = tokio::spawn(run_loop(
-        config, state_dir, conductor, presenter, wake, run_rx, stop_rx,
+        config, state_dir, conductor, presenter, wake, run_rx, stop_rx, running,
     ));
     (handle, task)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     config: Arc<Config>,
     state_dir: PathBuf,
@@ -698,8 +713,8 @@ async fn run_loop(
         oneshot::Sender<std::result::Result<String, String>>,
     )>,
     mut stop: watch::Receiver<bool>,
+    running: Arc<Mutex<HashSet<u64>>>,
 ) {
-    let running: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
     loop {
         if *stop.borrow() {
             break;
@@ -914,7 +929,7 @@ async fn execute_job(
             JobOutcome::Failed(format!("{e:#}"))
         } else {
             let timeout = Duration::from_secs_f64(config.scheduler.script_timeout_secs.max(0.1));
-            match run_collector_script(&job.script, &state_dir, timeout).await {
+            match run_collector_script(&job.script, &state_dir, job.id, manual, timeout).await {
                 Ok(stdout) if stdout.trim().is_empty() => {
                     tracing::info!(
                         "schedule #{} ({}): collector empty, skipped",
@@ -1148,15 +1163,182 @@ pub fn should_notify_failure(consecutive_failures: u64) -> bool {
     consecutive_failures >= 1 && consecutive_failures.is_power_of_two()
 }
 
+/// Turn a schedule slug (`morning-digest`, `ci-watch`) into a clean display title.
+pub fn humanize_schedule_name(name: &str) -> String {
+    match name.trim() {
+        "morning-digest" => "Morning Brief".to_string(),
+        "pre-daily" => "Pre-Daily Brief".to_string(),
+        "weekly-distill" => "Weekly Distill".to_string(),
+        other => other
+            .split(['-', '_'])
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let mut word = first.to_uppercase().to_string();
+                        word.push_str(chars.as_str());
+                        word
+                    }
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// Turn a human or 5-field cron schedule specification into a concise readable
+/// label (e.g. `"*/5 5-14 * * *"` → `"every 5m (05:00–14:59)"`,
+/// `"0 9 * * 1-5"` → `"weekdays 09:00"`).
+pub fn humanize_schedule_spec(spec: &str) -> String {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.len() != 5 {
+        return match parts.as_slice() {
+            [kw, time]
+                if kw.eq_ignore_ascii_case("daily") || kw.eq_ignore_ascii_case("weekdays") =>
+            {
+                if let Ok((h, m)) = parse_hhmm(time) {
+                    format!("{} {h:02}:{m:02}", kw.to_ascii_lowercase())
+                } else {
+                    trimmed.to_string()
+                }
+            }
+            [kw, dur] if kw.eq_ignore_ascii_case("every") || kw.eq_ignore_ascii_case("in") => {
+                format!("{} {}", kw.to_ascii_lowercase(), dur.to_ascii_lowercase())
+            }
+            _ => trimmed.to_string(),
+        };
+    }
+
+    let (min_s, hour_s, dom_s, mon_s, dow_s) = (parts[0], parts[1], parts[2], parts[3], parts[4]);
+    if dom_s != "*" || mon_s != "*" {
+        return trimmed.to_string();
+    }
+
+    let dow_label = format_cron_dow_label(dow_s);
+
+    // `*/N ...` minute step patterns.
+    if let Some(step_str) = min_s.strip_prefix("*/")
+        && let Ok(step) = step_str.parse::<u32>()
+        && step > 0
+    {
+        let base = if hour_s == "*" {
+            format!("every {step}m")
+        } else if let Some((h1, h2)) = parse_hour_range(hour_s) {
+            format!("every {step}m ({h1:02}:00–{h2:02}:59)")
+        } else {
+            return trimmed.to_string();
+        };
+        return match dow_label {
+            Some(ref label) if label == "daily" => base,
+            Some(label) => format!("{label} {base}"),
+            None => trimmed.to_string(),
+        };
+    }
+
+    // Exact minute (`M`).
+    if let Ok(min) = min_s.parse::<u32>()
+        && min <= 59
+    {
+        if let Ok(hour) = hour_s.parse::<u32>()
+            && hour <= 23
+        {
+            return match dow_label {
+                Some(label) => format!("{label} {hour:02}:{min:02}"),
+                None => trimmed.to_string(),
+            };
+        }
+        if min == 0
+            && let Some(step_str) = hour_s.strip_prefix("*/")
+            && let Ok(step) = step_str.parse::<u32>()
+            && step > 0
+        {
+            let base = format!("every {step}h");
+            return match dow_label {
+                Some(ref label) if label == "daily" => base,
+                Some(label) => format!("{label} {base}"),
+                None => trimmed.to_string(),
+            };
+        }
+        if let Some((h1, h2)) = parse_hour_range(hour_s) {
+            let base = if min == 0 {
+                format!("hourly ({h1:02}:00–{h2:02}:59)")
+            } else {
+                format!("hourly at :{min:02} ({h1:02}:00–{h2:02}:59)")
+            };
+            return match dow_label {
+                Some(ref label) if label == "daily" => base,
+                Some(label) => format!("{label} {base}"),
+                None => trimmed.to_string(),
+            };
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn parse_hour_range(hour_s: &str) -> Option<(u32, u32)> {
+    let (a, b) = hour_s.split_once('-')?;
+    let h1: u32 = a.parse().ok()?;
+    let h2: u32 = b.parse().ok()?;
+    (h1 <= 23 && h2 <= 23 && h1 <= h2).then_some((h1, h2))
+}
+
+fn format_cron_dow_label(dow_s: &str) -> Option<String> {
+    const NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let lower = dow_s.to_ascii_lowercase();
+    if lower == "*" {
+        return Some("daily".to_string());
+    }
+    if lower == "1-5" || lower == "mon-fri" {
+        return Some("weekdays".to_string());
+    }
+    if lower == "0,6" || lower == "6,0" || lower == "sat,sun" || lower == "sun,sat" {
+        return Some("weekends".to_string());
+    }
+    let mut labels = Vec::new();
+    for part in lower.split(',') {
+        if let Some((a, b)) = part.split_once('-') {
+            let start = parse_cron_dow_index(a)?;
+            let end = parse_cron_dow_index(b)?;
+            labels.push(format!("{}-{}", NAMES[start], NAMES[end]));
+        } else {
+            let idx = parse_cron_dow_index(part)?;
+            labels.push(NAMES[idx].to_string());
+        }
+    }
+    (!labels.is_empty()).then(|| labels.join(","))
+}
+
+fn parse_cron_dow_index(atom: &str) -> Option<usize> {
+    if let Some(idx) = parse_single_dow(atom) {
+        return Some(idx);
+    }
+    let num: usize = atom.parse().ok()?;
+    (num <= 7).then_some(num % 7)
+}
+
 async fn run_collector_script(
     script: &str,
     state_dir: &Path,
+    job_id: u64,
+    manual: bool,
     timeout: Duration,
 ) -> std::result::Result<String, String> {
     let mut child = Command::new("/bin/sh")
         .args(["-c", script])
         .env("HEY_COMPUTER_STATE_DIR", state_dir)
         .env("HEY_COMPUTER_ARTIFACTS_DIR", state_dir.join("artifacts"))
+        .env("HEY_COMPUTER_SCHEDULE_ID", job_id.to_string())
+        .env(
+            "HEY_COMPUTER_SCHEDULE_MANUAL",
+            if manual { "1" } else { "0" },
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1340,5 +1522,57 @@ mod tests {
         assert!(should_notify_failure(4));
         assert!(!should_notify_failure(5));
         assert!(should_notify_failure(8));
+    }
+
+    #[test]
+    fn humanizes_schedule_specs_and_names() {
+        assert_eq!(humanize_schedule_name("morning-digest"), "Morning Brief");
+        assert_eq!(humanize_schedule_name("pre-daily"), "Pre-Daily Brief");
+        assert_eq!(humanize_schedule_name("weekly-distill"), "Weekly Distill");
+        assert_eq!(humanize_schedule_name("ci-watch"), "Ci Watch");
+        assert_eq!(humanize_schedule_name("backup_check"), "Backup Check");
+
+        assert_eq!(
+            humanize_schedule_spec("*/5 5-14 * * *"),
+            "every 5m (05:00–14:59)"
+        );
+        assert_eq!(humanize_schedule_spec("0 9 * * 1-5"), "weekdays 09:00");
+        assert_eq!(humanize_schedule_spec("0 18 * * 0"), "Sun 18:00");
+        assert_eq!(humanize_schedule_spec("30 7 * * *"), "daily 07:30");
+        assert_eq!(humanize_schedule_spec("*/15 * * * *"), "every 15m");
+        assert_eq!(humanize_schedule_spec("0 */2 * * *"), "every 2h");
+        assert_eq!(humanize_schedule_spec("weekdays 09:56"), "weekdays 09:56");
+        assert_eq!(humanize_schedule_spec("every 15m"), "every 15m");
+    }
+
+    #[tokio::test]
+    async fn collector_script_receives_schedule_id_and_manual_env_vars() {
+        let dir = std::env::temp_dir().join(format!("hc-sched-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let auto_out = run_collector_script(
+            "printf '%s:%s' \"$HEY_COMPUTER_SCHEDULE_ID\" \"$HEY_COMPUTER_SCHEDULE_MANUAL\"",
+            &dir,
+            42,
+            false,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(auto_out, "42:0");
+
+        let manual_out = run_collector_script(
+            "printf '%s:%s' \"$HEY_COMPUTER_SCHEDULE_ID\" \"$HEY_COMPUTER_SCHEDULE_MANUAL\"",
+            &dir,
+            42,
+            true,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(manual_out, "42:1");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

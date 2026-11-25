@@ -166,11 +166,12 @@ hey-computer [--config FILE] [--socket PATH] [-v|-vv] COMMAND
 | `status [--json]` | For example `agent ready, idle, follow-ups for 78 s, 7 handled` (plus active profile, background running/queued counts, and `speak` / `speaking` state). |
 | `speak [on \| off \| toggle \| status] [--json]` | Enable, disable, toggle, or inspect spoken voice answers (`present.speak`), persisting `<state_dir>/speak_enabled` and updating the running daemon immediately. |
 | `distill [--since SPEC] [--limit N] [-p\|--profile NAME] [-b\|--background] [--print \| --json]` | Review recent user-originated `history.db` turns (skipping scheduled, pre-collector, and suppressed runs) against configured `memory_file` / `memory_files` and propose per-hunk `memory.md` diffs and repeated-workflow `SKILL.md` drafts in `hey-computer-viewer` (never auto-applied). |
-| `view [FILE] [--turn-id ID] [--focus-composer]` | Open a Markdown file or persisted conversation turn in `hey-computer-viewer`. |
-| `last [--copy \| --open] [--lane interactive\|background\|restricted\|all] [--json]` | Retrieve the last successful answer (defaults to the `interactive` lane): print it, output JSON, copy to the clipboard (`present.clipboard`), or open in the viewer (`present.viewer`). Works even when the daemon is stopped. |
+| `view [TARGET] [--turn-id ID] [--schedule TARGET \| --schedules] [--history \| --recall QUERY] [--focus-composer] [-d\|--detach]` | Open a Markdown file, persisted conversation turn (positional numeric `<ID>` / `#<ID>` or `--turn-id`), Schedule Inspector (`--schedule`), Schedules overview (`--schedules`), or History/Recall drawer (`--history` / `--recall`) in `hey-computer-viewer`. `--detach` (`-d`, auto-enabled inside agent turns when `HEY_COMPUTER_AGENT_TURN=1`) validates the target, launches detached via `present.viewer` (or sibling `hey-computer-viewer`), and returns immediately without popping an `"Answer opened"` notification. |
+| `history [-n\|--limit 60] [--lane all] [--no-threads] [--include-failed] [--all] [--since SPEC] [--json] [QUERY...]` | Fast single-shot read-only SQLite feed of active background/interactive tasks plus thread-collapsed past conversations (or FTS5 search matches when `QUERY` is passed). Works even when the daemon is stopped. |
+| `last [--copy \| --open] [--lane interactive\|background\|restricted\|all] [--json]` | Retrieve the last successful answer (defaults to the `interactive` lane): print it, output JSON, copy to the clipboard (`present.clipboard`), or open in the viewer (`present.viewer`, falling back to `hey-computer-viewer`). Works even when the daemon is stopped. |
 | `tasks [list \| show ID \| open ID \| copy ID \| cancel ID]` | List recent tasks (`--lane`, `--status`, `--all`, `--limit`, `--json`; defaults to the `background` lane), inspect one task, open it in the viewer, copy its answer, or cancel a running/queued task. `list`, `show`, `open`, and `copy` work even when the daemon is stopped. |
-| `schedule [add \| list \| show \| edit \| pause \| resume \| remove \| run]` | Create, inspect, pause, resume, edit, remove, or test-run scheduled jobs stored in `history.db`. `list`/`show` and mutations work even when the daemon is stopped (mutations wake a running daemon automatically); `run <id\|name>` triggers an immediate test run in the running daemon. |
-| `recall [--since SPEC] [--until SPEC] [-n\|--limit N] [--lane ...] [--sort relevance\|recent] [--any] [--full] [--max-chars N] [--raw-fts] [--json] [--plain] [QUERY...]` | Full-text search (SQLite FTS5) over past completed answers, wrapped in `<untrusted_recall>` by default (for agent skill use; `--plain` or `--json` for direct terminal/script use). Time specs accept relative (`24h`, `7d`, `2w`) and calendar (`today`, `yesterday`, `YYYY-MM-DD`) forms. Works even when the daemon is stopped. |
+| `schedule [add \| list \| show \| edit \| pause \| resume \| remove \| run \| open]` | Create, inspect, pause, resume, edit, remove, test-run, or open scheduled jobs stored in `history.db` in the viewer (`open [TARGET]`, alias `view`). `list --json` and `show <target> --json` enrich `ScheduleRecord` with humanized titles/specs, live running state, relative times, `latest_turn_id`, `active_turn_id`, and `recent_turns`. `list`/`show` and mutations work even when the daemon is stopped (mutations wake a running daemon automatically); `run <id\|name>` triggers an immediate test run in the running daemon (setting `HEY_COMPUTER_SCHEDULE_ID` and `HEY_COMPUTER_SCHEDULE_MANUAL=1` for collector scripts). |
+| `recall [--since SPEC] [--until SPEC] [--on DATE] [--user-only] [--id ID \| --thread ID] [-n\|--limit N] [--lane ...] [--sort relevance\|recent] [--any] [--full] [--max-chars N] [--raw-fts] [--json] [--plain] [QUERY...]` | Full-text search (SQLite FTS5) over past completed answers, wrapped in `<untrusted_recall>` by default (for agent skill use; `--plain` or `--json` for direct terminal/script use). Supports single-day `--on` (`today`, `yesterday`, `YYYY-MM-DD`), `--user-only`, and sanitized single-turn (`--id`) or full-thread (`--thread`) inspection. Time specs accept relative (`24h`, `7d`, `2w`) and calendar (`today`, `yesterday`, `YYYY-MM-DD`; `--until` dates are inclusive of that entire day) forms. Works even when the daemon is stopped. |
 
 - An empty or whitespace-only request (with no attachments) is reported on stderr and exits 2.
 - When the daemon is not running, `ask` says so on stderr, sends a
@@ -255,14 +256,23 @@ request. Keep the writing side open until the answer has arrived.
 **status** `{"type":"status"}` →
 
 ```json
-{"type":"status","agent":"ready","running":null,"running_secs":null,"running_profile":null,"follow_up_secs":61.2,"handled":7,"background_running":0,"background_queued":0}
+{"type":"status","agent":"ready","running":null,"running_secs":null,"running_profile":null,"follow_up_secs":61.2,"handled":7,"background_running":0,"background_queued":0,"running_schedules":[1]}
 ```
 
 `agent` is `down`, `starting` or `ready`; `running` / `running_secs` /
 `running_profile` reflect the interactive lane; `follow_up_secs` is how long a
 new interactive request would still continue the current conversation;
 `background_running` and `background_queued` count active and waiting tasks in
-the background lane.
+the background lane; `running_schedules` lists currently executing schedule IDs
+(omitted when empty).
+
+**read_aloud** `{"type":"read_aloud","text":"…"}` →
+`{"type":"speak_started","id":1000000001}` followed by
+`{"type":"speak_finished","id":1000000001}` when playback finishes or is
+stopped. Bypasses `speak_enabled` and short-answer cutoffs (cleans Markdown
+blocks/math/tables before sentence-streaming through the configured TTS
+pipeline and media ducking); closing the socket immediately stops playback and
+restores ducked media.
 
 **schedule_reload / schedule_run** `{"type":"schedule_reload"}` or
 `{"type":"schedule_run","target":"…"}` → `{"type":"ok","message":"…"}`.

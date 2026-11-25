@@ -586,3 +586,229 @@ fn mcp_ui_stdio_speak_and_distill_cli_round_trip() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test]
+async fn history_recall_schedule_json_and_detached_view_cli() {
+    use hey_computer::config::History;
+    use hey_computer::store::{
+        FailureDeliver, Lane, NewSchedule, NewTurn, Store, TurnOrigin, TurnStatus, create_schedule,
+        unix_timestamp_ms,
+    };
+
+    let dir = scratch("refinements-cli");
+    let state = dir.join("state");
+    let viewer_log = dir.join("viewer.log");
+    let notify_log = dir.join("notify.log");
+    let config = dir.join("config.toml");
+
+    std::fs::write(
+        &config,
+        format!(
+            "state_dir = {state:?}\n\
+             [present]\n\
+             notifier = [\"/bin/sh\", \"-c\", \"echo \\\"$*\\\" >> {notify_log:?}; echo 7\", \"sh\"]\n\
+             viewer = [\"/bin/sh\", \"-c\", \"printf 'agent=%s args=%s\\n' \\\"$HEY_COMPUTER_AGENT_TURN\\\" \\\"$*\\\" >> {viewer_log:?}\", \"sh\", \"--turn-id\", \"{{id}}\", \"{{file}}\"]\n",
+        ),
+    )
+    .unwrap();
+
+    let (store, _) = Store::open(&state, &History::default()).unwrap();
+    let now = unix_timestamp_ms();
+    let sched = create_schedule(
+        &state,
+        &NewSchedule {
+            name: "morning-digest".to_string(),
+            schedule_spec: "*/5 5-14 * * *".to_string(),
+            prompt: "Morning brief".to_string(),
+            profile: "deep".to_string(),
+            script: "echo data".to_string(),
+            no_agent: false,
+            suppress_token: Some("HEARTBEAT_OK".to_string()),
+            failure_deliver: FailureDeliver::Notify,
+            max_runs: None,
+            expires_at: None,
+            next_run_at: now + 300_000,
+        },
+        10,
+    )
+    .unwrap();
+
+    store.create_turn(NewTurn {
+        id: 10,
+        lane: Lane::Interactive,
+        status: TurnStatus::Running,
+        profile: String::new(),
+        created_at_ms: now - 5_000,
+        request: "Explain pipewire quantum".to_string(),
+        attachments: vec![],
+        origin: TurnOrigin::Voice,
+        schedule_id: None,
+    });
+    store.mark_running(
+        10,
+        Lane::Interactive,
+        "s10".to_string(),
+        Some(10),
+        String::new(),
+        now - 5_000,
+    );
+    store.finish_completed(
+        10,
+        "PipeWire quantum sets the buffer size in samples.".to_string(),
+        vec![],
+        now - 4_000,
+    );
+
+    store.create_turn(NewTurn {
+        id: 11,
+        lane: Lane::Background,
+        status: TurnStatus::Running,
+        profile: "deep".to_string(),
+        created_at_ms: now - 3_000,
+        request: "collector".to_string(),
+        attachments: vec![],
+        origin: TurnOrigin::ScheduleScript,
+        schedule_id: Some(sched.id),
+    });
+    store.finish_completed(
+        11,
+        "# Morning Brief — Today\n\nClear day.".to_string(),
+        vec![],
+        now - 2_000,
+    );
+
+    store.create_turn(NewTurn {
+        id: 12,
+        lane: Lane::Interactive,
+        status: TurnStatus::Failed,
+        profile: String::new(),
+        created_at_ms: now - 1_000,
+        request: "broken turn".to_string(),
+        attachments: vec![],
+        origin: TurnOrigin::Typed,
+        schedule_id: None,
+    });
+    store.shutdown().await;
+
+    // 1. `hey-computer history --json` returns active_tasks + items.
+    let hist = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .args(["history", "--include-failed", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        hist.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hist.stderr)
+    );
+    let feed: serde_json::Value = serde_json::from_slice(&hist.stdout).unwrap();
+    assert!(feed["items"].as_array().unwrap().len() >= 2);
+
+    // 2. `hey-computer recall --on today --user-only` excludes scheduled turn #11.
+    let rec = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .args(["recall", "--on", "today", "--user-only", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        rec.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rec.stderr)
+    );
+    let hits: serde_json::Value = serde_json::from_slice(&rec.stdout).unwrap();
+    assert_eq!(hits.as_array().unwrap().len(), 1);
+    assert_eq!(hits[0]["id"], 10);
+
+    // 3. `hey-computer recall --thread 10` wraps turn in `<untrusted_recall>`.
+    let thr = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .args(["recall", "--thread", "10"])
+        .output()
+        .unwrap();
+    assert!(thr.status.success());
+    let thr_out = String::from_utf8_lossy(&thr.stdout);
+    assert!(thr_out.starts_with("<untrusted_recall>\n"), "{thr_out}");
+    assert!(thr_out.contains("PipeWire quantum"), "{thr_out}");
+
+    // 4. `hey-computer schedule list --json` & `show morning-digest --json` emit enriched fields.
+    let slist = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--socket")
+        .arg(dir.join("offline.sock"))
+        .args(["schedule", "list", "--all", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        slist.status.success(),
+        "{}",
+        String::from_utf8_lossy(&slist.stderr)
+    );
+    let sjson: serde_json::Value = serde_json::from_slice(&slist.stdout).unwrap();
+    assert_eq!(sjson[0]["name"], "morning-digest");
+    assert_eq!(sjson[0]["title"], "Morning Brief");
+    assert_eq!(sjson[0]["human_schedule"], "every 5m (05:00–14:59)");
+    assert_eq!(sjson[0]["latest_turn_id"], 11);
+
+    let sshow = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--socket")
+        .arg(dir.join("offline.sock"))
+        .args(["schedule", "show", "morning-digest", "--json"])
+        .output()
+        .unwrap();
+    assert!(sshow.status.success());
+    let show_json: serde_json::Value = serde_json::from_slice(&sshow.stdout).unwrap();
+    assert_eq!(show_json["recent_turns"][0]["id"], 11);
+
+    // 5. `hey-computer view 10` auto-detaches when `HEY_COMPUTER_AGENT_TURN=1`,
+    //    strips `HEY_COMPUTER_AGENT_TURN` from child, and emits NO "Answer opened" notification!
+    let view_ok = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("HEY_COMPUTER_AGENT_TURN", "1")
+        .args(["view", "#10"])
+        .output()
+        .unwrap();
+    assert!(
+        view_ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&view_ok.stderr)
+    );
+    let vlog = std::fs::read_to_string(&viewer_log).unwrap();
+    assert!(
+        vlog.contains("agent= "),
+        "HEY_COMPUTER_AGENT_TURN must be stripped: {vlog}"
+    );
+    assert!(vlog.contains("--turn-id 10"), "{vlog}");
+    assert!(
+        std::fs::read_to_string(&notify_log)
+            .unwrap_or_default()
+            .is_empty(),
+        "detached view must not pop an Answer opened notification"
+    );
+
+    // 6. Detached view on missing turn or empty failed turn exits 1 cleanly.
+    let view_missing = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .args(["view", "--detach", "--turn-id", "999"])
+        .output()
+        .unwrap();
+    assert_eq!(view_missing.status.code(), Some(1));
+
+    let view_empty = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .args(["view", "--detach", "--turn-id", "12"])
+        .output()
+        .unwrap();
+    assert_eq!(view_empty.status.code(), Some(1));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

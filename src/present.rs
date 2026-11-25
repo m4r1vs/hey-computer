@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::config::{MediaDuck, Present as PresentConfig, Speak as SpeakConfig};
@@ -44,6 +44,8 @@ const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 /// A viewer that exits with an error within this long is reported as
 /// failed; one that is still running then has its window up.
 const VIEWER_GRACE: Duration = Duration::from_millis(1500);
+/// Fast startup error check window for detached CLI/agent viewer launches.
+const DETACHED_VIEWER_GRACE: Duration = Duration::from_millis(300);
 /// How much of a failed viewer's stderr goes into the message.
 const VIEWER_STDERR_KEPT: usize = 400;
 /// Maximum concurrent waiting action-notification tasks (`notify-send -A`).
@@ -127,6 +129,16 @@ pub trait Presenter: Send + Sync + 'static {
     /// Current `(speak_enabled, currently_speaking)` state.
     fn speak_status(&self) -> (bool, bool) {
         (false, false)
+    }
+
+    /// Speak arbitrary Markdown or plain text on demand, bypassing
+    /// `speak_enabled` and short-answer cutoffs. Returns `(speech_id, done_rx)`
+    /// where `done_rx` resolves when playback finishes or is stopped.
+    fn read_aloud(
+        &self,
+        _text: String,
+    ) -> std::result::Result<(u64, oneshot::Receiver<()>), String> {
+        Err("text-to-speech is not configured".to_string())
     }
 }
 
@@ -941,11 +953,18 @@ pub struct Recorder {
     speaking: AtomicBool,
     active_speech_id: AtomicU64,
     stopped_speech: Mutex<Vec<Option<u64>>>,
+    next_read_aloud_id: AtomicU64,
+    hold_read_aloud: AtomicBool,
+    read_alouds: Mutex<Vec<(u64, String)>>,
+    read_aloud_done: Mutex<HashMap<u64, oneshot::Sender<()>>>,
 }
 
 impl Recorder {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Arc::new(Self {
+            next_read_aloud_id: AtomicU64::new(1_000_000_000),
+            ..Self::default()
+        })
     }
 
     pub fn items(&self) -> Vec<Presentation> {
@@ -958,6 +977,33 @@ impl Recorder {
             .lock()
             .map(|s| s.clone())
             .unwrap_or_default()
+    }
+
+    /// Recorded `read_aloud` calls `(id, text)` for integration tests.
+    pub fn read_alouds(&self) -> Vec<(u64, String)> {
+        self.read_alouds
+            .lock()
+            .map(|r| r.clone())
+            .unwrap_or_default()
+    }
+
+    /// When `true`, `read_aloud` stays active until `stop_speech` or
+    /// `finish_read_aloud` is called.
+    pub fn set_hold_read_aloud(&self, hold: bool) {
+        self.hold_read_aloud.store(hold, Ordering::SeqCst);
+    }
+
+    /// Manually finish a held `read_aloud` in tests.
+    pub fn finish_read_aloud(&self, id: u64) {
+        if let Ok(mut map) = self.read_aloud_done.lock()
+            && let Some(tx) = map.remove(&id)
+        {
+            if self.active_speech_id.load(Ordering::SeqCst) == id {
+                self.speaking.store(false, Ordering::SeqCst);
+                self.active_speech_id.store(0, Ordering::SeqCst);
+            }
+            let _ = tx.send(());
+        }
     }
 
     /// Simulate active TTS playback for `id` (`None` clears active playback).
@@ -1039,6 +1085,11 @@ impl Presenter for Recorder {
         }
         self.speaking.store(false, Ordering::SeqCst);
         self.active_speech_id.store(0, Ordering::SeqCst);
+        if let Ok(mut map) = self.read_aloud_done.lock()
+            && let Some(tx) = map.remove(&current)
+        {
+            let _ = tx.send(());
+        }
         Some(current)
     }
 
@@ -1056,6 +1107,28 @@ impl Presenter for Recorder {
             self.speaking.load(Ordering::SeqCst),
         )
     }
+
+    fn read_aloud(
+        &self,
+        text: String,
+    ) -> std::result::Result<(u64, oneshot::Receiver<()>), String> {
+        let id = self.next_read_aloud_id.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(mut calls) = self.read_alouds.lock() {
+            calls.push((id, text));
+        }
+        let (tx, rx) = oneshot::channel();
+        if self.hold_read_aloud.load(Ordering::SeqCst) {
+            self.active_speech_id.store(id, Ordering::SeqCst);
+            self.speaking.store(true, Ordering::SeqCst);
+            if let Ok(mut map) = self.read_aloud_done.lock() {
+                map.insert(id, tx);
+            }
+        } else {
+            let _ = tx.send(());
+        }
+        self.changed.notify_waiters();
+        Ok((id, rx))
+    }
 }
 
 /// Notifications through the configured notifier, long answers through the
@@ -1069,6 +1142,7 @@ pub struct Desktop {
     speech: Arc<SpeechShared>,
     speech_queue: Mutex<Option<mpsc::UnboundedSender<SpeechCmd>>>,
     speech_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    next_read_aloud_id: AtomicU64,
 }
 
 impl Desktop {
@@ -1181,6 +1255,7 @@ impl Desktop {
             speech,
             speech_queue: Mutex::new(Some(speech_tx)),
             speech_task: Mutex::new(Some(speech_task)),
+            next_read_aloud_id: AtomicU64::new(1_000_000_000),
         })
     }
 
@@ -1309,6 +1384,53 @@ impl Presenter for Desktop {
             self.speech.speak_enabled.load(Ordering::SeqCst),
             self.speech.speaking.load(Ordering::SeqCst),
         )
+    }
+
+    fn read_aloud(
+        &self,
+        text: String,
+    ) -> std::result::Result<(u64, oneshot::Receiver<()>), String> {
+        if !has_tts_command(&self.speech.config) {
+            return Err(
+                "no TTS command is configured (set present.speak.command, command_en, or command_de)"
+                    .to_string(),
+            );
+        }
+        let sentences = prepare_document_for_speech(&text);
+        let id = self.next_read_aloud_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let (done_tx, done_rx) = oneshot::channel();
+        if sentences.is_empty() {
+            let _ = done_tx.send(());
+            return Ok((id, done_rx));
+        }
+        let lang = detect_document_lang(&sentences);
+        self.speech.kill_active_pgid();
+        let epoch = self.speech.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.speech.active_turn_id.store(id, Ordering::SeqCst);
+        self.speech.speaking.store(true, Ordering::SeqCst);
+        if let Ok(q) = self.speech_queue.lock()
+            && let Some(tx) = q.as_ref()
+            && tx
+                .send(SpeechCmd::ReadAloud {
+                    id,
+                    epoch,
+                    sentences,
+                    lang,
+                    done: done_tx,
+                })
+                .is_ok()
+        {
+            Ok((id, done_rx))
+        } else {
+            self.speech.speaking.store(false, Ordering::SeqCst);
+            let _ = self.speech.active_turn_id.compare_exchange(
+                id,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            Err("the speech worker is stopped".to_string())
+        }
     }
 }
 
@@ -2430,6 +2552,7 @@ fn spawn_viewer(
         .replace("{id}", &id_str);
     let child = Command::new(&program)
         .args(&args)
+        .env_remove("HEY_COMPUTER_AGENT_TURN")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)
@@ -2492,6 +2615,151 @@ async fn watch_viewer(
             tokio::spawn(async move {
                 let _ = child.wait().await;
             });
+        }
+    }
+}
+
+/// Return a `PresentConfig` ready to open turn `turn_id` in a viewer: uses
+/// `config.viewer` (with `{id}` expanded) when configured, falling back to the
+/// sibling `hey-computer-viewer` binary when `WAYLAND_DISPLAY` or `DISPLAY` is set.
+pub fn viewer_config_with_fallback(config: &PresentConfig, turn_id: u64) -> PresentConfig {
+    let mut cfg = crate::distill::present_config_for_turn(config, turn_id);
+    if cfg.viewer.is_empty() && has_graphical_display() {
+        let bin = crate::distill::resolve_viewer_binary()
+            .to_string_lossy()
+            .into_owned();
+        cfg.viewer = vec![
+            bin,
+            "--turn-id".to_string(),
+            turn_id.to_string(),
+            "{file}".to_string(),
+        ];
+    }
+    cfg
+}
+
+fn has_graphical_display() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty())
+}
+
+/// Spawn the native viewer detached from the caller's process group (and via
+/// `config.viewer`'s `systemd-run --user --scope` wrapper when configured),
+/// waiting up to 300 ms to catch immediate startup errors and sending **no**
+/// `"Answer opened"` notification.
+///
+/// Used by `hey-computer view --detach` (auto-enabled inside agent turns via
+/// `HEY_COMPUTER_AGENT_TURN=1`) so the agent can open a past chat or schedule
+/// without blocking its tool call or leaving the window inside the daemon cgroup.
+pub async fn open_viewer_detached(
+    config: &PresentConfig,
+    viewer_args: &[std::ffi::OsString],
+    fallback_turn: Option<(u64, &str, &[String])>,
+) -> anyhow::Result<()> {
+    let log_dir = ipc::runtime_dir().unwrap_or_else(|_| std::env::temp_dir());
+    let (mut log, stderr) = unlinked_log_file(&log_dir, "viewer-detached-stderr")?;
+
+    let (program, args): (std::ffi::OsString, Vec<std::ffi::OsString>) = if !config
+        .viewer
+        .is_empty()
+    {
+        if let Some(hc_idx) = config.viewer.iter().position(|arg| {
+            Path::new(arg)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == "hey-computer-viewer")
+        }) {
+            let program = std::ffi::OsString::from(&config.viewer[0]);
+            let mut args: Vec<std::ffi::OsString> = config.viewer[1..=hc_idx]
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect();
+            args.extend(viewer_args.iter().cloned());
+            (program, args)
+        } else {
+            // Custom external viewer or test recording script in `present.viewer`.
+            let (file_str, id_str) = if let Some((id, text, denied)) = fallback_turn {
+                let answers_dir = log_dir.join("hey-computer");
+                let document = format_document(text, denied);
+                let file = write_answer(&answers_dir, id, &document, config.keep_answers)?;
+                (file.to_string_lossy().into_owned(), id.to_string())
+            } else {
+                (String::new(), String::new())
+            };
+            let program = std::ffi::OsString::from(
+                config.viewer[0]
+                    .replace("{file}", &file_str)
+                    .replace("{id}", &id_str),
+            );
+            let mut args = Vec::new();
+            let had_file_placeholder = config.viewer.iter().any(|a| a.contains("{file}"));
+            let had_id_placeholder = config.viewer.iter().any(|a| a.contains("{id}"));
+            let tail = &config.viewer[1..];
+            let mut i = 0;
+            while i < tail.len() {
+                let raw = &tail[i];
+                if raw == "--turn-id"
+                    && tail.get(i + 1).is_some_and(|next| next.contains("{id}"))
+                    && id_str.is_empty()
+                {
+                    i += 2;
+                    continue;
+                }
+                if (raw.contains("{file}") && file_str.is_empty())
+                    || (raw.contains("{id}") && id_str.is_empty())
+                {
+                    i += 1;
+                    continue;
+                }
+                let expanded = raw.replace("{file}", &file_str).replace("{id}", &id_str);
+                args.push(std::ffi::OsString::from(expanded));
+                i += 1;
+            }
+            if fallback_turn.is_none() || (!had_file_placeholder && !had_id_placeholder) {
+                args.extend(viewer_args.iter().cloned());
+            } else if !had_file_placeholder && !file_str.is_empty() {
+                args.push(std::ffi::OsString::from(file_str));
+            }
+            (program, args)
+        }
+    } else if has_graphical_display() {
+        let bin = crate::distill::resolve_viewer_binary();
+        (bin.into_os_string(), viewer_args.to_vec())
+    } else {
+        anyhow::bail!(
+            "no viewer is configured (set present.viewer) and no graphical display (WAYLAND_DISPLAY/DISPLAY) is available"
+        );
+    };
+
+    let program_display = program.to_string_lossy().into_owned();
+    let mut child = Command::new(&program)
+        .args(&args)
+        .env_remove("HEY_COMPUTER_AGENT_TURN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .process_group(0)
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("starting {program_display}: {e}"))?;
+
+    match tokio::time::timeout(DETACHED_VIEWER_GRACE, child.wait()).await {
+        Ok(Ok(status)) if !status.success() => {
+            let detail = child_failure_detail(&program_display, status, &mut log);
+            drop(log);
+            anyhow::bail!("{detail}");
+        }
+        Ok(Ok(_)) => {
+            drop(log);
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            drop(log);
+            anyhow::bail!("waiting for {program_display}: {e}");
+        }
+        Err(_) => {
+            // Still running after 300 ms: leave the detached viewer alive after CLI exit.
+            drop(log);
+            Ok(())
         }
     }
 }
@@ -2802,18 +3070,31 @@ pub fn detect_speech_lang(text: &str) -> &'static str {
     }
 }
 
-/// Strip inline Markdown formatting (`**`, `__`, `` ` ``, and `[label](url)` ->
+/// Strip inline Markdown formatting (`**`, `__`, `~~`, `*`, `` ` ``,
+/// `$$...$$`, disarmed `[image: ...]` placeholders, and `[label](url)` ->
 /// `label`) before piping a spoken sentence to TTS stdin.
 pub fn strip_speech_markdown(text: &str) -> String {
     let mut unlinked = String::with_capacity(text.len());
     let mut rest = text;
     while !rest.is_empty() {
-        let Some(pos) = rest.find(['!', '[']) else {
+        let Some(pos) = rest.find(['!', '[', '$']) else {
             unlinked.push_str(rest);
             break;
         };
         unlinked.push_str(&rest[..pos]);
         rest = &rest[pos..];
+
+        // Skip inline `$$...$$` display math spans.
+        if let Some(after_math) = rest.strip_prefix("$$") {
+            if let Some(end) = after_math.find("$$") {
+                rest = &after_math[end + 2..];
+                continue;
+            }
+            rest = after_math;
+            continue;
+        }
+
+        let is_image = rest.starts_with("![");
         let bracket_rest = if let Some(after_bang) = rest.strip_prefix("![") {
             Some(after_bang)
         } else {
@@ -2821,12 +3102,26 @@ pub fn strip_speech_markdown(text: &str) -> String {
         };
         if let Some(after_open) = bracket_rest
             && let Some(label_end) = find_closing_bracket(after_open)
-            && let Some(after_paren_open) = after_open[label_end + 1..].strip_prefix('(')
-            && let Some(paren_end) = find_closing_paren(after_paren_open)
         {
-            unlinked.push_str(&after_open[..label_end]);
-            rest = &after_paren_open[paren_end + 1..];
-            continue;
+            let label = &after_open[..label_end];
+            let after_bracket = &after_open[label_end + 1..];
+            let is_disarmed_img = label
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("image:");
+            if let Some(after_paren_open) = after_bracket.strip_prefix('(')
+                && let Some(paren_end) = find_closing_paren(after_paren_open)
+            {
+                if !is_image && !is_disarmed_img {
+                    unlinked.push_str(label);
+                }
+                rest = &after_paren_open[paren_end + 1..];
+                continue;
+            }
+            if is_disarmed_img {
+                rest = after_bracket;
+                continue;
+            }
         }
         let ch_len = rest.chars().next().map_or(1, char::len_utf8);
         unlinked.push_str(&rest[..ch_len]);
@@ -2836,8 +3131,317 @@ pub fn strip_speech_markdown(text: &str) -> String {
     let cleaned = unlinked
         .replace("**", "")
         .replace("__", "")
+        .replace("~~", "")
         .replace('`', "");
-    cleaned.trim().to_string()
+    let cleaned = strip_inline_emphasis(&cleaned);
+    collapse_speech_whitespace(&cleaned)
+}
+
+/// Remove paired single `*…*` emphasis markers without harming standalone
+/// arithmetic asterisks (`2 * 3`) or snake_case identifiers (`foo_bar`).
+fn strip_inline_emphasis(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if (ch == '*' || ch == '_')
+            && i + 1 < chars.len()
+            && !chars[i + 1].is_whitespace()
+            && (ch == '*' || i == 0 || !chars[i - 1].is_alphanumeric())
+            && let Some(rel_close) = chars[i + 1..].iter().position(|&c| c == ch)
+        {
+            let close = i + 1 + rel_close;
+            let valid_close = close > i + 1
+                && !chars[close - 1].is_whitespace()
+                && (ch == '*' || close + 1 >= chars.len() || !chars[close + 1].is_alphanumeric());
+            if valid_close {
+                for &inner in &chars[i + 1..close] {
+                    out.push(inner);
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
+fn collapse_speech_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_space = true;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Prepare a full Markdown document (or selection) for on-demand TTS playback.
+///
+/// Skips fenced code blocks (` ``` ` / `~~~`), `$$...$$` display math blocks,
+/// disarmed `[image: ...]` placeholders, horizontal rules, and Markdown table
+/// separator rows; turns GFM alerts (`[!NOTE]`, `[!WARNING]`, etc.) into spoken
+/// prefixes; strips headings (`# `) and list/checkbox markers while treating
+/// headings and list items as clean sentence boundaries; and splits prose with
+/// the existing German/English-aware [`SentenceAccumulator`].
+pub fn prepare_document_for_speech(markdown: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut prose = String::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut in_display_math = false;
+
+    let flush_prose = |prose: &mut String, out: &mut Vec<String>| {
+        if prose.trim().is_empty() {
+            prose.clear();
+            return;
+        }
+        let mut acc = SentenceAccumulator::default();
+        let mut produced = acc.push_delta(prose);
+        produced.extend(acc.flush_remaining());
+        prose.clear();
+        for raw in produced {
+            let clean = strip_speech_markdown(&raw);
+            if !clean.is_empty() {
+                out.push(clean);
+            }
+        }
+    };
+
+    for raw_line in markdown.lines() {
+        let trimmed = raw_line.trim();
+
+        // Fenced code blocks (` ``` ` or `~~~`, up to 3 leading spaces).
+        let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
+        if let Some((fch, flen)) = fence {
+            if indent <= 3 {
+                let run = trimmed.chars().take_while(|&c| c == fch).count();
+                if run >= flen && trimmed[run..].trim().is_empty() {
+                    fence = None;
+                }
+            }
+            continue;
+        }
+        if !in_display_math && indent <= 3 {
+            if trimmed.starts_with("```") {
+                let run = trimmed.chars().take_while(|&c| c == '`').count();
+                if !trimmed[run..].contains('`') {
+                    flush_prose(&mut prose, &mut sentences);
+                    fence = Some(('`', run));
+                    continue;
+                }
+            } else if trimmed.starts_with("~~~") {
+                let run = trimmed.chars().take_while(|&c| c == '~').count();
+                flush_prose(&mut prose, &mut sentences);
+                fence = Some(('~', run));
+                continue;
+            }
+        }
+
+        // Display math blocks (`$$...$$`).
+        if in_display_math {
+            if trimmed.contains("$$") {
+                in_display_math = false;
+            }
+            continue;
+        }
+        if let Some(after) = trimmed.strip_prefix("$$") {
+            flush_prose(&mut prose, &mut sentences);
+            if !after.contains("$$") {
+                in_display_math = true;
+            }
+            continue;
+        }
+
+        // Blank lines flush the current prose paragraph.
+        if trimmed.is_empty() {
+            flush_prose(&mut prose, &mut sentences);
+            continue;
+        }
+
+        // Strip leading blockquote markers (`>`).
+        let mut line = trimmed;
+        while let Some(after_gt) = line.strip_prefix('>') {
+            line = after_gt.trim_start();
+        }
+        if line.is_empty() {
+            flush_prose(&mut prose, &mut sentences);
+            continue;
+        }
+
+        // Skip thematic breaks / horizontal rules (`---`, `***`, `___`).
+        if is_horizontal_rule(line) {
+            flush_prose(&mut prose, &mut sentences);
+            continue;
+        }
+
+        // Skip Markdown table separator rows (`| --- | :---: |`).
+        if is_table_separator_row(line) {
+            continue;
+        }
+
+        // Convert GFM alert markers (`[!NOTE]`, `[!WARNING]`, etc.) into spoken prefixes.
+        if let Some((label, rest)) = parse_gfm_alert(line) {
+            flush_prose(&mut prose, &mut sentences);
+            prose.push_str(label);
+            if !rest.is_empty() {
+                prose.push_str(rest);
+                prose.push(' ');
+            }
+            continue;
+        }
+
+        // Headings (`# Heading`) are clean sentence boundaries.
+        let hashes = line.chars().take_while(|&c| c == '#').count();
+        if (1..=6).contains(&hashes)
+            && (line.len() == hashes || line[hashes..].starts_with([' ', '\t']))
+        {
+            flush_prose(&mut prose, &mut sentences);
+            let heading = line[hashes..].trim().trim_end_matches('#').trim();
+            let clean = strip_speech_markdown(heading);
+            if !clean.is_empty() {
+                sentences.push(clean);
+            }
+            continue;
+        }
+
+        // Table rows: turn `| A | B |` into `A, B` as a clean boundary.
+        if line.starts_with('|') && line.matches('|').count() >= 2 {
+            flush_prose(&mut prose, &mut sentences);
+            let cells: Vec<String> = line
+                .trim_matches('|')
+                .split('|')
+                .map(|cell| strip_speech_markdown(cell.trim()))
+                .filter(|c| !c.is_empty())
+                .collect();
+            if !cells.is_empty() {
+                sentences.push(cells.join(", "));
+            }
+            continue;
+        }
+
+        // List items & task checkboxes (`- `, `* `, `+ `, `1. `, `1) `, `- [ ] `, `- [x] `).
+        if let Some(item) = strip_list_marker(line) {
+            flush_prose(&mut prose, &mut sentences);
+            prose.push_str(item);
+            flush_prose(&mut prose, &mut sentences);
+            continue;
+        }
+
+        if !prose.is_empty() && !prose.ends_with(' ') {
+            prose.push(' ');
+        }
+        prose.push_str(line);
+    }
+
+    flush_prose(&mut prose, &mut sentences);
+    sentences
+}
+
+fn is_horizontal_rule(line: &str) -> bool {
+    let mut marker: Option<char> = None;
+    let mut count = 0usize;
+    for ch in line.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if !matches!(ch, '-' | '*' | '_') {
+            return false;
+        }
+        if let Some(prev) = marker
+            && prev != ch
+        {
+            return false;
+        }
+        marker = Some(ch);
+        count += 1;
+    }
+    count >= 3
+}
+
+fn is_table_separator_row(line: &str) -> bool {
+    line.contains('|')
+        && line.contains('-')
+        && line
+            .chars()
+            .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+}
+
+fn parse_gfm_alert(line: &str) -> Option<(&'static str, &str)> {
+    const ALERTS: [(&str, &str); 5] = [
+        ("[!NOTE]", "Note: "),
+        ("[!TIP]", "Tip: "),
+        ("[!IMPORTANT]", "Important: "),
+        ("[!WARNING]", "Warning: "),
+        ("[!CAUTION]", "Caution: "),
+    ];
+    let upper_prefix: String = line
+        .chars()
+        .take(16)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    for (tag, spoken) in ALERTS {
+        if upper_prefix.starts_with(tag) {
+            let rest = line[tag.len()..].trim();
+            return Some((spoken, rest));
+        }
+    }
+    None
+}
+
+fn strip_list_marker(line: &str) -> Option<&str> {
+    let rest = if let Some(after) = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+    {
+        after
+    } else {
+        let digits = line.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digits == 0 || digits >= line.len() {
+            return None;
+        }
+        let after_digits = &line[digits..];
+        after_digits
+            .strip_prefix(". ")
+            .or_else(|| after_digits.strip_prefix(") "))?
+    };
+    let rest = rest.trim_start();
+    let rest = rest
+        .strip_prefix("[ ] ")
+        .or_else(|| rest.strip_prefix("[x] "))
+        .or_else(|| rest.strip_prefix("[X] "))
+        .unwrap_or(rest);
+    Some(rest.trim())
+}
+
+/// Latch DE vs EN language across the first ~160 chars of cleaned prose so a
+/// single loanword heading does not mis-select the voice for the whole document.
+fn detect_document_lang(sentences: &[String]) -> &'static str {
+    let mut sample = String::new();
+    for s in sentences {
+        if !sample.is_empty() {
+            sample.push(' ');
+        }
+        sample.push_str(s);
+        if sample.chars().count() >= 160 {
+            break;
+        }
+    }
+    detect_speech_lang(&sample)
+}
+
+fn has_tts_command(speak: &SpeakConfig) -> bool {
+    !speak.command.is_empty() || !speak.command_en.is_empty() || !speak.command_de.is_empty()
 }
 
 fn find_closing_paren(s: &str) -> Option<usize> {
@@ -3058,9 +3662,7 @@ impl SpeechShared {
 
     fn can_speak(&self) -> bool {
         self.speak_enabled.load(Ordering::SeqCst)
-            && (!self.config.command.is_empty()
-                || !self.config.command_en.is_empty()
-                || !self.config.command_de.is_empty()
+            && (has_tts_command(&self.config)
                 || !self.config.earcon_start.is_empty()
                 || !self.config.earcon_done.is_empty())
     }
@@ -3092,6 +3694,13 @@ enum SpeechCmd {
         has_widgets: bool,
         epoch: u64,
     },
+    ReadAloud {
+        id: u64,
+        epoch: u64,
+        sentences: Vec<String>,
+        lang: &'static str,
+        done: oneshot::Sender<()>,
+    },
     Stop {
         epoch: u64,
     },
@@ -3105,6 +3714,16 @@ struct TurnSpeech {
     sentences: VecDeque<String>,
     finishing: bool,
     cut_off_to_viewer: bool,
+    is_read_aloud: bool,
+    done: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for TurnSpeech {
+    fn drop(&mut self) {
+        if let Some(tx) = self.done.take() {
+            let _ = tx.send(());
+        }
+    }
 }
 
 struct RunningTts {
@@ -3150,7 +3769,11 @@ async fn run_speech_actor(shared: Arc<SpeechShared>, mut rx: mpsc::UnboundedRece
                     let lang = *t
                         .lang
                         .get_or_insert_with(|| detect_speech_lang(&raw_sentence));
-                    let clean = strip_speech_markdown(&raw_sentence);
+                    let clean = if t.is_read_aloud {
+                        raw_sentence
+                    } else {
+                        strip_speech_markdown(&raw_sentence)
+                    };
                     let argv = select_tts_command(&shared.config, lang);
                     if !clean.trim().is_empty() && !argv.is_empty() {
                         duck_media(shared.config.media_duck, &mut duck_state).await;
@@ -3166,7 +3789,7 @@ async fn run_speech_actor(shared: Arc<SpeechShared>, mut rx: mpsc::UnboundedRece
                         continue;
                     }
                 } else if t.finishing {
-                    completed_turn = Some((t.id, t.epoch, true));
+                    completed_turn = Some((t.id, t.epoch, !t.is_read_aloud));
                 } else if rx_closed {
                     completed_turn = Some((t.id, t.epoch, false));
                 }
@@ -3271,6 +3894,32 @@ async fn handle_speech_cmd(
                 sentences: VecDeque::new(),
                 finishing: false,
                 cut_off_to_viewer: false,
+                is_read_aloud: false,
+                done: None,
+            });
+        }
+        SpeechCmd::ReadAloud {
+            id,
+            epoch,
+            sentences,
+            lang,
+            done,
+        } => {
+            if epoch != current_epoch || !has_tts_command(&shared.config) {
+                let _ = done.send(());
+                return;
+            }
+            kill_running_tts(shared, running_tts).await;
+            *turn = Some(TurnSpeech {
+                id,
+                epoch,
+                accumulator: SentenceAccumulator::default(),
+                lang: Some(lang),
+                sentences: sentences.into(),
+                finishing: true,
+                cut_off_to_viewer: false,
+                is_read_aloud: true,
+                done: Some(done),
             });
         }
         SpeechCmd::Chunk { id, delta, epoch } => {
@@ -3367,6 +4016,103 @@ fn select_tts_command<'a>(speak: &'a SpeakConfig, lang: &str) -> &'a [String] {
         "en" if !speak.command_en.is_empty() => &speak.command_en,
         _ => &speak.command,
     }
+}
+
+/// Offline fallback TTS playback used by `hey-computer-viewer` when
+/// `hey-computer.sock` is unreachable (e.g. viewing a standalone Markdown file
+/// while the daemon is stopped). Returns `Ok(true)` if spoken to completion,
+/// `Ok(false)` if cancelled or empty, or `Err` if no TTS command is configured.
+pub async fn speak_text_local(
+    config: &SpeakConfig,
+    text: String,
+    mut cancel: watch::Receiver<bool>,
+) -> anyhow::Result<bool> {
+    if !has_tts_command(config) {
+        anyhow::bail!(
+            "no TTS command is configured (set present.speak.command, command_en, or command_de)"
+        );
+    }
+    let sentences = prepare_document_for_speech(&text);
+    if sentences.is_empty() || *cancel.borrow() {
+        return Ok(false);
+    }
+    let lang = detect_document_lang(&sentences);
+    let argv = select_tts_command(config, lang);
+    if argv.is_empty() {
+        anyhow::bail!("no TTS command available for language `{lang}`");
+    }
+
+    let mut duck_state = DuckState::Idle;
+    duck_media(config.media_duck, &mut duck_state).await;
+
+    let program = argv[0].replace("{lang}", lang);
+    let args: Vec<String> = argv[1..]
+        .iter()
+        .map(|a| a.replace("{lang}", lang))
+        .collect();
+
+    let mut completed = true;
+    for sentence in sentences {
+        if *cancel.borrow() {
+            completed = false;
+            break;
+        }
+        let mut child = match Command::new(&program)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                restore_media(&mut duck_state).await;
+                anyhow::bail!("cannot start TTS command {program}: {e}");
+            }
+        };
+        let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
+        if let Some(mut stdin) = child.stdin.take() {
+            let mut payload = sentence.into_bytes();
+            payload.push(b'\n');
+            tokio::spawn(async move {
+                let _ = stdin.write_all(&payload).await;
+                let _ = stdin.shutdown().await;
+            });
+        }
+
+        let cancelled = loop {
+            tokio::select! {
+                biased;
+                res = cancel.changed() => {
+                    if res.is_err() || *cancel.borrow() {
+                        break true;
+                    }
+                }
+                status = child.wait() => {
+                    if let Ok(st) = status && !st.success() {
+                        tracing::debug!("local tts command exited with {st}");
+                    }
+                    break false;
+                }
+            }
+        };
+        if cancelled {
+            if let Some(p) = pgid {
+                unsafe {
+                    libc::kill(-p, libc::SIGKILL);
+                }
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            completed = false;
+            break;
+        }
+    }
+
+    restore_media(&mut duck_state).await;
+    Ok(completed)
 }
 
 fn spawn_tts_sentence(
@@ -5533,5 +6279,129 @@ mod tests {
                 "wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.80",
             ]
         );
+    }
+
+    #[test]
+    fn prepare_document_for_speech_skips_code_math_images_tables_and_handles_alerts() {
+        let doc = "\
+# Morning Brief
+
+> [!NOTE]
+> Rain arrives at **15:00** in [Hamburg](https://example.test).
+
+```rust
+fn secret_code() { println!(\"skip me\"); }
+```
+
+$$
+E = mc^2
+$$
+
+Here is the first sentence. Second sentence with *emphasis* and [image: chart](https://x.test/a.png).
+
+| Service | State |
+| --- | :---: |
+| Daemon | Ready |
+
+- [x] Buy coffee
+- Review PR #88
+";
+        let sentences = prepare_document_for_speech(doc);
+        assert_eq!(
+            sentences,
+            vec![
+                "Morning Brief",
+                "Note: Rain arrives at 15:00 in Hamburg.",
+                "Here is the first sentence.",
+                "Second sentence with emphasis and .",
+                "Service, State",
+                "Daemon, Ready",
+                "Buy coffee",
+                "Review PR #88",
+            ]
+        );
+        // Single English heading + German body latches German over first ~160 chars.
+        let de_doc =
+            "# Dashboard\n\nHeute ist es im Büro ruhig und wir haben am 25. Mai einen Termin.";
+        let de_sents = prepare_document_for_speech(de_doc);
+        assert_eq!(detect_document_lang(&de_sents), "de");
+    }
+
+    #[tokio::test]
+    async fn desktop_read_aloud_bypasses_speak_enabled_and_rich_cutoff_and_local_cancels() {
+        let dir = std::env::temp_dir().join(format!("hc-read-aloud-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("spoken.log");
+
+        let mut cfg = PresentConfig {
+            notifications: false,
+            ..PresentConfig::default()
+        };
+        // Notice: speak.enabled is FALSE, yet on-demand ReadAloud must still speak!
+        cfg.speak = SpeakConfig {
+            enabled: false,
+            voice_only: true,
+            command_en: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("printf 'en:%s\\n' \"$(cat)\" >> '{}'", log_path.display()),
+                "sh".to_string(),
+            ],
+            command_de: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("printf 'de:%s\\n' \"$(cat)\" >> '{}'", log_path.display()),
+                "sh".to_string(),
+            ],
+            media_duck: MediaDuck::None,
+            ..SpeakConfig::default()
+        };
+
+        let desktop = Desktop::spawn(&cfg, dir.join("answers"));
+        let (_id, done_rx) = desktop
+            .read_aloud("# Summary\n\n```sh\necho skip\n```\n\nThe server is healthy.".to_string())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("read_aloud should finish")
+            .unwrap();
+        desktop.finish().await;
+
+        let spoken = std::fs::read_to_string(&log_path).unwrap();
+        assert!(spoken.contains("en:Summary\n"), "{spoken}");
+        assert!(spoken.contains("en:The server is healthy.\n"), "{spoken}");
+        assert!(!spoken.contains("echo skip"), "{spoken}");
+
+        // Offline `speak_text_local` cancels promptly when watch receiver flips true.
+        let local_pid = dir.join("local.pid");
+        let mut slow_speak = cfg.speak.clone();
+        slow_speak.command_en = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo $$ > '{}'; exec sleep 10", local_pid.display()),
+            "sh".to_string(),
+        ];
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            speak_text_local(
+                &slow_speak,
+                "First sentence. Second sentence.".to_string(),
+                cancel_rx,
+            )
+            .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !local_pid.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(local_pid.exists());
+        let t0 = Instant::now();
+        let _ = cancel_tx.send(true);
+        let completed = task.await.unwrap().unwrap();
+        assert!(!completed);
+        assert!(t0.elapsed() < Duration::from_secs(2));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -103,15 +103,58 @@ enum Command {
         #[command(subcommand)]
         action: Option<ScheduleCommand>,
     },
-    /// Search past completed answers using the local SQLite FTS5 index.
-    Recall {
+    /// Browse recent conversation history and active tasks (fast read-only SQLite feed).
+    History {
+        /// Maximum number of history items to return (1..=200).
+        #[arg(short = 'n', long, default_value_t = 60)]
+        limit: usize,
+        /// Restrict history items to one lane (`all` by default).
+        #[arg(long, value_enum, default_value_t = LaneFilter::All)]
+        lane: LaneFilter,
+        /// Show individual turns instead of collapsing multi-turn conversations.
+        #[arg(long)]
+        no_threads: bool,
+        /// Include failed and cancelled turns alongside completed answers.
+        #[arg(long)]
+        include_failed: bool,
+        /// Include suppressed heartbeat turns (implies `--include-failed`).
+        #[arg(long)]
+        all: bool,
         /// Only include turns created at or after this time (`24h`, `7d`, `2w`,
         /// `today`, `yesterday`, or `YYYY-MM-DD`).
         #[arg(long, value_name = "SPEC")]
         since: Option<String>,
-        /// Only include turns created before this time.
-        #[arg(long, value_name = "SPEC")]
+        /// Emit structured JSON (`{now_ms, query, active_tasks, items}`).
+        #[arg(long)]
+        json: bool,
+        /// Optional full-text search query (uses SQLite FTS5).
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        query: Vec<String>,
+    },
+    /// Search past completed answers using the local SQLite FTS5 index.
+    Recall {
+        /// Only include turns created at or after this time (`24h`, `7d`, `2w`,
+        /// `today`, `yesterday`, or `YYYY-MM-DD`).
+        #[arg(long, value_name = "SPEC", conflicts_with_all = ["on", "id", "thread"])]
+        since: Option<String>,
+        /// Only include turns created before this time (`24h`, `7d`, `today`,
+        /// `yesterday`, or `YYYY-MM-DD`; calendar dates are inclusive of that entire day).
+        #[arg(long, value_name = "SPEC", conflicts_with_all = ["on", "id", "thread"])]
         until: Option<String>,
+        /// Only include turns created on a single local calendar day (`today`,
+        /// `yesterday`, or `YYYY-MM-DD`).
+        #[arg(long, value_name = "DATE", conflicts_with_all = ["since", "until", "id", "thread"])]
+        on: Option<String>,
+        /// Exclude automated scheduled, pre-collector, and distill turns.
+        #[arg(long)]
+        user_only: bool,
+        /// Fetch a single turn by numeric ID (sanitized inside `<untrusted_recall>`).
+        #[arg(long, value_name = "ID", conflicts_with_all = ["thread", "on", "since", "until"])]
+        id: Option<u64>,
+        /// Fetch the full chronological conversation thread for a turn ID
+        /// (sanitized inside `<untrusted_recall>`).
+        #[arg(long, value_name = "ID", conflicts_with_all = ["id", "on", "since", "until"])]
+        thread: Option<u64>,
         /// Maximum number of matches to return (1..=50).
         #[arg(short = 'n', long, default_value_t = 5)]
         limit: usize,
@@ -127,7 +170,7 @@ enum Command {
         /// Return full request/answer text (truncated to `--max-chars`) instead of snippets.
         #[arg(long)]
         full: bool,
-        /// Maximum characters per field when `--full` is set.
+        /// Maximum characters per field when `--full`, `--id`, or `--thread` is set.
         #[arg(long, default_value_t = 1200)]
         max_chars: usize,
         /// Pass the query directly to SQLite FTS5 `MATCH` without sanitization.
@@ -176,15 +219,35 @@ enum Command {
     },
     /// Open the native answer viewer (`hey-computer-viewer`).
     View {
-        /// Optional Markdown file to render.
-        #[arg(value_name = "FILE")]
-        file: Option<PathBuf>,
+        /// Optional Markdown file to render, or numeric turn ID (`42` / `#42`)
+        /// when no file with that name exists.
+        #[arg(value_name = "TARGET")]
+        target: Option<String>,
         /// Conversation turn ID to load from `history.db`.
-        #[arg(long, value_name = "ID")]
+        #[arg(long, value_name = "ID", conflicts_with_all = ["schedule", "schedules"])]
         turn_id: Option<u64>,
+        /// Open the Schedule Inspector for one scheduled job (numeric ID or name).
+        #[arg(long, value_name = "TARGET", conflicts_with_all = ["schedules", "turn_id", "history", "recall"])]
+        schedule: Option<String>,
+        /// Open the Scheduled Actions overview in the viewer.
+        #[arg(long, conflicts_with_all = ["schedule", "turn_id", "history", "recall"])]
+        schedules: bool,
+        /// Open the viewer with the History drawer expanded.
+        #[arg(long, conflicts_with_all = ["schedule", "schedules", "recall"])]
+        history: bool,
+        /// Open the viewer with the History drawer pre-filtered by this recall query.
+        #[arg(long, value_name = "QUERY", conflicts_with_all = ["schedule", "schedules", "history"])]
+        recall: Option<String>,
         /// Focus the bottom follow-up composer on startup.
         #[arg(long)]
         focus_composer: bool,
+        /// Spawn the viewer detached and return immediately (auto-enabled inside
+        /// agent turns when `HEY_COMPUTER_AGENT_TURN=1`).
+        #[arg(short = 'd', long, conflicts_with = "foreground")]
+        detach: bool,
+        /// Force foreground exec even when `HEY_COMPUTER_AGENT_TURN=1` is set.
+        #[arg(long, hide = true, conflicts_with = "detach")]
+        foreground: bool,
     },
     /// Print what the daemon is doing.
     Status {
@@ -361,6 +424,15 @@ enum ScheduleCommand {
     Remove { target: String },
     /// Trigger an immediate test run via the running daemon.
     Run { target: String },
+    /// Open one schedule inspector or the all-schedules overview in `hey-computer-viewer`.
+    #[command(visible_alias = "view")]
+    Open {
+        /// Optional numeric ID or schedule name (omit to open the overview).
+        target: Option<String>,
+        /// Spawn the viewer detached and return immediately.
+        #[arg(short = 'd', long)]
+        detach: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -556,17 +628,30 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             return speak_cmd(cli.config.as_deref(), &socket, action, *json).await;
         }
         Command::View {
-            file,
+            target,
             turn_id,
+            schedule,
+            schedules,
+            history,
+            recall,
             focus_composer,
+            detach,
+            foreground,
         } => {
-            return exec_viewer(
+            return view_cmd(
                 cli.config.as_deref(),
                 cli.socket.as_deref(),
-                file.as_deref(),
+                target.as_deref(),
                 *turn_id,
+                schedule.as_deref(),
+                *schedules,
+                *history,
+                recall.as_deref(),
                 *focus_composer,
-            );
+                *detach,
+                *foreground,
+            )
+            .await;
         }
         _ => {}
     }
@@ -636,11 +721,42 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
         Command::Schedule { action } => {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
-            schedule_cmd(&config, &socket, action).await
+            schedule_cmd(
+                &config,
+                cli.config.as_deref(),
+                cli.socket.as_deref(),
+                &socket,
+                action,
+            )
+            .await
         }
+        Command::History {
+            limit,
+            lane,
+            no_threads,
+            include_failed,
+            all,
+            since,
+            json,
+            query,
+        } => history_cmd(
+            &config,
+            limit,
+            lane.into_lane(),
+            no_threads,
+            include_failed,
+            all,
+            since,
+            json,
+            query,
+        ),
         Command::Recall {
             since,
             until,
+            on,
+            user_only,
+            id,
+            thread,
             limit,
             lane,
             sort,
@@ -655,6 +771,10 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             &config,
             since,
             until,
+            on,
+            user_only,
+            id,
+            thread,
             limit,
             lane.into_lane(),
             sort.into_sort(),
@@ -842,30 +962,51 @@ async fn speak_cmd(
     }
 }
 
-fn build_viewer_args(
-    config_path: Option<&Path>,
-    socket_path: Option<&Path>,
-    file: Option<&Path>,
+#[derive(Debug, Default)]
+struct ViewerLaunchArgs<'a> {
+    config_path: Option<&'a Path>,
+    socket_path: Option<&'a Path>,
+    file: Option<&'a Path>,
     turn_id: Option<u64>,
+    schedule: Option<&'a str>,
+    schedules: bool,
+    history: bool,
+    recall: Option<&'a str>,
     focus_composer: bool,
-) -> Vec<OsString> {
+}
+
+fn build_viewer_args(opts: &ViewerLaunchArgs<'_>) -> Vec<OsString> {
     let mut args = Vec::new();
-    if let Some(cfg) = config_path {
+    if let Some(cfg) = opts.config_path {
         args.push(OsString::from("--config"));
         args.push(cfg.as_os_str().to_os_string());
     }
-    if let Some(sock) = socket_path {
+    if let Some(sock) = opts.socket_path {
         args.push(OsString::from("--socket"));
         args.push(sock.as_os_str().to_os_string());
     }
-    if let Some(id) = turn_id {
+    if let Some(id) = opts.turn_id {
         args.push(OsString::from("--turn-id"));
         args.push(OsString::from(id.to_string()));
     }
-    if focus_composer {
+    if let Some(target) = opts.schedule {
+        args.push(OsString::from("--schedule"));
+        args.push(OsString::from(target));
+    }
+    if opts.schedules {
+        args.push(OsString::from("--schedules"));
+    }
+    if opts.history {
+        args.push(OsString::from("--history"));
+    }
+    if let Some(q) = opts.recall {
+        args.push(OsString::from("--recall"));
+        args.push(OsString::from(q));
+    }
+    if opts.focus_composer {
         args.push(OsString::from("--focus-composer"));
     }
-    if let Some(file) = file {
+    if let Some(file) = opts.file {
         if file.to_string_lossy().starts_with('-') {
             args.push(OsString::from("--"));
         }
@@ -874,17 +1015,129 @@ fn build_viewer_args(
     args
 }
 
-fn exec_viewer(
+/// Interpret a positional `view` target: numeric `<ID>` or `#<ID>` becomes
+/// `turn_id` when no file with that exact path exists on disk.
+fn resolve_view_target(
+    target: Option<&str>,
+    explicit_turn_id: Option<u64>,
+    has_other_mode: bool,
+) -> (Option<PathBuf>, Option<u64>) {
+    let Some(raw) = target else {
+        return (None, explicit_turn_id);
+    };
+    let path = Path::new(raw);
+    if explicit_turn_id.is_none() && !has_other_mode && !path.exists() {
+        let stripped = raw.strip_prefix('#').unwrap_or(raw);
+        if !stripped.is_empty()
+            && stripped.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(parsed) = stripped.parse::<u64>()
+        {
+            return (None, Some(parsed));
+        }
+    }
+    (Some(path.to_path_buf()), explicit_turn_id)
+}
+
+fn should_detach_viewer(detach: bool, foreground: bool) -> bool {
+    detach
+        || (!foreground
+            && std::env::var("HEY_COMPUTER_AGENT_TURN")
+                .ok()
+                .as_deref()
+                .is_some_and(|v| v == "1"))
+}
+
+fn exec_viewer(opts: &ViewerLaunchArgs<'_>) -> Result<ExitCode> {
+    let viewer_bin = distill::resolve_viewer_binary();
+    let args = build_viewer_args(opts);
+    let err = std::process::Command::new(&viewer_bin)
+        .args(&args)
+        .env_remove("HEY_COMPUTER_AGENT_TURN")
+        .exec();
+    Err(err).with_context(|| format!("launching {}", viewer_bin.display()))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn view_cmd(
     config_path: Option<&Path>,
     socket_path: Option<&Path>,
-    file: Option<&Path>,
+    target: Option<&str>,
     turn_id: Option<u64>,
+    schedule: Option<&str>,
+    schedules: bool,
+    history: bool,
+    recall: Option<&str>,
     focus_composer: bool,
+    detach: bool,
+    foreground: bool,
 ) -> Result<ExitCode> {
-    let viewer_bin = distill::resolve_viewer_binary();
-    let args = build_viewer_args(config_path, socket_path, file, turn_id, focus_composer);
-    let err = std::process::Command::new(&viewer_bin).args(&args).exec();
-    Err(err).with_context(|| format!("launching {}", viewer_bin.display()))
+    let has_other_mode = schedule.is_some() || schedules || history || recall.is_some();
+    let (file, resolved_turn_id) = resolve_view_target(target, turn_id, has_other_mode);
+    let launch_args = ViewerLaunchArgs {
+        config_path,
+        socket_path,
+        file: file.as_deref(),
+        turn_id: resolved_turn_id,
+        schedule,
+        schedules,
+        history,
+        recall,
+        focus_composer,
+    };
+
+    if !should_detach_viewer(detach, foreground) {
+        return exec_viewer(&launch_args);
+    }
+
+    let config = match config_path {
+        Some(path) => Config::load(Some(path))?,
+        None => Config::load(None).unwrap_or_default(),
+    };
+    let state_dir = config.state_dir()?;
+
+    let mut fallback_turn_owned: Option<(u64, String, Vec<String>)> = None;
+    if let Some(id) = resolved_turn_id {
+        let Some(turn) = store::get_turn(&state_dir, id)? else {
+            eprintln!("hey-computer: turn #{id} not found");
+            return Ok(ExitCode::FAILURE);
+        };
+        if turn.answer.trim().is_empty() && turn.widgets.is_empty() {
+            eprintln!("hey-computer: turn #{id} has no answer or widgets to open");
+            return Ok(ExitCode::FAILURE);
+        }
+        fallback_turn_owned = Some((turn.id, turn.answer, turn.denied));
+    }
+    if let Some(sched_target) = schedule
+        && store::get_schedule(&state_dir, sched_target)?.is_none()
+    {
+        eprintln!("hey-computer: schedule `{sched_target}` not found");
+        return Ok(ExitCode::FAILURE);
+    }
+    if let Some(path) = file.as_deref()
+        && !path.exists()
+    {
+        eprintln!("hey-computer: file {} does not exist", path.display());
+        return Ok(ExitCode::FAILURE);
+    }
+
+    let viewer_args = build_viewer_args(&launch_args);
+    let fallback_ref = fallback_turn_owned
+        .as_ref()
+        .map(|(id, ans, denied)| (*id, ans.as_str(), denied.as_slice()));
+    present::open_viewer_detached(&config.present, &viewer_args, fallback_ref).await?;
+
+    if let Some(id) = resolved_turn_id {
+        println!("opened turn #{id} in viewer");
+    } else if let Some(sched) = schedule {
+        println!("opened schedule `{sched}` in viewer");
+    } else if schedules {
+        println!("opened schedules overview in viewer");
+    } else if let Some(path) = file.as_deref() {
+        println!("opened {} in viewer", path.display());
+    } else {
+        println!("opened viewer");
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn last(
@@ -915,7 +1168,7 @@ async fn last(
         present::copy_to_clipboard(&config.present, &answer.text).await?;
     } else if open {
         let answers = ipc::runtime_dir()?.join("hey-computer");
-        let viewer_cfg = distill::present_config_for_turn(&config.present, answer.id);
+        let viewer_cfg = present::viewer_config_with_fallback(&config.present, answer.id);
         present::open_answer(
             &viewer_cfg,
             &answers,
@@ -950,10 +1203,94 @@ fn resolve_attachments(files: Vec<PathBuf>, images: Vec<PathBuf>) -> Result<Vec<
 }
 
 #[allow(clippy::too_many_arguments)]
+fn history_cmd(
+    config: &Config,
+    limit: usize,
+    lane: Option<store::Lane>,
+    no_threads: bool,
+    include_failed: bool,
+    all: bool,
+    since: Option<String>,
+    json: bool,
+    words: Vec<String>,
+) -> Result<ExitCode> {
+    let now_ms = store::unix_timestamp_ms();
+    let since_ms = since
+        .as_deref()
+        .map(|s| store::parse_time_spec(s, now_ms))
+        .transpose()?;
+    let query = if words.is_empty() {
+        None
+    } else {
+        Some(words.join(" "))
+    };
+    let state_dir = config.state_dir()?;
+    let feed = store::history_feed(
+        &state_dir,
+        &store::HistoryFeedOptions {
+            query,
+            lane,
+            since_ms,
+            limit,
+            no_threads,
+            include_failed: include_failed || all,
+            include_suppressed: all,
+        },
+    )?;
+    if json {
+        println!("{}", serde_json::to_string(&feed)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !feed.active_tasks.is_empty() {
+        println!("Active tasks:");
+        for task in &feed.active_tasks {
+            let prof = if task.profile.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", task.profile)
+            };
+            println!(
+                "  #{}  [{} {}s{prof}]  {}",
+                task.id,
+                task.status.as_str(),
+                task.elapsed_secs,
+                task.title
+            );
+        }
+    }
+    if feed.items.is_empty() {
+        if feed.active_tasks.is_empty() {
+            println!("no history recorded");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    for item in &feed.items {
+        let turns_suffix = if item.turn_count > 1 {
+            format!(" ({} turns)", item.turn_count)
+        } else {
+            String::new()
+        };
+        println!(
+            "#{}  {:<6}  {:<10}  {}{}",
+            item.id,
+            item.relative_time,
+            item.origin.as_str(),
+            item.title,
+            turns_suffix
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn recall_cmd(
     config: &Config,
     since: Option<String>,
     until: Option<String>,
+    on: Option<String>,
+    user_only: bool,
+    id: Option<u64>,
+    thread: Option<u64>,
     limit: usize,
     lane: Option<store::Lane>,
     sort: store::RecallSort,
@@ -965,21 +1302,62 @@ fn recall_cmd(
     plain: bool,
     words: Vec<String>,
 ) -> Result<ExitCode> {
+    let state_dir = config.state_dir()?;
+    if let Some(target_id) = id.or(thread) {
+        let full_thread = thread.is_some();
+        if json {
+            if full_thread {
+                let mut turns = store::conversation_turns(&state_dir, target_id, true, 0)?;
+                if turns.is_empty()
+                    && let Some(single) = store::get_turn(&state_dir, target_id)?
+                {
+                    turns.push(single);
+                }
+                if turns.is_empty() {
+                    eprintln!("hey-computer: turn #{target_id} not found");
+                    return Ok(ExitCode::FAILURE);
+                }
+                println!("{}", serde_json::to_string(&turns)?);
+            } else {
+                let Some(turn) = store::get_turn(&state_dir, target_id)? else {
+                    eprintln!("hey-computer: turn #{target_id} not found");
+                    return Ok(ExitCode::FAILURE);
+                };
+                println!("{}", serde_json::to_string(&turn)?);
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        let Some(formatted) =
+            store::format_recall_thread(&state_dir, target_id, full_thread, max_chars, plain)?
+        else {
+            eprintln!("hey-computer: turn #{target_id} not found");
+            return Ok(ExitCode::FAILURE);
+        };
+        println!("{formatted}");
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let now_ms = store::unix_timestamp_ms();
-    let since_ms = since
-        .as_deref()
-        .map(|s| store::parse_time_spec(s, now_ms))
-        .transpose()?;
-    let until_ms = until
-        .as_deref()
-        .map(|s| store::parse_until_time_spec(s, now_ms))
-        .transpose()?;
+    let (since_ms, until_ms) = if let Some(day_spec) = on.as_deref() {
+        let (start, end) = store::parse_day_range(day_spec, now_ms)?;
+        (Some(start), Some(end))
+    } else {
+        (
+            since
+                .as_deref()
+                .map(|s| store::parse_time_spec(s, now_ms))
+                .transpose()?,
+            until
+                .as_deref()
+                .map(|s| store::parse_until_time_spec(s, now_ms))
+                .transpose()?,
+        )
+    };
     let query = if words.is_empty() {
         None
     } else {
         Some(words.join(" "))
     };
-    let state_dir = config.state_dir()?;
     let hits = store::recall(
         &state_dir,
         &store::RecallOptions {
@@ -991,6 +1369,7 @@ fn recall_cmd(
             sort,
             match_any,
             raw_fts,
+            user_only,
         },
     )?;
     if json {
@@ -1125,7 +1504,7 @@ async fn tasks(config: &Config, socket: &Path, action: Option<TasksCommand>) -> 
                 return Ok(ExitCode::FAILURE);
             }
             let answers = ipc::runtime_dir()?.join("hey-computer");
-            let viewer_cfg = distill::present_config_for_turn(&config.present, row.id);
+            let viewer_cfg = present::viewer_config_with_fallback(&config.present, row.id);
             present::open_answer(&viewer_cfg, &answers, row.id, &row.answer, &row.denied).await?;
             Ok(ExitCode::SUCCESS)
         }
@@ -1164,8 +1543,169 @@ fn validate_schedule_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn schedule_mode(job: &store::ScheduleRecord) -> &'static str {
+    if !job.script.is_empty() && job.no_agent {
+        "script+notify"
+    } else if !job.script.is_empty() {
+        "script+agent"
+    } else if job.no_agent {
+        "reminder"
+    } else {
+        "agent"
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ScheduleTurnSummary {
+    id: u64,
+    status: store::TurnStatus,
+    created_at_ms: i64,
+    created_local: String,
+    relative_time: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finished_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    profile: String,
+    has_answer: bool,
+    widget_count: usize,
+    answer_preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suppressed_token: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ScheduleListEntry {
+    #[serde(flatten)]
+    record: store::ScheduleRecord,
+    title: String,
+    human_schedule: String,
+    mode: &'static str,
+    running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_run_local: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_run_relative: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_run_local: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_run_relative: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_turn_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_turn_id: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct ScheduleShowEntry {
+    #[serde(flatten)]
+    entry: ScheduleListEntry,
+    recent_turns: Vec<ScheduleTurnSummary>,
+}
+
+async fn query_running_schedules(socket: &Path) -> Vec<u64> {
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        ipc::request(socket, &Request::Status),
+    )
+    .await
+    {
+        Ok(Ok(Reply::Status(status))) => status.running_schedules,
+        _ => Vec::new(),
+    }
+}
+
+fn enrich_schedule(
+    state_dir: &Path,
+    job: store::ScheduleRecord,
+    running_ids: &[u64],
+    now_ms: i64,
+    recent_limit: usize,
+) -> (ScheduleListEntry, Vec<ScheduleTurnSummary>) {
+    let turns =
+        store::list_turns_for_schedule_job(state_dir, &job, recent_limit).unwrap_or_default();
+    let latest_turn_id = turns
+        .iter()
+        .find(|t| {
+            t.status == store::TurnStatus::Completed
+                && (!t.answer.trim().is_empty() || !t.widgets.is_empty())
+        })
+        .map(|t| t.id);
+    let active_turn_id = turns
+        .iter()
+        .find(|t| {
+            matches!(
+                t.status,
+                store::TurnStatus::Running | store::TurnStatus::Queued
+            )
+        })
+        .map(|t| t.id);
+    let running = running_ids.contains(&job.id) || active_turn_id.is_some();
+    let title = scheduler::humanize_schedule_name(&job.name);
+    let human_schedule = scheduler::humanize_schedule_spec(&job.schedule_spec);
+    let mode = schedule_mode(&job);
+    let next_run_local = job.next_run_at.map(store::format_local_timestamp);
+    let next_run_relative = job
+        .next_run_at
+        .map(|ts| store::format_relative_time(ts, now_ms));
+    let last_run_local = job.last_run_at.map(store::format_local_timestamp);
+    let last_run_relative = job
+        .last_run_at
+        .map(|ts| store::format_relative_ago(ts, now_ms));
+
+    let recent_turns = turns
+        .into_iter()
+        .map(|t| {
+            let has_answer = !t.answer.trim().is_empty() || !t.widgets.is_empty();
+            let answer_preview = if !t.answer.trim().is_empty() {
+                store::compact_single_line(&t.answer, 160)
+            } else if !t.widgets.is_empty() {
+                format!("[{} widget(s)]", t.widgets.len())
+            } else if let Some(ref err) = t.error_message {
+                store::compact_single_line(err, 140)
+            } else if let Some(ref tok) = t.suppressed_token {
+                format!("suppressed ({tok})")
+            } else {
+                String::new()
+            };
+            ScheduleTurnSummary {
+                id: t.id,
+                status: t.status,
+                created_at_ms: t.created_at_ms,
+                created_local: store::format_local_timestamp(t.created_at_ms),
+                relative_time: store::format_relative_time(t.created_at_ms, now_ms),
+                finished_at_ms: t.finished_at_ms,
+                profile: t.profile,
+                has_answer,
+                widget_count: t.widgets.len(),
+                answer_preview,
+                error_message: t.error_message,
+                suppressed_token: t.suppressed_token,
+            }
+        })
+        .collect();
+
+    let entry = ScheduleListEntry {
+        record: job,
+        title,
+        human_schedule,
+        mode,
+        running,
+        next_run_local,
+        next_run_relative,
+        last_run_local,
+        last_run_relative,
+        latest_turn_id,
+        active_turn_id,
+    };
+    (entry, recent_turns)
+}
+
 async fn schedule_cmd(
     config: &Config,
+    config_path: Option<&Path>,
+    cli_socket: Option<&Path>,
     socket: &Path,
     action: Option<ScheduleCommand>,
 ) -> Result<ExitCode> {
@@ -1178,7 +1718,13 @@ async fn schedule_cmd(
             let state_dir = config.state_dir()?;
             let jobs = store::list_schedules(&state_dir, all)?;
             if json {
-                println!("{}", serde_json::to_string(&jobs)?);
+                let running_ids = query_running_schedules(socket).await;
+                let now_ms = store::unix_timestamp_ms();
+                let enriched: Vec<ScheduleListEntry> = jobs
+                    .into_iter()
+                    .map(|job| enrich_schedule(&state_dir, job, &running_ids, now_ms, 10).0)
+                    .collect();
+                println!("{}", serde_json::to_string(&enriched)?);
                 return Ok(ExitCode::SUCCESS);
             }
             if jobs.is_empty() {
@@ -1191,15 +1737,7 @@ async fn schedule_cmd(
                     .next_run_at
                     .map(store::format_local_timestamp)
                     .unwrap_or_else(|| "-".to_string());
-                let mode = if !job.script.is_empty() && job.no_agent {
-                    "script+notify"
-                } else if !job.script.is_empty() {
-                    "script+agent"
-                } else if job.no_agent {
-                    "reminder"
-                } else {
-                    "agent"
-                };
+                let mode = schedule_mode(&job);
                 println!(
                     "#{}  {:<20}  {:<6}  {:<13}  {:<16}  next: {}",
                     job.id, job.name, state, mode, job.schedule_spec, next
@@ -1214,7 +1752,17 @@ async fn schedule_cmd(
                 return Ok(ExitCode::FAILURE);
             };
             if json {
-                println!("{}", serde_json::to_string(&job)?);
+                let running_ids = query_running_schedules(socket).await;
+                let now_ms = store::unix_timestamp_ms();
+                let (entry, recent_turns) =
+                    enrich_schedule(&state_dir, job, &running_ids, now_ms, 20);
+                println!(
+                    "{}",
+                    serde_json::to_string(&ScheduleShowEntry {
+                        entry,
+                        recent_turns,
+                    })?
+                );
                 return Ok(ExitCode::SUCCESS);
             }
             println!(
@@ -1446,6 +1994,22 @@ async fn schedule_cmd(
                 other => unexpected(other),
             }
         }
+        ScheduleCommand::Open { target, detach } => {
+            view_cmd(
+                config_path,
+                cli_socket,
+                None,
+                None,
+                target.as_deref(),
+                target.is_none(),
+                false,
+                None,
+                false,
+                detach,
+                false,
+            )
+            .await
+        }
     }
 }
 
@@ -1499,6 +2063,7 @@ async fn ask(
                 reply_to,
                 stream: false,
                 distill: false,
+                schedule_id: None,
             };
             match request_size(&req) {
                 Ok(()) => ipc::ask_request(socket, &req).await,
@@ -1656,6 +2221,44 @@ mod tests {
                 "--no-agent=false",
             ],
             vec!["hey-computer", "recall"],
+            vec!["hey-computer", "history"],
+            vec![
+                "hey-computer",
+                "history",
+                "--limit",
+                "60",
+                "--lane",
+                "all",
+                "--include-failed",
+                "--json",
+            ],
+            vec![
+                "hey-computer",
+                "history",
+                "--no-threads",
+                "--since",
+                "7d",
+                "nixos",
+            ],
+            vec![
+                "hey-computer",
+                "recall",
+                "--on",
+                "yesterday",
+                "--user-only",
+                "coffee",
+            ],
+            vec!["hey-computer", "recall", "--id", "42"],
+            vec!["hey-computer", "recall", "--thread", "42", "--plain"],
+            vec!["hey-computer", "schedule", "open"],
+            vec!["hey-computer", "schedule", "open", "morning-digest", "-d"],
+            vec!["hey-computer", "schedule", "view", "morning-digest"],
+            vec!["hey-computer", "view", "42", "--detach"],
+            vec!["hey-computer", "view", "#42", "--foreground"],
+            vec!["hey-computer", "view", "--schedule", "morning-digest"],
+            vec!["hey-computer", "view", "--schedules"],
+            vec!["hey-computer", "view", "--history"],
+            vec!["hey-computer", "view", "--recall", "nixos"],
             vec![
                 "hey-computer",
                 "recall",
@@ -1833,13 +2436,14 @@ mod tests {
 
     #[test]
     fn viewer_args_forward_config_socket_turn_id_focus_and_file() {
-        let args = build_viewer_args(
-            Some(Path::new("/tmp/cfg.toml")),
-            Some(Path::new("/tmp/hc.sock")),
-            Some(Path::new("/tmp/ans.md")),
-            Some(19),
-            true,
-        );
+        let args = build_viewer_args(&ViewerLaunchArgs {
+            config_path: Some(Path::new("/tmp/cfg.toml")),
+            socket_path: Some(Path::new("/tmp/hc.sock")),
+            file: Some(Path::new("/tmp/ans.md")),
+            turn_id: Some(19),
+            focus_composer: true,
+            ..ViewerLaunchArgs::default()
+        });
         let strings: Vec<String> = args
             .into_iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1857,5 +2461,27 @@ mod tests {
                 "/tmp/ans.md"
             ]
         );
+
+        let sched_args = build_viewer_args(&ViewerLaunchArgs {
+            schedule: Some("morning-digest"),
+            ..ViewerLaunchArgs::default()
+        });
+        assert_eq!(
+            sched_args
+                .into_iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["--schedule", "morning-digest"]
+        );
+
+        let (file, tid) = resolve_view_target(Some("#42"), None, false);
+        assert!(file.is_none());
+        assert_eq!(tid, Some(42));
+        let (file2, tid2) = resolve_view_target(Some("123"), None, false);
+        assert!(file2.is_none());
+        assert_eq!(tid2, Some(123));
+        let (file3, tid3) = resolve_view_target(Some("/tmp/notes.md"), None, false);
+        assert_eq!(file3, Some(PathBuf::from("/tmp/notes.md")));
+        assert!(tid3.is_none());
     }
 }

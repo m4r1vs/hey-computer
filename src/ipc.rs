@@ -157,6 +157,7 @@ pub async fn ask(path: &Path, text: &str, wait: bool, new: bool) -> Result<(u64,
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await

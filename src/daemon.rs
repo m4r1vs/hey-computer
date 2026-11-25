@@ -259,10 +259,40 @@ async fn connection(
     };
 
     match request {
-        Request::Status => send(&mut write, &Reply::Status(handle.status())).await,
+        Request::Status => {
+            let mut status = handle.status();
+            status.running_schedules = scheduler.running_ids();
+            send(&mut write, &Reply::Status(status)).await
+        }
         Request::Speak { action } => {
             let (enabled, speaking) = handle.control_speak(action);
             send(&mut write, &Reply::SpeakStatus { enabled, speaking }).await
+        }
+        Request::ReadAloud { text } => {
+            if text.trim().is_empty() {
+                return send(
+                    &mut write,
+                    &Reply::Error {
+                        message: "the text to read aloud is empty".to_string(),
+                    },
+                )
+                .await;
+            }
+            let (id, finished_rx) = match handle.read_aloud(text) {
+                Ok(pair) => pair,
+                Err(message) => return send(&mut write, &Reply::Error { message }).await,
+            };
+            send(&mut write, &Reply::SpeakStarted { id }).await?;
+            tokio::select! {
+                _ = finished_rx => {
+                    send(&mut write, &Reply::SpeakFinished { id }).await
+                }
+                () = hung_up(&mut reader) => {
+                    tracing::debug!("read_aloud client for speech {id} left");
+                    handle.stop_speech(Some(id));
+                    Ok(())
+                }
+            }
         }
         Request::ScheduleReload => {
             scheduler.reload();
@@ -305,6 +335,7 @@ async fn connection(
             reply_to,
             stream,
             distill,
+            schedule_id,
         } => {
             if new && reply_to.is_some() {
                 return send(
@@ -365,7 +396,7 @@ async fn connection(
                 source,
                 reply_to,
                 distill,
-                schedule_id: None,
+                schedule_id,
                 schedule_has_script: false,
             };
             if stream {
@@ -588,6 +619,7 @@ done
                 reply_to: None,
                 stream: true,
                 distill: false,
+                schedule_id: None,
             },
         )
         .await
@@ -646,6 +678,7 @@ done
                 reply_to: Some(t1_id),
                 stream: false,
                 distill: false,
+                schedule_id: None,
             },
         )
         .await
@@ -678,6 +711,7 @@ done
                 reply_to: Some(t1_id),
                 stream: false,
                 distill: false,
+                schedule_id: None,
             },
         )
         .await
@@ -715,6 +749,7 @@ done
                 reply_to: None,
                 stream: false,
                 distill: false,
+                schedule_id: None,
             },
         )
         .await
@@ -752,6 +787,7 @@ done
                 reply_to: None,
                 stream: false,
                 distill: false,
+                schedule_id: None,
             },
         )
         .await

@@ -504,7 +504,21 @@ impl Handle {
             background_queued: shared.bg_queued,
             speak,
             speaking,
+            running_schedules: Vec::new(),
         }
+    }
+
+    /// Start on-demand document/selection TTS playback via the presenter.
+    pub fn read_aloud(
+        &self,
+        text: String,
+    ) -> std::result::Result<(u64, oneshot::Receiver<()>), String> {
+        self.presenter.read_aloud(text)
+    }
+
+    /// Immediately stop active or queued TTS speech (optionally scoped to `only`).
+    pub fn stop_speech(&self, only: Option<u64>) -> Option<u64> {
+        self.presenter.stop_speech(only)
     }
 
     pub fn control_speak(&self, action: SpeakAction) -> (bool, bool) {

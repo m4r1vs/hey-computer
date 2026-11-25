@@ -1278,6 +1278,7 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1304,6 +1305,7 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1336,6 +1338,7 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1359,6 +1362,7 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1434,6 +1438,7 @@ async fn mid_session_config_rejection_falls_back_to_a_fresh_session() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1467,6 +1472,7 @@ async fn unknown_profile_returns_error_without_superseding_running_request() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1529,6 +1535,7 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1574,6 +1581,7 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1604,6 +1612,7 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1653,6 +1662,7 @@ async fn background_task_runs_concurrently_with_interactive_and_survives_interac
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1754,6 +1764,7 @@ async fn background_tasks_queue_fifo_respect_max_queued_and_cancel_by_id() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1774,6 +1785,7 @@ async fn background_tasks_queue_fifo_respect_max_queued_and_cancel_by_id() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1796,6 +1808,7 @@ async fn background_tasks_queue_fifo_respect_max_queued_and_cancel_by_id() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1849,6 +1862,7 @@ async fn suppress_token_silences_heartbeats_and_notifies_on_alerts() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1878,6 +1892,7 @@ async fn suppress_token_silences_heartbeats_and_notifies_on_alerts() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -1902,6 +1917,7 @@ async fn suppress_token_silences_heartbeats_and_notifies_on_alerts() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2003,6 +2019,7 @@ async fn mcp_config_is_written_privately_and_profile_mcp_allowlist_is_enforced()
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2281,6 +2298,7 @@ async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2303,6 +2321,7 @@ async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2330,6 +2349,7 @@ async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2357,6 +2377,7 @@ async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2383,6 +2404,7 @@ async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2424,6 +2446,7 @@ async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2493,6 +2516,7 @@ async fn triage_background_promotion_clears_running_and_expiring_recurring_sched
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2520,6 +2544,7 @@ async fn triage_background_promotion_clears_running_and_expiring_recurring_sched
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2657,6 +2682,7 @@ async fn section3_ux_and_conductor_quirks_regression() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2695,6 +2721,7 @@ async fn section3_ux_and_conductor_quirks_regression() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2733,6 +2760,7 @@ async fn section3_ux_and_conductor_quirks_regression() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2752,6 +2780,7 @@ async fn section3_ux_and_conductor_quirks_regression() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2794,6 +2823,7 @@ async fn section3_ux_and_conductor_quirks_regression() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2870,6 +2900,7 @@ async fn section3_ux_and_conductor_quirks_regression() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -2970,6 +3001,7 @@ async fn phase5_mcp_ui_streaming_reply_to_resumption_and_voice_tts_modality() {
             reply_to: None,
             stream: true,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -3037,6 +3069,7 @@ async fn phase5_mcp_ui_streaming_reply_to_resumption_and_voice_tts_modality() {
             reply_to: Some(agenda_id),
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -3067,6 +3100,7 @@ async fn phase5_mcp_ui_streaming_reply_to_resumption_and_voice_tts_modality() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -3088,6 +3122,7 @@ async fn phase5_mcp_ui_streaming_reply_to_resumption_and_voice_tts_modality() {
             reply_to: Some(bg_id),
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -3141,6 +3176,7 @@ async fn phase5_mcp_ui_streaming_reply_to_resumption_and_voice_tts_modality() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -3180,6 +3216,7 @@ async fn phase5_mcp_ui_streaming_reply_to_resumption_and_voice_tts_modality() {
             reply_to: None,
             stream: false,
             distill: false,
+            schedule_id: None,
         },
     )
     .await
@@ -3225,6 +3262,82 @@ async fn phase5_mcp_ui_streaming_reply_to_resumption_and_voice_tts_modality() {
         .unwrap();
     assert_eq!(cancel_reply, Reply::Cancelled { id: Some(voice_id) });
     assert!(h.recorder.stopped_speech().contains(&None));
+
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn read_aloud_streams_completion_and_stops_immediately_on_disconnect() {
+    let h = Harness::start(r#"{"turns": []}"#, |cfg| {
+        cfg.agent.warm_start = false;
+    })
+    .await;
+
+    // 1. Empty text returns Reply::Error cleanly.
+    let err = ipc::request(
+        &h.socket,
+        &Request::ReadAloud {
+            text: "   ".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(err, Reply::Error { .. }), "{err:?}");
+
+    // 2. Normal completion: SpeakStarted -> SpeakFinished.
+    let mut client = ipc::Client::send(
+        &h.socket,
+        &Request::ReadAloud {
+            text: "# Brief\n\nAll systems are nominal.".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let started_id = match client.next(Some(Duration::from_secs(5))).await.unwrap() {
+        Reply::SpeakStarted { id } => id,
+        other => panic!("expected SpeakStarted, got {other:?}"),
+    };
+    let finished_id = match client.next(Some(Duration::from_secs(5))).await.unwrap() {
+        Reply::SpeakFinished { id } => id,
+        other => panic!("expected SpeakFinished, got {other:?}"),
+    };
+    assert_eq!(started_id, finished_id);
+    assert_eq!(h.recorder.read_alouds().len(), 1);
+
+    // 3. Held ReadAloud: dropping the client socket immediately invokes stop_speech(Some(id)).
+    h.recorder.set_hold_read_aloud(true);
+    let mut held_client = ipc::Client::send(
+        &h.socket,
+        &Request::ReadAloud {
+            text: "Long paragraph being spoken aloud.".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let held_id = match held_client
+        .next(Some(Duration::from_secs(5)))
+        .await
+        .unwrap()
+    {
+        Reply::SpeakStarted { id } => id,
+        other => panic!("expected SpeakStarted, got {other:?}"),
+    };
+    assert!(h.status().await.speaking);
+    drop(held_client);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if h.recorder.stopped_speech().contains(&Some(held_id)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    assert!(
+        h.recorder.stopped_speech().contains(&Some(held_id)),
+        "expected stop_speech(Some({held_id})) on disconnect, got {:?}",
+        h.recorder.stopped_speech()
+    );
+    assert!(!h.status().await.speaking);
 
     h.stop().await;
 }

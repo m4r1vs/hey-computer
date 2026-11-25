@@ -886,11 +886,18 @@ CREATE INDEX idx_turns_distill ON turns(created_at DESC, id DESC)
     WHERE status = 'completed'
       AND schedule_id IS NULL
       AND origin NOT IN ('schedule', 'schedule_script', 'distill');
+CREATE INDEX IF NOT EXISTS idx_turns_schedule_id ON turns(schedule_id, id DESC)
+    WHERE schedule_id IS NOT NULL;
 "#;
+
+const IDX_TURNS_SCHEDULE_ID: &str = "CREATE INDEX IF NOT EXISTS idx_turns_schedule_id \
+    ON turns(schedule_id, id DESC) WHERE schedule_id IS NOT NULL;";
 
 fn migrate(conn: &mut Connection) -> Result<()> {
     let cur: i32 = conn.query_row("PRAGMA user_version;", [], |r| r.get(0))?;
     if cur == DB_SCHEMA_VERSION {
+        conn.execute_batch(IDX_TURNS_SCHEDULE_ID)
+            .context("ensuring idx_turns_schedule_id index")?;
         return Ok(());
     }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1154,7 +1161,9 @@ pub fn load_last_for_lane(state_dir: &Path, lane: Option<Lane>) -> Result<Option
                 .query_row(
                     &format!(
                         "SELECT {TURN_COLUMNS} FROM turns
-                         WHERE status = 'completed' AND length(trim(answer)) > 0 AND lane = ?1
+                         WHERE status = 'completed'
+                           AND (length(trim(answer)) > 0 OR widgets_json != '[]')
+                           AND lane = ?1
                          ORDER BY id DESC LIMIT 1"
                     ),
                     params![lane.as_str()],
@@ -1165,7 +1174,8 @@ pub fn load_last_for_lane(state_dir: &Path, lane: Option<Lane>) -> Result<Option
                 .query_row(
                     &format!(
                         "SELECT {TURN_COLUMNS} FROM turns
-                         WHERE status = 'completed' AND length(trim(answer)) > 0
+                         WHERE status = 'completed'
+                           AND (length(trim(answer)) > 0 OR widgets_json != '[]')
                          ORDER BY id DESC LIMIT 1"
                     ),
                     [],
@@ -1284,6 +1294,96 @@ pub fn get_turn(state_dir: &Path, id: u64) -> Result<Option<TurnRecord>> {
         )
         .optional()?;
     Ok(turn)
+}
+
+/// List recent turns linked to `schedule_id`, newest first (`ORDER BY id DESC`).
+///
+/// When `schedule_id` has zero directly linked turns and the schedule row in
+/// `schedules` is a distillation job (name or script references `distill`),
+/// falls back to pre-existing `origin = 'distill'` turns so historical
+/// `weekly-distill` runs remain inspectable.
+pub fn list_turns_for_schedule(
+    state_dir: &Path,
+    schedule_id: u64,
+    limit: usize,
+) -> Result<Vec<TurnRecord>> {
+    let Some(conn) = open_reader_connection(state_dir)? else {
+        return Ok(Vec::new());
+    };
+    let cap = limit.clamp(1, 200) as i64;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {TURN_COLUMNS}
+         FROM turns
+         WHERE schedule_id = ?1
+         ORDER BY id DESC
+         LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(params![schedule_id as i64, cap], row_to_turn)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    if out.is_empty() && has_schedules_table(&conn)? {
+        let is_distill: bool = conn
+            .query_row(
+                "SELECT (lower(name) LIKE '%distill%' OR lower(script) LIKE '%distill%')
+                 FROM schedules WHERE id = ?1",
+                params![schedule_id as i64],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            != 0;
+        if is_distill {
+            let mut fallback = conn.prepare(&format!(
+                "SELECT {TURN_COLUMNS}
+                 FROM turns
+                 WHERE origin = 'distill'
+                 ORDER BY id DESC
+                 LIMIT ?1"
+            ))?;
+            let fb_rows = fallback.query_map(params![cap], row_to_turn)?;
+            for row in fb_rows {
+                out.push(row?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// List recent turns belonging to a [`ScheduleRecord`], newest first, with
+/// automatic `origin = 'distill'` fallback for distill jobs.
+pub fn list_turns_for_schedule_job(
+    state_dir: &Path,
+    job: &ScheduleRecord,
+    limit: usize,
+) -> Result<Vec<TurnRecord>> {
+    let turns = list_turns_for_schedule(state_dir, job.id, limit)?;
+    if !turns.is_empty() {
+        return Ok(turns);
+    }
+    let looks_distill = job.name.to_ascii_lowercase().contains("distill")
+        || job.script.to_ascii_lowercase().contains("distill");
+    if !looks_distill {
+        return Ok(turns);
+    }
+    let Some(conn) = open_reader_connection(state_dir)? else {
+        return Ok(Vec::new());
+    };
+    let cap = limit.clamp(1, 200) as i64;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {TURN_COLUMNS}
+         FROM turns
+         WHERE origin = 'distill'
+         ORDER BY id DESC
+         LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map(params![cap], row_to_turn)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 /// Load completed turns belonging to the same conversation as `target_id`,
@@ -1455,6 +1555,7 @@ pub struct RecallOptions {
     pub sort: RecallSort,
     pub match_any: bool,
     pub raw_fts: bool,
+    pub user_only: bool,
 }
 
 impl Default for RecallOptions {
@@ -1468,6 +1569,7 @@ impl Default for RecallOptions {
             sort: RecallSort::Relevance,
             match_any: false,
             raw_fts: false,
+            user_only: false,
         }
     }
 }
@@ -1478,6 +1580,14 @@ pub struct RecallHit {
     pub lane: Lane,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<u64>,
+    #[serde(default)]
+    pub origin: TurnOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<u64>,
+    #[serde(default)]
+    pub widget_count: usize,
     pub created_at_ms: i64,
     pub created_local: String,
     pub request: String,
@@ -1563,35 +1673,61 @@ pub fn recall(state_dir: &Path, opts: &RecallOptions) -> Result<Vec<RecallHit>> 
         .map(str::trim)
         .filter(|q| !q.is_empty());
 
+    let user_only_flag = i64::from(opts.user_only);
+
     let Some(raw_query) = raw_query else {
         let mut stmt = conn.prepare(
-            "SELECT id, lane, profile, created_at, request, answer
+            "SELECT id, lane, profile, conversation_id, origin, schedule_id, widgets_json,
+                    created_at, request, answer
              FROM turns
              WHERE status = 'completed'
-               AND length(trim(answer)) > 0
+               AND (length(trim(answer)) > 0 OR widgets_json != '[]')
                AND (?1 IS NULL OR lane = ?1)
                AND (?2 IS NULL OR created_at >= ?2)
                AND (?3 IS NULL OR created_at < ?3)
+               AND (?4 = 0 OR (schedule_id IS NULL AND origin NOT IN ('schedule', 'schedule_script', 'distill')))
              ORDER BY created_at DESC, id DESC
-             LIMIT ?4",
+             LIMIT ?5",
         )?;
         let rows = stmt.query_map(
-            params![lane_param, opts.since_ms, opts.until_ms, limit],
+            params![
+                lane_param,
+                opts.since_ms,
+                opts.until_ms,
+                user_only_flag,
+                limit
+            ],
             |row| {
                 let id: i64 = row.get(0)?;
                 let lane_str: String = row.get(1)?;
                 let profile: String = row.get(2)?;
-                let created_at_ms: i64 = row.get(3)?;
-                let request: String = row.get(4)?;
-                let answer: String = row.get(5)?;
+                let conversation_id: Option<i64> = row.get(3)?;
+                let origin_str: String = row.get(4)?;
+                let schedule_id: Option<i64> = row.get(5)?;
+                let widgets_json: String = row.get(6)?;
+                let created_at_ms: i64 = row.get(7)?;
+                let request: String = row.get(8)?;
+                let answer: String = row.get(9)?;
+                let widgets: Vec<WidgetSpec> =
+                    serde_json::from_str(&widgets_json).unwrap_or_default();
+                let widget_count = widgets.len();
+                let ans_snippet = if answer.trim().is_empty() && !widgets.is_empty() {
+                    summarize_widgets(&widgets)
+                } else {
+                    truncate_chars(&answer, 240)
+                };
                 Ok(RecallHit {
                     id: id.max(0) as u64,
                     lane: Lane::parse(&lane_str).unwrap_or(Lane::Interactive),
                     profile,
+                    conversation_id: conversation_id.map(|c| c.max(0) as u64),
+                    origin: TurnOrigin::parse(&origin_str),
+                    schedule_id: schedule_id.map(|s| s.max(0) as u64),
+                    widget_count,
                     created_at_ms,
                     created_local: format_local_timestamp(created_at_ms),
                     req_snippet: truncate_chars(&request, 120),
-                    ans_snippet: truncate_chars(&answer, 240),
+                    ans_snippet,
                     request,
                     answer,
                     score: None,
@@ -1621,7 +1757,8 @@ pub fn recall(state_dir: &Path, opts: &RecallOptions) -> Result<Vec<RecallHit>> 
     };
     let sql = format!(
         "SELECT
-             t.id, t.lane, t.profile, t.created_at, t.request, t.answer,
+             t.id, t.lane, t.profile, t.conversation_id, t.origin, t.schedule_id, t.widgets_json,
+             t.created_at, t.request, t.answer,
              snippet(turns_fts, 0, '«', '»', '…', 20) AS req_snippet,
              snippet(turns_fts, 1, '«', '»', '…', 48) AS ans_snippet,
              bm25(turns_fts, 1.5, 1.0)
@@ -1634,8 +1771,9 @@ pub fn recall(state_dir: &Path, opts: &RecallOptions) -> Result<Vec<RecallHit>> 
            AND (?3 IS NULL OR t.lane = ?3)
            AND (?4 IS NULL OR t.created_at >= ?4)
            AND (?5 IS NULL OR t.created_at < ?5)
+           AND (?6 = 0 OR (t.schedule_id IS NULL AND t.origin NOT IN ('schedule', 'schedule_script', 'distill')))
          ORDER BY {order}
-         LIMIT ?6"
+         LIMIT ?7"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -1646,22 +1784,34 @@ pub fn recall(state_dir: &Path, opts: &RecallOptions) -> Result<Vec<RecallHit>> 
                 lane_param,
                 opts.since_ms,
                 opts.until_ms,
+                user_only_flag,
                 limit
             ],
             |row| {
                 let id: i64 = row.get(0)?;
                 let lane_str: String = row.get(1)?;
                 let profile: String = row.get(2)?;
-                let created_at_ms: i64 = row.get(3)?;
-                let request: String = row.get(4)?;
-                let answer: String = row.get(5)?;
-                let req_snippet: String = row.get(6)?;
-                let ans_snippet: String = row.get(7)?;
-                let score: f64 = row.get(8)?;
+                let conversation_id: Option<i64> = row.get(3)?;
+                let origin_str: String = row.get(4)?;
+                let schedule_id: Option<i64> = row.get(5)?;
+                let widgets_json: String = row.get(6)?;
+                let created_at_ms: i64 = row.get(7)?;
+                let request: String = row.get(8)?;
+                let answer: String = row.get(9)?;
+                let req_snippet: String = row.get(10)?;
+                let ans_snippet: String = row.get(11)?;
+                let score: f64 = row.get(12)?;
+                let widget_count = serde_json::from_str::<Vec<serde_json::Value>>(&widgets_json)
+                    .map(|v| v.len())
+                    .unwrap_or(0);
                 Ok(RecallHit {
                     id: id.max(0) as u64,
                     lane: Lane::parse(&lane_str).unwrap_or(Lane::Interactive),
                     profile,
+                    conversation_id: conversation_id.map(|c| c.max(0) as u64),
+                    origin: TurnOrigin::parse(&origin_str),
+                    schedule_id: schedule_id.map(|s| s.max(0) as u64),
+                    widget_count,
                     created_at_ms,
                     created_local: format_local_timestamp(created_at_ms),
                     request,
@@ -1761,6 +1911,42 @@ pub fn parse_until_time_spec(spec: &str, now_ms: i64) -> Result<i64> {
         return local_date_end_to_ms(year, month, day);
     }
     parse_time_spec(spec, now_ms)
+}
+
+/// Parse a single calendar day (`today`, `yesterday`, or `YYYY-MM-DD`) into
+/// `[start_ms, end_ms)` spanning local `00:00:00` through `23:59:59.999`.
+pub fn parse_day_range(spec: &str, now_ms: i64) -> Result<(i64, i64)> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        bail!("date specification is empty (expected `today`, `yesterday`, or `YYYY-MM-DD`)");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "today" {
+        return Ok((local_midnight_ms(now_ms, 0)?, local_midnight_ms(now_ms, 1)?));
+    }
+    if lower == "yesterday" {
+        return Ok((
+            local_midnight_ms(now_ms, -1)?,
+            local_midnight_ms(now_ms, 0)?,
+        ));
+    }
+    let parts: Vec<&str> = trimmed.split('-').collect();
+    if parts.len() == 3
+        && let (Ok(year), Ok(month), Ok(day)) = (
+            parts[0].parse::<i32>(),
+            parts[1].parse::<i32>(),
+            parts[2].parse::<i32>(),
+        )
+        && (1970..=9999).contains(&year)
+        && (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+    {
+        return Ok((
+            local_date_to_ms(year, month, day)?,
+            local_date_end_to_ms(year, month, day)?,
+        ));
+    }
+    bail!("unrecognized date `{spec}` (expected `today`, `yesterday`, or `YYYY-MM-DD`)");
 }
 
 unsafe extern "C" {
@@ -1882,6 +2068,93 @@ fn truncate_chars(text: &str, max: usize) -> String {
     }
 }
 
+fn summarize_widgets(widgets: &[WidgetSpec]) -> String {
+    let titles: Vec<&str> = widgets
+        .iter()
+        .map(|w| w.title.trim())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if titles.is_empty() {
+        format!("[{} widget(s)]", widgets.len())
+    } else {
+        truncate_chars(&format!("[widget: {}]", titles.join(", ")), 200)
+    }
+}
+
+/// Format a compact relative duration string between `target_ms` and `now_ms`.
+/// Past timestamps yield e.g. `"now"`, `"4m"`, `"2h"`, `"3d"`, `"2w"`; future
+/// timestamps yield e.g. `"in <1m"`, `"in 14m"`, `"in 2h"`, `"in 3d"`.
+pub fn format_relative_time(target_ms: i64, now_ms: i64) -> String {
+    let diff_ms = target_ms - now_ms;
+    if diff_ms > 0 {
+        let secs = diff_ms / 1000;
+        if secs < 60 {
+            return "in <1m".to_string();
+        }
+        let mins = secs / 60;
+        if mins < 60 {
+            return format!("in {mins}m");
+        }
+        let hours = mins / 60;
+        if hours < 48 {
+            return format!("in {hours}h");
+        }
+        let days = hours / 24;
+        if days < 14 {
+            return format!("in {days}d");
+        }
+        return format!("in {}w", days / 7);
+    }
+
+    let ago_secs = (-diff_ms) / 1000;
+    if ago_secs < 60 {
+        return "now".to_string();
+    }
+    let mins = ago_secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    if days < 14 {
+        return format!("{days}d");
+    }
+    if days < 60 {
+        return format!("{}w", days / 7);
+    }
+    let full = format_local_timestamp(target_ms);
+    full.get(..10).unwrap_or(&full).to_string()
+}
+
+/// Format a past timestamp as `"just now"`, `"4m ago"`, `"2h ago"`, `"3d ago"`,
+/// or a local date for older runs (used in `schedule list/show --json`).
+pub fn format_relative_ago(target_ms: i64, now_ms: i64) -> String {
+    let ago_secs = (now_ms - target_ms).max(0) / 1000;
+    if ago_secs < 60 {
+        return "just now".to_string();
+    }
+    let mins = ago_secs / 60;
+    if mins < 60 {
+        return format!("{mins}m ago");
+    }
+    let hours = mins / 60;
+    if hours < 48 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    if days < 14 {
+        return format!("{days}d ago");
+    }
+    if days < 60 {
+        return format!("{}w ago", days / 7);
+    }
+    let full = format_local_timestamp(target_ms);
+    full.get(..10).unwrap_or(&full).to_string()
+}
+
 /// Format recall hits for text output, wrapped in `<untrusted_recall>` by
 /// default for prompt-injection hygiene.
 pub fn format_recall_output(
@@ -1903,14 +2176,26 @@ pub fn format_recall_output(
         if idx > 0 {
             body.push_str("\n---\n");
         }
+        let root_conv = hit.conversation_id.unwrap_or(hit.id);
         let profile_part = if hit.profile.is_empty() {
             String::new()
         } else {
             format!(" profile={}", hit.profile)
         };
+        let widgets_part = if hit.widget_count > 0 {
+            format!(" widgets={}", hit.widget_count)
+        } else {
+            String::new()
+        };
         body.push_str(&format!(
-            "[#{} {} lane={}{}]\n",
-            hit.id, hit.created_local, hit.lane, profile_part
+            "[#{} {} conv={} lane={} origin={}{}{}]\n",
+            hit.id,
+            hit.created_local,
+            root_conv,
+            hit.lane,
+            hit.origin.as_str(),
+            profile_part,
+            widgets_part
         ));
         let (req, ans) = if full {
             (
@@ -1936,6 +2221,580 @@ pub fn format_recall_output(
     } else {
         format!("<untrusted_recall>\n{}</untrusted_recall>", body)
     }
+}
+
+/// Load a single turn (`full_thread = false`) or its full chronological
+/// conversation thread (`full_thread = true`) and format it wrapped in
+/// `<untrusted_recall>` with [`sanitize_recall_text`] unless `plain` is set.
+pub fn format_recall_thread(
+    state_dir: &Path,
+    turn_id: u64,
+    full_thread: bool,
+    max_chars: usize,
+    plain: bool,
+) -> Result<Option<String>> {
+    let turns = if full_thread {
+        let mut thread = conversation_turns(state_dir, turn_id, true, 0)?;
+        if thread.is_empty()
+            && let Some(single) = get_turn(state_dir, turn_id)?
+        {
+            thread.push(single);
+        }
+        thread
+    } else {
+        match get_turn(state_dir, turn_id)? {
+            Some(turn) => vec![turn],
+            None => Vec::new(),
+        }
+    };
+    if turns.is_empty() {
+        return Ok(None);
+    }
+
+    let mut body = String::new();
+    for (idx, turn) in turns.iter().enumerate() {
+        if idx > 0 {
+            body.push_str("\n---\n");
+        }
+        let root_conv = turn.conversation_id.unwrap_or(turn.id);
+        let profile_part = if turn.profile.is_empty() {
+            String::new()
+        } else {
+            format!(" profile={}", turn.profile)
+        };
+        let widgets_part = if !turn.widgets.is_empty() {
+            format!(" widgets={}", turn.widgets.len())
+        } else {
+            String::new()
+        };
+        let status_part = if turn.status != TurnStatus::Completed {
+            format!(" status={}", turn.status)
+        } else {
+            String::new()
+        };
+        body.push_str(&format!(
+            "[#{} {} conv={} lane={} origin={}{}{}{}]\n",
+            turn.id,
+            format_local_timestamp(turn.created_at_ms),
+            root_conv,
+            turn.lane,
+            turn.origin.as_str(),
+            profile_part,
+            widgets_part,
+            status_part
+        ));
+        let req = if max_chars > 0 {
+            truncate_chars(&turn.request, max_chars)
+        } else {
+            turn.request.clone()
+        };
+        let ans_raw = if !turn.answer.trim().is_empty() {
+            turn.answer.clone()
+        } else if !turn.widgets.is_empty() {
+            summarize_widgets(&turn.widgets)
+        } else if let Some(err) = &turn.error_message {
+            format!("[error: {err}]")
+        } else if let Some(tok) = &turn.suppressed_token {
+            format!("[suppressed: {tok}]")
+        } else {
+            String::new()
+        };
+        let ans = if max_chars > 0 {
+            truncate_chars(&ans_raw, max_chars)
+        } else {
+            ans_raw
+        };
+        if plain {
+            body.push_str(&format!("Q: {req}\nA: {ans}\n"));
+        } else {
+            body.push_str(&format!(
+                "Q: {}\nA: {}\n",
+                sanitize_recall_text(&req),
+                sanitize_recall_text(&ans)
+            ));
+        }
+    }
+
+    if plain {
+        Ok(Some(body.trim_end().to_string()))
+    } else {
+        Ok(Some(format!(
+            "<untrusted_recall>\n{body}</untrusted_recall>"
+        )))
+    }
+}
+
+/// Options for [`history_feed`].
+#[derive(Debug, Clone)]
+pub struct HistoryFeedOptions {
+    pub query: Option<String>,
+    pub lane: Option<Lane>,
+    pub since_ms: Option<i64>,
+    pub limit: usize,
+    pub no_threads: bool,
+    pub include_failed: bool,
+    pub include_suppressed: bool,
+}
+
+impl Default for HistoryFeedOptions {
+    fn default() -> Self {
+        Self {
+            query: None,
+            lane: None,
+            since_ms: None,
+            limit: 60,
+            no_threads: false,
+            include_failed: false,
+            include_suppressed: false,
+        }
+    }
+}
+
+/// Compact representation of an active or queued turn for Rofi / UI feeds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveTaskItem {
+    pub id: u64,
+    pub lane: Lane,
+    pub status: TurnStatus,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
+    pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    pub elapsed_secs: u64,
+    pub title: String,
+    pub request: String,
+    pub origin: TurnOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_name: Option<String>,
+}
+
+/// Compact single-line sanitized past conversation or turn entry for Rofi / UI feeds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryItem {
+    pub id: u64,
+    pub conversation_id: u64,
+    pub turn_count: usize,
+    pub lane: Lane,
+    pub status: TurnStatus,
+    pub origin: TurnOrigin,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_name: Option<String>,
+    pub created_at_ms: i64,
+    pub created_local: String,
+    pub created_date: String,
+    pub relative_time: String,
+    pub title: String,
+    pub request_preview: String,
+    pub answer_preview: String,
+    pub widget_count: usize,
+    pub has_answer: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_preview: Option<String>,
+}
+
+/// Single-shot read-only SQLite feed returned by `hey-computer history --json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryFeed {
+    pub now_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    pub active_tasks: Vec<ActiveTaskItem>,
+    pub items: Vec<HistoryItem>,
+}
+
+/// Collapse whitespace, strip control/bidi chars, and truncate to `max` chars
+/// for safe single-line Rofi / terminal display (never emits `\0` or `\x1f`).
+pub fn compact_single_line(raw: &str, max: usize) -> String {
+    let mut cleaned = String::with_capacity(raw.len().min(max * 4));
+    let mut prev_space = true;
+    for ch in raw.chars() {
+        if is_bidi_or_bad_control(ch) || ch == '\x1f' {
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !prev_space {
+                cleaned.push(' ');
+                prev_space = true;
+            }
+        } else {
+            cleaned.push(ch);
+            prev_space = false;
+        }
+    }
+    truncate_chars(cleaned.trim(), max)
+}
+
+fn extract_markdown_heading(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+        if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with([' ', '\t']) {
+            let heading = trimmed[hashes..].trim().trim_end_matches('#').trim();
+            if !heading.is_empty() {
+                return Some(compact_single_line(heading, 84));
+            }
+        }
+        break;
+    }
+    None
+}
+
+fn derive_history_title(
+    origin: TurnOrigin,
+    schedule_name: Option<&str>,
+    root_request: &str,
+    answer: &str,
+    widgets: &[WidgetSpec],
+) -> String {
+    if let Some(sched) = schedule_name {
+        if let Some(heading) = extract_markdown_heading(answer) {
+            return heading;
+        }
+        return crate::scheduler::humanize_schedule_name(sched);
+    }
+    if origin == TurnOrigin::Distill {
+        if let Some(heading) = extract_markdown_heading(answer) {
+            return heading;
+        }
+        return "Memory & Skill Distillation".to_string();
+    }
+    let req = compact_single_line(root_request, 84);
+    if !req.is_empty() {
+        return req;
+    }
+    if let Some(heading) = extract_markdown_heading(answer) {
+        return heading;
+    }
+    if let Some(w) = widgets.first()
+        && !w.title.trim().is_empty()
+    {
+        return compact_single_line(&w.title, 84);
+    }
+    "(untitled)".to_string()
+}
+
+fn derive_answer_preview(
+    status: TurnStatus,
+    answer: &str,
+    widgets: &[WidgetSpec],
+    error_message: Option<&str>,
+    fail_reason: Option<&str>,
+    suppressed_token: Option<&str>,
+) -> String {
+    if !answer.trim().is_empty() {
+        // Strip leading `#` markers from first heading line so previews read cleanly.
+        let mut lines = Vec::new();
+        for line in answer.lines().take(6) {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with("```") || t.starts_with("~~~") {
+                continue;
+            }
+            let stripped = t.trim_start_matches('#').trim();
+            if !stripped.is_empty() {
+                lines.push(stripped);
+            }
+        }
+        return compact_single_line(&lines.join(" "), 180);
+    }
+    if !widgets.is_empty() {
+        return compact_single_line(&summarize_widgets(widgets), 180);
+    }
+    match status {
+        TurnStatus::Failed | TurnStatus::Cancelled => {
+            let detail = error_message.or(fail_reason).unwrap_or(status.as_str());
+            compact_single_line(detail, 140)
+        }
+        TurnStatus::Suppressed => compact_single_line(
+            &format!(
+                "suppressed ({})",
+                suppressed_token.unwrap_or("HEARTBEAT_OK")
+            ),
+            140,
+        ),
+        _ => String::new(),
+    }
+}
+
+/// Fast single-shot read-only SQLite feed of active background/interactive tasks
+/// plus chronological (thread-collapsed) or FTS5-matched past history items.
+pub fn history_feed(state_dir: &Path, opts: &HistoryFeedOptions) -> Result<HistoryFeed> {
+    let now_ms = unix_timestamp_ms();
+    let raw_query = opts
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(str::to_string);
+
+    let Some(conn) = open_reader_connection(state_dir)? else {
+        return Ok(HistoryFeed {
+            now_ms,
+            query: raw_query,
+            active_tasks: Vec::new(),
+            items: Vec::new(),
+        });
+    };
+
+    let has_sched = has_schedules_table(&conn)?;
+    let sched_join = if has_sched {
+        "LEFT JOIN schedules s ON s.id = t.schedule_id"
+    } else {
+        ""
+    };
+    let sched_col = if has_sched { "s.name" } else { "NULL" };
+
+    // 1. Active & queued tasks.
+    let mut active_tasks = Vec::new();
+    {
+        let sql = format!(
+            "SELECT t.id, t.lane, t.status, t.profile, t.created_at, t.started_at,
+                    t.request, t.origin, t.schedule_id, {sched_col}
+             FROM turns t
+             {sched_join}
+             WHERE t.status IN ('queued', 'running')
+             ORDER BY CASE WHEN t.status = 'running' THEN 0 ELSE 1 END ASC, t.id ASC
+             LIMIT 20"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let lane_str: String = row.get(1)?;
+            let status_str: String = row.get(2)?;
+            let profile: String = row.get(3)?;
+            let created_at_ms: i64 = row.get(4)?;
+            let started_at_ms: Option<i64> = row.get(5)?;
+            let request: String = row.get(6)?;
+            let origin_str: String = row.get(7)?;
+            let schedule_id: Option<i64> = row.get(8)?;
+            let schedule_name: Option<String> = row.get(9)?;
+            let origin = TurnOrigin::parse(&origin_str);
+            let ref_ms = started_at_ms.unwrap_or(created_at_ms);
+            let elapsed_secs = ((now_ms - ref_ms).max(0) / 1000) as u64;
+            let title = if let Some(ref sname) = schedule_name {
+                crate::scheduler::humanize_schedule_name(sname)
+            } else {
+                compact_single_line(&request, 84)
+            };
+            Ok(ActiveTaskItem {
+                id: id.max(0) as u64,
+                lane: Lane::parse(&lane_str).unwrap_or(Lane::Background),
+                status: TurnStatus::parse(&status_str).unwrap_or(TurnStatus::Running),
+                profile,
+                created_at_ms,
+                started_at_ms,
+                elapsed_secs,
+                title,
+                request: compact_single_line(&request, 240),
+                origin,
+                schedule_id: schedule_id.map(|v| v.max(0) as u64),
+                schedule_name,
+            })
+        })?;
+        for row in rows {
+            active_tasks.push(row?);
+        }
+    }
+
+    let limit = opts.limit.clamp(1, 200) as i64;
+    let lane_param = opts.lane.map(Lane::as_str);
+
+    // 2. History items: FTS5 search when query is provided, else chronological (optionally thread-collapsed).
+    let mut items = Vec::new();
+    if let Some(ref q) = raw_query {
+        if let Some(fts_query) = build_fts_query(q, false) {
+            let sql = format!(
+                "SELECT t.id, COALESCE(t.conversation_id, t.id) AS conv_id, 1 AS turn_count,
+                        t.lane, t.status, t.origin, t.profile, t.schedule_id, {sched_col},
+                        t.created_at, t.request, t.request AS root_request, t.answer,
+                        t.widgets_json, t.error_message, t.fail_reason, t.suppressed_token,
+                        bm25(turns_fts, 1.5, 1.0)
+                          / (1.0 + (MAX(0, ?1 - t.created_at) / (86400000.0 * 30.0))) AS score
+                 FROM turns_fts
+                 JOIN turns t ON t.id = turns_fts.rowid
+                 {sched_join}
+                 WHERE turns_fts MATCH ?2
+                   AND t.status = 'completed'
+                   AND length(trim(t.answer)) > 0
+                   AND (?3 IS NULL OR t.lane = ?3)
+                   AND (?4 IS NULL OR t.created_at >= ?4)
+                 ORDER BY score ASC, t.created_at DESC, t.id DESC
+                 LIMIT ?5"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(
+                    params![now_ms, fts_query, lane_param, opts.since_ms, limit],
+                    |row| row_to_history_item(row, now_ms),
+                )
+                .context("running FTS5 history feed query")?;
+            for row in rows {
+                items.push(row?);
+            }
+        }
+    } else {
+        let status_clause = if opts.include_suppressed {
+            "((t.status = 'completed' AND (length(trim(t.answer)) > 0 OR t.widgets_json != '[]')) \
+              OR t.status IN ('failed', 'cancelled', 'suppressed'))"
+        } else if opts.include_failed {
+            "((t.status = 'completed' AND (length(trim(t.answer)) > 0 OR t.widgets_json != '[]')) \
+              OR t.status IN ('failed', 'cancelled'))"
+        } else {
+            "(t.status = 'completed' AND (length(trim(t.answer)) > 0 OR t.widgets_json != '[]'))"
+        };
+
+        let sql = if opts.no_threads {
+            format!(
+                "SELECT t.id, COALESCE(t.conversation_id, t.id) AS conv_id, 1 AS turn_count,
+                        t.lane, t.status, t.origin, t.profile, t.schedule_id, {sched_col},
+                        t.created_at, t.request, t.request AS root_request, t.answer,
+                        t.widgets_json, t.error_message, t.fail_reason, t.suppressed_token
+                 FROM turns t
+                 {sched_join}
+                 WHERE {status_clause}
+                   AND (?1 IS NULL OR t.lane = ?1)
+                   AND (?2 IS NULL OR t.created_at >= ?2)
+                 ORDER BY t.created_at DESC, t.id DESC
+                 LIMIT ?3"
+            )
+        } else {
+            format!(
+                "WITH filtered AS (
+                     SELECT t.id, COALESCE(t.conversation_id, t.id) AS conv_id,
+                            t.lane, t.status, t.origin, t.profile, t.schedule_id,
+                            {sched_col} AS schedule_name,
+                            t.created_at, t.request, t.answer, t.widgets_json,
+                            t.error_message, t.fail_reason, t.suppressed_token,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY COALESCE(t.conversation_id, t.id)
+                                ORDER BY t.id DESC
+                            ) AS rn,
+                            COUNT(*) OVER (
+                                PARTITION BY COALESCE(t.conversation_id, t.id)
+                            ) AS turn_count,
+                            FIRST_VALUE(t.request) OVER (
+                                PARTITION BY COALESCE(t.conversation_id, t.id)
+                                ORDER BY t.id ASC
+                            ) AS root_request
+                     FROM turns t
+                     {sched_join}
+                     WHERE {status_clause}
+                       AND (?1 IS NULL OR t.lane = ?1)
+                       AND (?2 IS NULL OR t.created_at >= ?2)
+                 )
+                 SELECT id, conv_id, turn_count, lane, status, origin, profile,
+                        schedule_id, schedule_name, created_at, request, root_request,
+                        answer, widgets_json, error_message, fail_reason, suppressed_token
+                 FROM filtered
+                 WHERE rn = 1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?3"
+            )
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![lane_param, opts.since_ms, limit], |row| {
+            row_to_history_item(row, now_ms)
+        })?;
+        for row in rows {
+            items.push(row?);
+        }
+    }
+
+    Ok(HistoryFeed {
+        now_ms,
+        query: raw_query,
+        active_tasks,
+        items,
+    })
+}
+
+fn row_to_history_item(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Result<HistoryItem> {
+    let id: i64 = row.get(0)?;
+    let conv_id: i64 = row.get(1)?;
+    let turn_count: i64 = row.get(2)?;
+    let lane_str: String = row.get(3)?;
+    let status_str: String = row.get(4)?;
+    let origin_str: String = row.get(5)?;
+    let profile: String = row.get(6)?;
+    let schedule_id: Option<i64> = row.get(7)?;
+    let schedule_name: Option<String> = row.get(8)?;
+    let created_at_ms: i64 = row.get(9)?;
+    let request: String = row.get(10)?;
+    let root_request: String = row.get(11)?;
+    let answer: String = row.get(12)?;
+    let widgets_json: String = row.get(13)?;
+    let error_message: Option<String> = row.get(14)?;
+    let fail_reason: Option<String> = row.get(15)?;
+    let suppressed_token: Option<String> = row.get(16)?;
+
+    let status = TurnStatus::parse(&status_str).unwrap_or(TurnStatus::Failed);
+    let origin = TurnOrigin::parse(&origin_str);
+    let widgets: Vec<WidgetSpec> = serde_json::from_str(&widgets_json).unwrap_or_default();
+    let widget_count = widgets.len();
+    let created_local = format_local_timestamp(created_at_ms);
+    let created_date = created_local
+        .get(..10)
+        .unwrap_or(&created_local)
+        .to_string();
+    let title = derive_history_title(
+        origin,
+        schedule_name.as_deref(),
+        &root_request,
+        &answer,
+        &widgets,
+    );
+    let request_preview = compact_single_line(&request, 140);
+    let answer_preview = derive_answer_preview(
+        status,
+        &answer,
+        &widgets,
+        error_message.as_deref(),
+        fail_reason.as_deref(),
+        suppressed_token.as_deref(),
+    );
+    let has_answer = !answer.trim().is_empty() || widget_count > 0;
+    let error_preview = if matches!(status, TurnStatus::Failed | TurnStatus::Cancelled) {
+        Some(compact_single_line(
+            error_message
+                .as_deref()
+                .or(fail_reason.as_deref())
+                .unwrap_or(status.as_str()),
+            140,
+        ))
+    } else {
+        None
+    };
+
+    Ok(HistoryItem {
+        id: id.max(0) as u64,
+        conversation_id: conv_id.max(0) as u64,
+        turn_count: turn_count.max(1) as usize,
+        lane: Lane::parse(&lane_str).unwrap_or(Lane::Interactive),
+        status,
+        origin,
+        profile,
+        schedule_id: schedule_id.map(|v| v.max(0) as u64),
+        schedule_name,
+        created_at_ms,
+        created_local,
+        created_date,
+        relative_time: format_relative_time(created_at_ms, now_ms),
+        title,
+        request_preview,
+        answer_preview,
+        widget_count,
+        has_answer,
+        error_preview,
+    })
 }
 
 /// How scheduled job failures are delivered.
@@ -3252,6 +4111,264 @@ mod tests {
 
         let today = local_today_ymd();
         assert_eq!(today.len(), 10);
+
+        store.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_feed_schedule_turns_recall_filters_and_widget_only_turns() {
+        let dir = scratch("history-feed-and-recall");
+        let (store, _) = Store::open(&dir, &HistoryConfig::default()).unwrap();
+        let now = unix_timestamp_ms();
+
+        // Create two schedules: morning-digest (#1) and weekly-distill (#2).
+        let morning = create_schedule(
+            &dir,
+            &NewSchedule {
+                name: "morning-digest".to_string(),
+                schedule_spec: "*/5 5-14 * * *".to_string(),
+                prompt: "brief".to_string(),
+                profile: "deep".to_string(),
+                script: "collect".to_string(),
+                no_agent: false,
+                suppress_token: Some("HEARTBEAT_OK".to_string()),
+                failure_deliver: FailureDeliver::Notify,
+                max_runs: None,
+                expires_at: None,
+                next_run_at: now + 60_000,
+            },
+            10,
+        )
+        .unwrap();
+        let weekly = create_schedule(
+            &dir,
+            &NewSchedule {
+                name: "weekly-distill".to_string(),
+                schedule_spec: "0 18 * * 0".to_string(),
+                prompt: String::new(),
+                profile: String::new(),
+                script: "hey-computer distill -b".to_string(),
+                no_agent: true,
+                suppress_token: None,
+                failure_deliver: FailureDeliver::Log,
+                max_runs: None,
+                expires_at: None,
+                next_run_at: now + 120_000,
+            },
+            10,
+        )
+        .unwrap();
+
+        // Multi-turn user conversation: turn 1 -> turn 2 (conv_id = 1).
+        store.create_turn(NewTurn {
+            id: 1,
+            lane: Lane::Interactive,
+            status: TurnStatus::Running,
+            profile: String::new(),
+            created_at_ms: now - 20_000,
+            request: "How does NixOS flake locking work?".to_string(),
+            attachments: vec![],
+            origin: TurnOrigin::Voice,
+            schedule_id: None,
+        });
+        store.mark_running(
+            1,
+            Lane::Interactive,
+            "s1".to_string(),
+            Some(1),
+            String::new(),
+            now - 20_000,
+        );
+        store.finish_completed(
+            1,
+            "Flake locks pin inputs in flake.lock.".to_string(),
+            vec![],
+            now - 19_000,
+        );
+
+        store.create_turn(NewTurn {
+            id: 2,
+            lane: Lane::Interactive,
+            status: TurnStatus::Running,
+            profile: String::new(),
+            created_at_ms: now - 15_000,
+            request: "And how do I update just one input?".to_string(),
+            attachments: vec![],
+            origin: TurnOrigin::Typed,
+            schedule_id: None,
+        });
+        store.mark_running(
+            2,
+            Lane::Interactive,
+            "s1".to_string(),
+            Some(1),
+            String::new(),
+            now - 15_000,
+        );
+        store.finish_completed(
+            2,
+            "Run nix flake update <input>.".to_string(),
+            vec![],
+            now - 14_000,
+        );
+
+        // Turn 3: scheduled Morning Brief turn.
+        store.create_turn(NewTurn {
+            id: 3,
+            lane: Lane::Background,
+            status: TurnStatus::Running,
+            profile: "deep".to_string(),
+            created_at_ms: now - 10_000,
+            request: "long collector prompt".to_string(),
+            attachments: vec![],
+            origin: TurnOrigin::ScheduleScript,
+            schedule_id: Some(morning.id),
+        });
+        store.finish_completed(
+            3,
+            "# Morning Brief — Wednesday\n\nQuiet start ahead.".to_string(),
+            vec![],
+            now - 9_000,
+        );
+
+        // Turn 4: widget-only interactive turn (empty answer, 1 widget).
+        let widget = WidgetSpec {
+            id: "w-1".to_string(),
+            kind: "transit_board".to_string(),
+            title: "U3 Departures".to_string(),
+            data: serde_json::json!({}),
+        };
+        store.create_turn(NewTurn {
+            id: 4,
+            lane: Lane::Interactive,
+            status: TurnStatus::Running,
+            profile: String::new(),
+            created_at_ms: now - 8_000,
+            request: "Next train?".to_string(),
+            attachments: vec![],
+            origin: TurnOrigin::Voice,
+            schedule_id: None,
+        });
+        store.finish_completed_with_widgets(4, String::new(), vec![], vec![widget], now - 7_500);
+
+        // Turn 5: historical distill turn with schedule_id = None (tests fallback!).
+        store.create_turn(NewTurn {
+            id: 5,
+            lane: Lane::Background,
+            status: TurnStatus::Running,
+            profile: "deep".to_string(),
+            created_at_ms: now - 6_000,
+            request: "distill review".to_string(),
+            attachments: vec![],
+            origin: TurnOrigin::Distill,
+            schedule_id: None,
+        });
+        store.finish_completed(
+            5,
+            "No memory changes needed.".to_string(),
+            vec![],
+            now - 5_500,
+        );
+
+        // Turn 6: currently running background task.
+        store.create_turn(NewTurn {
+            id: 6,
+            lane: Lane::Background,
+            status: TurnStatus::Running,
+            profile: "deep".to_string(),
+            created_at_ms: now - 3_000,
+            request: "Summarize PR #88 diff".to_string(),
+            attachments: vec![],
+            origin: TurnOrigin::Typed,
+            schedule_id: None,
+        });
+
+        store.flush().await;
+
+        // 1. `load_last_for_lane` includes widget-only completed turn #4!
+        let last_interactive = load_last_for_lane(&dir, Some(Lane::Interactive))
+            .unwrap()
+            .unwrap();
+        assert_eq!(last_interactive.id, 4);
+        assert_eq!(last_interactive.widgets.len(), 1);
+
+        // 2. `list_turns_for_schedule` returns #3 for morning-digest and falls back to #5 for weekly-distill!
+        let morning_turns = list_turns_for_schedule(&dir, morning.id, 10).unwrap();
+        assert_eq!(
+            morning_turns.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![3]
+        );
+        let weekly_turns = list_turns_for_schedule(&dir, weekly.id, 10).unwrap();
+        assert_eq!(
+            weekly_turns.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![5]
+        );
+
+        // 3. `recall` with `user_only = true` skips scheduled (#3) and distill (#5) turns,
+        //    and includes widget-only turn (#4) in empty-query recall.
+        let user_hits = recall(
+            &dir,
+            &RecallOptions {
+                user_only: true,
+                limit: 10,
+                ..RecallOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            user_hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![4, 2, 1]
+        );
+        assert_eq!(user_hits[0].widget_count, 1);
+        assert_eq!(user_hits[1].conversation_id, Some(1));
+        assert_eq!(user_hits[1].origin, TurnOrigin::Typed);
+
+        let formatted = format_recall_output(&user_hits, false, 1200, false);
+        assert!(formatted.contains("conv=1"), "{formatted}");
+        assert!(formatted.contains("origin=voice"), "{formatted}");
+        assert!(formatted.contains("widgets=1"), "{formatted}");
+
+        // 4. `format_recall_thread` returns full chronological conversation wrapped in `<untrusted_recall>`.
+        let thread_text = format_recall_thread(&dir, 2, true, 1200, false)
+            .unwrap()
+            .unwrap();
+        assert!(thread_text.starts_with("<untrusted_recall>\n"));
+        assert!(thread_text.contains("[#1 "));
+        assert!(thread_text.contains("[#2 "));
+        assert!(thread_text.contains("flake.lock"));
+        assert!(thread_text.contains("nix flake update"));
+
+        // 5. `history_feed` surfaces active task #6 and collapses conversation 1 (#1 + #2 -> id #2, turn_count 2).
+        let feed = history_feed(&dir, &HistoryFeedOptions::default()).unwrap();
+        assert_eq!(feed.active_tasks.len(), 1);
+        assert_eq!(feed.active_tasks[0].id, 6);
+        let conv_item = feed.items.iter().find(|i| i.id == 2).unwrap();
+        assert_eq!(conv_item.conversation_id, 1);
+        assert_eq!(conv_item.turn_count, 2);
+        assert_eq!(conv_item.title, "How does NixOS flake locking work?");
+        let brief_item = feed.items.iter().find(|i| i.id == 3).unwrap();
+        assert_eq!(brief_item.schedule_name.as_deref(), Some("morning-digest"));
+        assert_eq!(brief_item.title, "Morning Brief — Wednesday");
+
+        // 6. `history_feed` with query uses FTS5.
+        let search_feed = history_feed(
+            &dir,
+            &HistoryFeedOptions {
+                query: Some("flake.lock".to_string()),
+                ..HistoryFeedOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(search_feed.items.len(), 1);
+        assert_eq!(search_feed.items[0].id, 1);
+
+        // 7. `parse_day_range` accepts calendar dates and rejects relative specs.
+        let (s, e) = parse_day_range("2026-11-24", now).unwrap();
+        assert!(e > s);
+        assert!(parse_day_range("today", now).is_ok());
+        assert!(parse_day_range("yesterday", now).is_ok());
+        assert!(parse_day_range("24h", now).is_err());
 
         store.shutdown().await;
         std::fs::remove_dir_all(&dir).unwrap();

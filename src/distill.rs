@@ -1027,6 +1027,14 @@ pub async fn run(config: &Config, socket: &Path, options: &DistillOptions) -> Re
     let skills = scan_existing_skills(config);
     let user_skills_dir = config.user_skills_dir();
 
+    let schedule_id = if options.background {
+        std::env::var("HEY_COMPUTER_SCHEDULE_ID")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    } else {
+        None
+    };
+
     // Shrink the candidate slice only in the extreme case where JSON escaping
     // pushes the wire request line past `MAX_REQUEST_LINE` (256 KiB).
     let mut trimmed_candidates = candidates;
@@ -1049,6 +1057,7 @@ pub async fn run(config: &Config, socket: &Path, options: &DistillOptions) -> Re
             reply_to: None,
             stream: false,
             distill: true,
+            schedule_id,
         };
         let encoded_len = crate::protocol::encode(&req).len() + 1;
         if encoded_len <= MAX_REQUEST_LINE || trimmed_candidates.turns.len() <= 1 {
@@ -1406,6 +1415,7 @@ mod tests {
             reply_to: None,
             stream: false,
             distill: true,
+            schedule_id: None,
         };
         let wire_len = crate::protocol::encode(&req).len() + 1;
         assert!(

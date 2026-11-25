@@ -18,6 +18,9 @@
 //!   `{"type":"cancelled","id":1}` (`null` when nothing matched).
 //! - `{"type":"status"}` → `{"type":"status",…}`.
 //! - `{"type":"speak","action":"toggle"}` → `{"type":"speak_status",…}`.
+//! - `{"type":"read_aloud","text":"…"}` → `{"type":"speak_started","id":…}`,
+//!   then `{"type":"speak_finished","id":…}` when playback completes or is
+//!   stopped; closing the connection stops speech immediately.
 //! - `{"type":"schedule_reload"}` → `{"type":"ok","message":"…"}` (wakes the
 //!   daemon scheduler after a CLI schedule edit).
 //! - `{"type":"schedule_run","target":"…"}` → `{"type":"ok","message":"…"}`
@@ -129,6 +132,11 @@ pub enum Request {
         /// never re-distills its own review runs.
         #[serde(default, skip_serializing_if = "is_false")]
         distill: bool,
+        /// Optional parent schedule ID linking a CLI-triggered background turn
+        /// (such as `hey-computer distill -b` run from a collector script) to
+        /// its originating row in `schedules`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schedule_id: Option<u64>,
     },
     Cancel {
         /// When omitted, cancels the active interactive request (or ongoing TTS
@@ -140,6 +148,12 @@ pub enum Request {
     /// Query or toggle spoken answers (`present.speak`) in the running daemon.
     Speak {
         action: SpeakAction,
+    },
+    /// Speak arbitrary Markdown or plain text on demand (bypassing
+    /// `speak_enabled` and short-answer cutoffs). Streams `SpeakStarted`, then
+    /// `SpeakFinished`; closing the connection stops speech immediately.
+    ReadAloud {
+        text: String,
     },
     /// Wake the daemon's scheduler after a CLI mutation to `schedules`.
     ScheduleReload,
@@ -208,6 +222,14 @@ pub enum Reply {
         enabled: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         speaking: bool,
+    },
+    /// On-demand `ReadAloud` playback started with speech handle `id`.
+    SpeakStarted {
+        id: u64,
+    },
+    /// On-demand `ReadAloud` playback finished or was stopped.
+    SpeakFinished {
+        id: u64,
     },
     /// Generic acknowledgement for control requests (`schedule_reload`, `schedule_run`).
     Ok {
@@ -284,6 +306,9 @@ pub struct Status {
     /// Whether TTS audio is actively playing right now.
     #[serde(default, skip_serializing_if = "is_false")]
     pub speaking: bool,
+    /// IDs of scheduled jobs currently executing (collector script or agent turn).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub running_schedules: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,6 +393,7 @@ mod tests {
                 reply_to: None,
                 stream: false,
                 distill: false,
+                schedule_id: None,
             }
         );
         let cancel: Request = serde_json::from_str(r#"{"type":"cancel"}"#).unwrap();
@@ -395,12 +421,16 @@ mod tests {
                 reply_to: Some(42),
                 stream: true,
                 distill: false,
+                schedule_id: Some(7),
             },
             Request::Cancel { id: None },
             Request::Cancel { id: Some(9) },
             Request::Status,
             Request::Speak {
                 action: SpeakAction::Toggle,
+            },
+            Request::ReadAloud {
+                text: "# Morning Brief\n\nClear skies today.".to_string(),
             },
             Request::ScheduleReload,
             Request::ScheduleRun {
@@ -475,11 +505,14 @@ mod tests {
                 background_queued: 2,
                 speak: true,
                 speaking: false,
+                running_schedules: vec![3, 9],
             }),
             Reply::SpeakStatus {
                 enabled: true,
                 speaking: true,
             },
+            Reply::SpeakStarted { id: 1_000_000_001 },
+            Reply::SpeakFinished { id: 1_000_000_001 },
             Reply::Error {
                 message: "bad".to_string(),
             },
@@ -511,6 +544,20 @@ mod tests {
                 message: "limit".to_string(),
             }),
             r#"{"type":"failed","id":3,"reason":"limit_reached","message":"limit"}"#
+        );
+        assert_eq!(
+            encode(&Request::ReadAloud {
+                text: "Hello".to_string(),
+            }),
+            r#"{"type":"read_aloud","text":"Hello"}"#
+        );
+        assert_eq!(
+            encode(&Reply::SpeakStarted { id: 11 }),
+            r#"{"type":"speak_started","id":11}"#
+        );
+        assert_eq!(
+            encode(&Reply::SpeakFinished { id: 11 }),
+            r#"{"type":"speak_finished","id":11}"#
         );
     }
 
