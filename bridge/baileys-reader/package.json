@@ -1,0 +1,13 @@
+{
+  "name": "hey-computer-baileys-reader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Strictly read-only WhatsApp Web linked-device reader for hey-computer-bridge",
+  "main": "index.mjs",
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "pino": "^9.6.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
