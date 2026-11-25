@@ -76,15 +76,48 @@ end (#4) are in place.
     Short answers should get notification actions too: Copy, Reply (opens the
     typed front end #4 in follow-up mode) and Open in viewer. Keep HTML and
     remote-image disarming for regular Markdown answers.
+
+    *Implementation notes from codebase review:*
+    - **Conversation resumption beyond `follow_up_secs`:** Reading a long answer
+      or interacting with a widget often takes longer than `follow_up_secs`
+      (90 s), after which `conductor.rs` has closed the live ACP session (and
+      background task sessions close immediately on completion). Add
+      `reply_to: Option<u64>` to `Request::Ask` and use the existing
+      `idx_turns_conversation_id` SQLite index in `store.rs` to seed a fresh ACP
+      session with prior turns from `history.db` when the live session is gone.
+    - **Structured `show_widget` delivery:** Capture widget payloads strictly
+      from dedicated ACP tool calls in `conductor::turn`, never from fenced code
+      blocks inside Markdown answers (which untrusted web or note content could
+      forge).
+    - **Short-answer notification replacement & waiter eviction:** Update
+      `wait_action_notification` in `present.rs` to pass
+      `--print-id --replace-id=N` (reading line 1's notification ID before
+      awaiting action selection) so short answers with `Copy` / `Reply` / `Open`
+      actions still replace `"Thinking…"` cleanly in place, and use LRU eviction
+      (rather than dropping new waiters) on `MAX_ACTION_WAITERS` (`16`).
 30. `[Important]` `[Upstream]` **Periodic memory & skill distillation
     (`hey-computer distill`).** Dedicated CLI subcommand (run manually or via a
     weekly background task) that reviews recent `history.db` turns (#17–#18)
-    against `instructions.memory_file` (#8) and proposes a minimal diff to
-    `memory.md` (promoting durable preferences/facts while respecting the
-    4,000-char cap and pruning stale entries) and/or draft `SKILL.md` files for
-    workflows repeated 3+ times. Pairs with the improved viewer (#29) so you
-    review and apply diffs manually — never auto-applied, avoiding skill
-    poisoning.
+    against `instructions.memory_file` / `instructions.memory_files` (#8) and
+    proposes a minimal diff to `memory.md` (promoting durable preferences/facts
+    while respecting the 4,000-char cap and pruning stale entries) and/or draft
+    `SKILL.md` files for workflows repeated 3+ times. Pairs with the improved
+    viewer (#29) so you review and apply diffs manually — never auto-applied,
+    avoiding skill poisoning.
+
+    *Implementation notes from codebase review:*
+    - **Two-tier read-only + mutable memory compatibility:** When `memory.file`
+      points to a read-only `agenix` secret (`/run/agenix/…`) paired with a
+      mutable `$XDG_STATE_HOME/hey-computer/memory.md` via `memory_files`
+      (`memory.extraFiles`, added in `8dc667d`), load the combined memory set
+      for deduplication and `memory_max_chars` budgeting while targeting diffs
+      and writes strictly at the writable state memory file (idle fingerprint
+      auto-reloading will then refresh `AGENTS.md` automatically).
+    - **Exclude scheduled/collector turns:** Add a `schedule_id` / `origin`
+      column on `turns` in `history.db` so `hey-computer distill` skips
+      automated scheduled and pre-collector turns—preventing both false
+      "repeated 3+ times" `SKILL.md` candidates from recurring jobs and
+      memory/skill poisoning from `<untrusted_collector_output>`.
 31. `[Important]` `[Upstream]` **Optional audio feedback hook (`present.speak` /
     earcons, streaming-ready).** For hands-free voice ergonomics, add an
     optional `present.speak` hook (e.g. Piper or Kokoro) or subtle earcons that
@@ -103,6 +136,14 @@ end (#4) are in place.
     easy to reach (voice command, Waybar click), because it's wanted at the desk
     only sometimes.
 
+    *Implementation notes for #31–#32:*
+    - **Post-turn `cancel` & Tier 2 escalation flush:** Route
+      `Request::Cancel { id: None }` (`hey-computer cancel`) to stop active TTS
+      audio in `Presenter` **even after the ACP turn has already completed**,
+      since short spoken answers finish streaming from the LLM seconds before
+      audio playback finishes. Also abort/flush any queued TTS chunks if Tier 2
+      (`escalate_on_failure`) retries a failed `fast` turn on `deep`.
+
 ## Phase 6: Multi-mode isolation & reactive messaging
 
 Highest operational surface; best built once the single-mode daemon and its
@@ -115,6 +156,12 @@ tooling are mature.
     changes and complicates the systemd template unit in #34). Wait for
     `org.freedesktop.secrets` to be unlocked before warm start (avoiding a
     hidden gcr-prompter behind the lock screen timing out).
+
+    *Implementation note:* Bind `hey-computer.sock` **first** and watch
+    `org.freedesktop.secrets` `Locked == false` via a D-Bus `PropertiesChanged`
+    subscription inside `Conductor::run`'s `select!` loop (rather than a `0.5 s`
+    `dbus-send` shell poll), exposing `agent: "locked"` (or `"starting"`) via
+    `status --json` so Waybar and Rofi reflect the locked state immediately.
 34. `[Important]` **Work and personal modes.** A mode is a named profile of
     everything the agent can reach: MCP servers, skills, instructions, vault,
     accounts and model.
@@ -142,6 +189,20 @@ tooling are mature.
     - **Work data policy.** Settled: the employer allows sending work data
       (Linear, GitLab, Slack, calendar) to the model service.
     - **GitLab write access.** Allowed directly without permission prompts.
+
+    *Implementation notes from codebase review:*
+    - Namespace `$XDG_RUNTIME_DIR/hey-computer/` viewer/answer Markdown files per
+      instance (`daemon.rs`, `main.rs`) so `work` and `personal` answer files do
+      not collide or prune each other.
+    - Export `HEY_COMPUTER_SOCKET` and `HEY_COMPUTER_CONFIG` alongside
+      `HEY_COMPUTER_STATE_DIR` in `acp.rs` and `scheduler.rs` so
+      `hey-computer schedule|recall|tasks` invoked by skills inside
+      `hey-computer@work` vs `hey-computer@personal` hit the matching daemon
+      socket and config.
+    - Splitting stdio MCP servers across `work` (`gitlab`, `linear`, `slack`,
+      work Calendar/Drive) and `personal` (`gmail`, personal
+      Calendar/Contacts/Drive/Tasks, `gh`, `openhue`) will also roughly halve
+      per-daemon idle/peak RSS and swap usage.
 35. `[Important]` **Acting on incoming notifications (v1: notification text
     only).** Watch notifications (a D-Bus monitor on
     `org.freedesktop.Notifications`, or a hook in the notification daemon) for
@@ -161,7 +222,14 @@ tooling are mature.
       their own ACP session with their own permission profile: the daemon
       refuses every `execute` and `edit` permission request and passes no MCP
       servers. No extra confinement (systemd hardening, bus proxy, separate
-      account) on purpose.
+      account) on purpose. *(Implementation note: because `agy` 1.5.13 executes
+      `read_file` without sending `session/request_permission`,
+      `LanePolicy::restricted()` in `src/policy.rs` must also explicitly deny
+      `"fetch"` and `"search"` tool kinds—in addition to
+      `["execute", "edit", "delete", "move"]` + `mcp`—so untrusted incoming
+      notification or message text cannot combine `read_file` with web fetch to
+      exfiltrate local files; also expose `restricted` in `LaneFilter` in
+      `src/main.rs`.)*
     - **Cost and noise.** A cheap filter decides first whether a message
       deserves a model at all (sender allowlist, group chats off, quiet hours),
       with `HEARTBEAT_OK`-style suppression (#17) and a rate limit.
@@ -250,6 +318,21 @@ tooling are mature.
 
 ## Done
 
+- `[Important]` `[Upstream + Config]` `[Done: 8dc667d, NixConfig c7f1428, f8cb9b8]`
+  **Post-Phase-4 review hardening, declarative scheduler jobs, multi-file memory
+  auto-reload, & UX polish (#8, #9, #17, #23, #26, #27, #28).** Added
+  declarative `[scheduler.jobs.<name>]` seeding (`managed = 1` in SQLite schema
+  v3) and migrated `morning-digest` and `pre-daily` off separate systemd user
+  timers into the native hybrid scheduler; added `instructions.memory_files`
+  (`memory.extraFiles`) with idle background `AGENTS.md` + warm-spare
+  auto-reloading when memory files change; emitted instant `"Thinking…"`
+  progress before Tier 3 triage (replaced in place on background promotion),
+  suppressed routine `(fast)` badges, prevented auto-backgrounding from
+  superseding active foreground turns, and exempted internal MCP schema
+  `read_file` lookups from `max_tool_calls`; isolated single-PID Ghostty
+  multi-window `tmux`/CWD context and scoped unattended background ambient
+  context to time-only; and added a `rofi-hey-computer-tasks` Waybar menu plus
+  ACP/SQLite/policy/scheduler bug fixes.
 - `[Important]` `[Upstream + Config]` `[Done: 21b5e80, NixConfig 6a1c4c3]`
   **System & per-turn budget awareness + raised `deep` budget (#9, #13, #15,
   #25).** Added `## Turn budgets` to generated `AGENTS.md` (documenting default
