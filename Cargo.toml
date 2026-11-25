@@ -2,23 +2,38 @@
 name = "hey-computer"
 version = "0.1.0"
 edition = "2024"
+default-run = "hey-computer"
 description = "A voice assistant daemon that keeps one ACP agent warm and answers one-shot requests"
 license = "MIT"
 repository = "https://github.com/m4r1vs/hey-computer"
+
+[[bin]]
+name = "hey-computer"
+path = "src/main.rs"
+
+[[bin]]
+name = "hey-computer-viewer"
+path = "src/bin/hey-computer-viewer.rs"
 
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
+gtk4 = { version = "0.11", features = ["v4_10"] }
 # kill(2) on the agent's process group, plus localtime_r(3)/tzset(3) for local time.
 libc = "0.2"
+pulldown-cmark = "0.13"
+pulldown-latex = "0.8"
 rusqlite = { version = "0.37", features = ["modern_sqlite"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+syntect = { version = "5.2", default-features = false, features = ["parsing", "html", "regex-fancy"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "process", "sync", "time", "io-util", "io-std", "signal", "fs"] }
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+webkit6 = "0.6"
 
 [profile.release]
 lto = true

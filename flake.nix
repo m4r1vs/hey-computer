@@ -57,19 +57,41 @@
             ./src
             ./tests
             ./skills
+            ./assets
           ];
         };
 
         cargoLock.lockFile = ./Cargo.lock;
 
-        nativeBuildInputs = [pkgs.makeWrapper pkgs.pkg-config];
-        buildInputs = [pkgs.sqlite];
+        nativeBuildInputs = [
+          pkgs.makeWrapper
+          pkgs.pkg-config
+          pkgs.wrapGAppsHook4
+        ];
+        buildInputs = [
+          pkgs.glib-networking
+          pkgs.gtk4
+          pkgs.sqlite
+          pkgs.webkitgtk_6_0
+        ];
+
+        # Wrap `hey-computer-viewer` with GApps/WebKitGTK environment variables
+        # while keeping `hey-computer` (the daemon & CLI) free of GUI wrapper
+        # variables that would otherwise leak into `agy acp`.
+        dontWrapGApps = true;
 
         postInstall = ''
           mkdir -p $out/share/hey-computer
           cp -r skills $out/share/hey-computer/skills
+          cp -r assets $out/share/hey-computer/assets
+        '';
+
+        postFixup = ''
           wrapProgram $out/bin/hey-computer \
             --prefix PATH : "${pkgs.lib.makeBinPath (runtimeTools pkgs)}"
+          wrapProgram $out/bin/hey-computer-viewer \
+            "''${gappsWrapperArgs[@]}" \
+            --set-default HC_VIEWER_ASSETS_DIR "$out/share/hey-computer/assets"
         '';
 
         meta = with pkgs.lib; {
@@ -90,8 +112,10 @@
       hey-computer = mkPackage final;
     };
 
-    packages = forAllSystems (system: {
-      default = mkPackage (pkgsFor system);
+    packages = forAllSystems (system: let
+      pkgs = pkgsFor system;
+    in {
+      default = mkPackage pkgs;
     });
 
     homeManagerModules.default = homeManagerModule;
@@ -138,7 +162,12 @@
     in {
       default = pkgs.mkShell {
         nativeBuildInputs = [pkgs.pkg-config];
-        buildInputs = [pkgs.sqlite];
+        buildInputs = [
+          pkgs.glib-networking
+          pkgs.gtk4
+          pkgs.sqlite
+          pkgs.webkitgtk_6_0
+        ];
         packages = with pkgs;
           [
             cargo
