@@ -1245,6 +1245,9 @@ async fn ask(
                 suppress_token,
                 attachments,
                 source,
+                reply_to: None,
+                stream: false,
+                distill: false,
             };
             match request_size(&req) {
                 Ok(()) => ipc::ask_request(socket, &req).await,

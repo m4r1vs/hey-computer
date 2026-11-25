@@ -7,21 +7,21 @@
 //! D-Bus itself: an argument vector can be swapped for a script, which is how
 //! the daemon is tested by hand without popping anything up.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Notify, mpsc, watch};
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 
-use crate::config::Present as PresentConfig;
+use crate::config::{MediaDuck, Present as PresentConfig, Speak as SpeakConfig};
 use crate::ipc;
-use crate::protocol::FailReason;
+use crate::protocol::{FailReason, WidgetSpec};
 
 static LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -71,6 +71,7 @@ pub enum Presentation {
         /// Commands the agent was refused on the way.
         denied: Vec<String>,
         profile: Option<String>,
+        widgets: Vec<WidgetSpec>,
     },
     /// A background task finished with a non-suppressed answer.
     TaskComplete {
@@ -79,6 +80,17 @@ pub enum Presentation {
         text: String,
         denied: Vec<String>,
         profile: Option<String>,
+        widgets: Vec<WidgetSpec>,
+    },
+    /// Start streaming speech/earcons for a voice-originated foreground turn.
+    SpeechStart { id: u64 },
+    /// Streamed text chunk for sentence-level TTS on a voice-originated turn.
+    SpeechChunk { id: u64, delta: String },
+    /// Finalize speech streaming for a completed voice-originated turn.
+    SpeechFinish {
+        id: u64,
+        full_text: String,
+        has_widgets: bool,
     },
     Failure {
         id: u64,
@@ -102,6 +114,20 @@ pub trait Presenter: Send + Sync + 'static {
     /// Queue something to show. Must not block: the daemon calls it from the
     /// task that talks to the agent.
     fn present(&self, item: Presentation);
+
+    /// Immediately stop active or queued TTS speech (optionally scoped to `id`),
+    /// returning the request ID whose speech was stopped if any.
+    fn stop_speech(&self, _id: Option<u64>) -> Option<u64> {
+        None
+    }
+
+    /// Update runtime spoken-answer toggle state (`present.speak`).
+    fn set_speak_enabled(&self, _enabled: bool) {}
+
+    /// Current `(speak_enabled, currently_speaking)` state.
+    fn speak_status(&self) -> (bool, bool) {
+        (false, false)
+    }
 }
 
 /// The limits that decide between a notification and the viewer.
@@ -911,6 +937,10 @@ fn truncate(text: &str, max: usize) -> String {
 pub struct Recorder {
     items: Mutex<Vec<Presentation>>,
     changed: Notify,
+    speak_enabled: AtomicBool,
+    speaking: AtomicBool,
+    active_speech_id: AtomicU64,
+    stopped_speech: Mutex<Vec<Option<u64>>>,
 }
 
 impl Recorder {
@@ -920,6 +950,28 @@ impl Recorder {
 
     pub fn items(&self) -> Vec<Presentation> {
         self.items.lock().map(|i| i.clone()).unwrap_or_default()
+    }
+
+    /// Recorded `stop_speech(only)` calls for assertions in integration tests.
+    pub fn stopped_speech(&self) -> Vec<Option<u64>> {
+        self.stopped_speech
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    /// Simulate active TTS playback for `id` (`None` clears active playback).
+    pub fn simulate_speaking(&self, id: Option<u64>) {
+        match id {
+            Some(id) => {
+                self.active_speech_id.store(id, Ordering::SeqCst);
+                self.speaking.store(true, Ordering::SeqCst);
+            }
+            None => {
+                self.speaking.store(false, Ordering::SeqCst);
+                self.active_speech_id.store(0, Ordering::SeqCst);
+            }
+        }
     }
 
     /// Wait until `predicate` holds for the recorded items.
@@ -944,19 +996,79 @@ impl Recorder {
 
 impl Presenter for Recorder {
     fn present(&self, item: Presentation) {
+        match &item {
+            Presentation::SpeechStart { id } if self.speak_enabled.load(Ordering::SeqCst) => {
+                self.active_speech_id.store(*id, Ordering::SeqCst);
+                self.speaking.store(true, Ordering::SeqCst);
+            }
+            Presentation::SpeechChunk { id, delta }
+                if self.speak_enabled.load(Ordering::SeqCst)
+                    && self.active_speech_id.load(Ordering::SeqCst) == *id =>
+            {
+                if is_rich(delta) {
+                    self.speaking.store(false, Ordering::SeqCst);
+                    self.active_speech_id.store(0, Ordering::SeqCst);
+                }
+            }
+            Presentation::SpeechFinish { id, .. }
+                if self.active_speech_id.load(Ordering::SeqCst) == *id =>
+            {
+                self.speaking.store(false, Ordering::SeqCst);
+                self.active_speech_id.store(0, Ordering::SeqCst);
+            }
+            _ => {}
+        }
         if let Ok(mut items) = self.items.lock() {
             items.push(item);
         }
         self.changed.notify_waiters();
     }
+
+    fn stop_speech(&self, id: Option<u64>) -> Option<u64> {
+        if let Ok(mut stopped) = self.stopped_speech.lock() {
+            stopped.push(id);
+        }
+        let current = self.active_speech_id.load(Ordering::SeqCst);
+        if current == 0 || !self.speaking.load(Ordering::SeqCst) {
+            return None;
+        }
+        if let Some(only) = id
+            && only != current
+        {
+            return None;
+        }
+        self.speaking.store(false, Ordering::SeqCst);
+        self.active_speech_id.store(0, Ordering::SeqCst);
+        Some(current)
+    }
+
+    fn set_speak_enabled(&self, enabled: bool) {
+        self.speak_enabled.store(enabled, Ordering::SeqCst);
+        if !enabled {
+            self.speaking.store(false, Ordering::SeqCst);
+            self.active_speech_id.store(0, Ordering::SeqCst);
+        }
+    }
+
+    fn speak_status(&self) -> (bool, bool) {
+        (
+            self.speak_enabled.load(Ordering::SeqCst),
+            self.speaking.load(Ordering::SeqCst),
+        )
+    }
 }
 
 /// Notifications through the configured notifier, long answers through the
-/// configured viewer. A queue and one task keep popups in order, which
-/// matters because each replaces the one before.
+/// configured viewer, and optional streaming spoken answers through
+/// [`SpeechActor`]. A queue and one task keep popups in order, which matters
+/// because each replaces the one before, while speech runs independently so
+/// notifications and TTS never block each other.
 pub struct Desktop {
     queue: Mutex<Option<mpsc::UnboundedSender<Presentation>>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    speech: Arc<SpeechShared>,
+    speech_queue: Mutex<Option<mpsc::UnboundedSender<SpeechCmd>>>,
+    speech_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Desktop {
@@ -988,12 +1100,21 @@ impl Desktop {
     ) -> Arc<Self> {
         let (queue, mut items) = mpsc::unbounded_channel();
         let (action_cancel, _) = watch::channel(false);
+        let speech = Arc::new(SpeechShared::new(&config.speak, Limits::from(config)));
+        let (speech_tx, speech_rx) = mpsc::unbounded_channel();
+        let speech_actor_shared = Arc::clone(&speech);
+        let speech_task = tokio::spawn(async move {
+            run_speech_actor(speech_actor_shared, speech_rx).await;
+        });
+
         let mut worker = Worker {
             config: config.clone(),
             answers_dir,
             progress: None,
             pending: None,
             watchers: JoinSet::new(),
+            next_waiter_seq: 0,
+            action_lru: VecDeque::new(),
             action_waiters: JoinSet::new(),
             action_cancel,
             viewer_grace,
@@ -1048,34 +1169,146 @@ impl Desktop {
             // early-exit check before exit; long-running viewers are already
             // handed off to detached reapers.
             while worker.watchers.join_next().await.is_some() {}
-            // Never stall daemon shutdown on unclicked "Open" notifications.
+            // Never stall daemon shutdown on unclicked action notifications.
             let _ = worker.action_cancel.send(true);
+            worker.action_lru.clear();
             worker.action_waiters.abort_all();
             while worker.action_waiters.join_next().await.is_some() {}
         });
         Arc::new(Self {
             queue: Mutex::new(Some(queue)),
             task: Mutex::new(Some(task)),
+            speech,
+            speech_queue: Mutex::new(Some(speech_tx)),
+            speech_task: Mutex::new(Some(speech_task)),
         })
     }
 
     /// Show what is queued, then stop taking more.
     pub async fn finish(&self) {
         drop(self.queue.lock().ok().and_then(|mut q| q.take()));
+        drop(self.speech_queue.lock().ok().and_then(|mut q| q.take()));
         let task = self.task.lock().ok().and_then(|mut t| t.take());
         if let Some(task) = task {
             let _ = task.await;
+        }
+        let speech_task = self.speech_task.lock().ok().and_then(|mut t| t.take());
+        if let Some(speech_task) = speech_task {
+            let _ = speech_task.await;
         }
     }
 }
 
 impl Presenter for Desktop {
     fn present(&self, item: Presentation) {
+        match item {
+            Presentation::SpeechStart { id } => {
+                if !self.speech.can_speak() {
+                    return;
+                }
+                self.speech.kill_active_pgid();
+                let epoch = self.speech.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                self.speech.active_turn_id.store(id, Ordering::SeqCst);
+                self.speech.speaking.store(false, Ordering::SeqCst);
+                if let Ok(q) = self.speech_queue.lock()
+                    && let Some(tx) = q.as_ref()
+                {
+                    let _ = tx.send(SpeechCmd::Start { id, epoch });
+                }
+                return;
+            }
+            Presentation::SpeechChunk { id, delta } => {
+                if !self.speech.can_speak()
+                    || self.speech.active_turn_id.load(Ordering::SeqCst) != id
+                {
+                    return;
+                }
+                let epoch = self.speech.epoch.load(Ordering::SeqCst);
+                if let Ok(q) = self.speech_queue.lock()
+                    && let Some(tx) = q.as_ref()
+                {
+                    let _ = tx.send(SpeechCmd::Chunk { id, delta, epoch });
+                }
+                return;
+            }
+            Presentation::SpeechFinish {
+                id,
+                full_text,
+                has_widgets,
+            } => {
+                if self.speech.active_turn_id.load(Ordering::SeqCst) != id {
+                    return;
+                }
+                let epoch = self.speech.epoch.load(Ordering::SeqCst);
+                if let Ok(q) = self.speech_queue.lock()
+                    && let Some(tx) = q.as_ref()
+                {
+                    let _ = tx.send(SpeechCmd::Finish {
+                        id,
+                        full_text,
+                        has_widgets,
+                        epoch,
+                    });
+                }
+                return;
+            }
+            Presentation::Failure {
+                id,
+                background: false,
+                ..
+            } => {
+                let _ = self.stop_speech(Some(id));
+            }
+            _ => {}
+        }
         if let Ok(queue) = self.queue.lock()
             && let Some(queue) = queue.as_ref()
         {
             let _ = queue.send(item);
         }
+    }
+
+    fn stop_speech(&self, only: Option<u64>) -> Option<u64> {
+        let current = self.speech.active_turn_id.load(Ordering::SeqCst);
+        if current == 0 {
+            return None;
+        }
+        if let Some(target) = only
+            && target != current
+        {
+            return None;
+        }
+        if self
+            .speech
+            .active_turn_id
+            .compare_exchange(current, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        let epoch = self.speech.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.speech.speaking.store(false, Ordering::SeqCst);
+        self.speech.kill_active_pgid();
+        if let Ok(q) = self.speech_queue.lock()
+            && let Some(tx) = q.as_ref()
+        {
+            let _ = tx.send(SpeechCmd::Stop { epoch });
+        }
+        Some(current)
+    }
+
+    fn set_speak_enabled(&self, enabled: bool) {
+        self.speech.speak_enabled.store(enabled, Ordering::SeqCst);
+        if !enabled {
+            let _ = self.stop_speech(None);
+        }
+    }
+
+    fn speak_status(&self) -> (bool, bool) {
+        (
+            self.speech.speak_enabled.load(Ordering::SeqCst),
+            self.speech.speaking.load(Ordering::SeqCst),
+        )
     }
 }
 
@@ -1134,8 +1367,12 @@ struct Worker {
     pending: Option<PendingUpdate>,
     /// Bounded early-exit watchers for recently launched viewers.
     watchers: JoinSet<()>,
-    /// Detached `notify-send -A open=Open` waiters for completed background tasks.
-    action_waiters: JoinSet<()>,
+    /// Monotonic sequence IDs for LRU eviction of `action_waiters`.
+    next_waiter_seq: u64,
+    /// Active action-notification waiters in oldest-to-newest order (`<= MAX_ACTION_WAITERS`).
+    action_lru: VecDeque<(u64, AbortHandle)>,
+    /// Detached `notify-send -A …` waiters for short answers and background tasks.
+    action_waiters: JoinSet<u64>,
     action_cancel: watch::Sender<bool>,
     viewer_grace: Duration,
     progress_interval: Duration,
@@ -1161,9 +1398,39 @@ impl Worker {
         }
     }
 
+    fn reap_action_waiters(&mut self) {
+        while let Some(res) = self.action_waiters.try_join_next() {
+            if let Ok(done_seq) = res {
+                self.action_lru.retain(|(seq, _)| *seq != done_seq);
+            }
+        }
+        self.action_lru.retain(|(_, handle)| !handle.is_finished());
+    }
+
+    fn spawn_action_waiter(&mut self, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.reap_action_waiters();
+        while self.action_lru.len() >= MAX_ACTION_WAITERS {
+            if let Some((_, oldest_handle)) = self.action_lru.pop_front() {
+                oldest_handle.abort();
+            }
+            while let Some(res) = self.action_waiters.try_join_next() {
+                if let Ok(done_seq) = res {
+                    self.action_lru.retain(|(seq, _)| *seq != done_seq);
+                }
+            }
+        }
+        self.next_waiter_seq += 1;
+        let seq = self.next_waiter_seq;
+        let handle = self.action_waiters.spawn(async move {
+            fut.await;
+            seq
+        });
+        self.action_lru.push_back((seq, handle));
+    }
+
     async fn show(&mut self, item: Presentation) {
         while self.watchers.try_join_next().is_some() {}
-        while self.action_waiters.try_join_next().is_some() {}
+        self.reap_action_waiters();
         if !matches!(
             item,
             Presentation::TaskComplete { .. }
@@ -1230,17 +1497,25 @@ impl Worker {
                 text,
                 denied,
                 profile,
-            } => self.answer(id, &text, &denied, profile.as_deref()).await,
+                widgets,
+            } => {
+                self.answer(id, &text, &denied, profile.as_deref(), &widgets)
+                    .await;
+            }
             Presentation::TaskComplete {
                 id,
                 text,
                 denied,
                 profile,
+                widgets,
                 ..
             } => {
-                self.task_complete(id, &text, &denied, profile.as_deref())
+                self.task_complete(id, &text, &denied, profile.as_deref(), &widgets)
                     .await;
             }
+            Presentation::SpeechStart { .. }
+            | Presentation::SpeechChunk { .. }
+            | Presentation::SpeechFinish { .. } => {}
             Presentation::Failure {
                 reason,
                 message,
@@ -1434,7 +1709,14 @@ impl Worker {
         }
     }
 
-    async fn answer(&mut self, id: u64, text: &str, denied: &[String], profile: Option<&str>) {
+    async fn answer(
+        &mut self,
+        id: u64,
+        text: &str,
+        denied: &[String],
+        profile: Option<&str>,
+        widgets: &[WidgetSpec],
+    ) {
         let replaces = self.take_progress_id();
         let refused = if denied.is_empty() {
             String::new()
@@ -1442,15 +1724,41 @@ impl Worker {
             format!("Refused: {}", denied.join(", "))
         };
 
-        if is_short(text, Limits::from(&self.config)) {
+        if widgets.is_empty() && is_short(text, Limits::from(&self.config)) {
             let mut body = to_markup(text);
             if !refused.is_empty() {
                 body.push_str("\n\n");
                 body.push_str(&escape_markup(&refused));
             }
             let summary = with_profile("Answer", profile);
-            self.notify(&summary, &body, Urgency::Normal, 0, replaces)
-                .await;
+            let actions = short_answer_actions(&self.config);
+            if actions.is_empty() {
+                self.notify(&summary, &body, Urgency::Normal, 0, replaces)
+                    .await;
+                return;
+            }
+            if !self.config.notifications || self.config.notifier.is_empty() {
+                return;
+            }
+            let cancel_rx = self.action_cancel.subscribe();
+            if let Some(wait_fut) = start_foreground_action_notification(
+                self.config.clone(),
+                self.answers_dir.clone(),
+                id,
+                summary,
+                body,
+                replaces,
+                actions,
+                text.to_string(),
+                denied.to_vec(),
+                self.viewer_grace,
+                self.action_timeout,
+                cancel_rx,
+            )
+            .await
+            {
+                self.spawn_action_waiter(wait_fut);
+            }
             return;
         }
 
@@ -1476,8 +1784,9 @@ impl Worker {
             file.display()
         );
 
+        let answer_head = answer_headline(text, widgets);
         if self.config.viewer.is_empty() {
-            let body = format!("{}\n{}", headline(text, 120), file.display());
+            let body = format!("{answer_head}\n{}", file.display());
             let summary = with_profile("Answer saved", profile);
             self.notify(
                 &summary,
@@ -1490,7 +1799,7 @@ impl Worker {
             return;
         }
 
-        let viewer = match spawn_viewer(&self.config.viewer, &file) {
+        let viewer = match spawn_viewer(&self.config.viewer, &file, id, &[]) {
             Ok(viewer) => viewer,
             Err(e) => {
                 report_viewer_failure(&self.config, &file, &format!("{e:#}"), replaces).await;
@@ -1501,7 +1810,7 @@ impl Worker {
         let opened_id = self
             .notify(
                 &summary,
-                &escape_markup(&headline(text, 120)),
+                &escape_markup(&answer_head),
                 Urgency::Low,
                 0,
                 replaces,
@@ -1521,6 +1830,7 @@ impl Worker {
         text: &str,
         denied: &[String],
         profile: Option<&str>,
+        widgets: &[WidgetSpec],
     ) {
         if !self.config.notifications || self.config.notifier.is_empty() {
             return;
@@ -1531,40 +1841,39 @@ impl Worker {
         } else {
             format!("Refused: {}", denied.join(", "))
         };
-        let mut body = if is_short(text, Limits::from(&self.config)) {
+        let mut body = if widgets.is_empty() && is_short(text, Limits::from(&self.config)) {
             to_markup(text)
         } else {
-            escape_markup(&format!("#{id} · {}", headline(text, 120)))
+            let head = answer_headline(text, widgets);
+            escape_markup(&format!("#{id} · {head}"))
         };
         if !refused.is_empty() {
             body.push_str("\n\n");
             body.push_str(&escape_markup(&refused));
         }
 
-        if self.config.viewer.is_empty() || self.action_waiters.len() >= MAX_ACTION_WAITERS {
+        if self.config.viewer.is_empty() {
             self.notify(&summary, &body, Urgency::Normal, 0, None).await;
             return;
         }
 
-        let config = self.config.clone();
-        let answers_dir = self.answers_dir.clone();
-        let text = text.to_string();
-        let denied = denied.to_vec();
-        let viewer_grace = self.viewer_grace;
-        let action_timeout = self.action_timeout;
         let cancel_rx = self.action_cancel.subscribe();
-        self.action_waiters.spawn(wait_action_notification(
-            config,
-            answers_dir,
+        if let Some(wait_fut) = start_background_action_notification(
+            self.config.clone(),
+            self.answers_dir.clone(),
             id,
-            summary,
-            body,
-            text,
-            denied,
-            viewer_grace,
-            action_timeout,
+            &summary,
+            &body,
+            None,
+            &[("open", "Open")],
+            text.to_string(),
+            denied.to_vec(),
+            self.viewer_grace,
+            self.action_timeout,
             cancel_rx,
-        ));
+        ) {
+            self.spawn_action_waiter(wait_fut);
+        }
     }
 
     /// Show one popup; returns its id so the next one can replace it.
@@ -1642,86 +1951,338 @@ pub async fn notify(
     }
 }
 
-/// Show a background-task completion popup with an `"Open"` action without
-/// blocking the sequential presenter worker. Clicking `"Open"` launches the
-/// configured viewer on the HTML-disarmed Markdown document.
-#[allow(clippy::too_many_arguments)]
-async fn wait_action_notification(
-    config: PresentConfig,
-    answers_dir: PathBuf,
-    id: u64,
-    summary: String,
-    body: String,
-    text: String,
-    denied: Vec<String>,
-    viewer_grace: Duration,
-    action_timeout: Duration,
-    mut cancel_rx: watch::Receiver<bool>,
-) {
+fn answer_headline(text: &str, widgets: &[WidgetSpec]) -> String {
+    let head = headline(text, 120);
+    if !head.is_empty() {
+        head
+    } else {
+        widgets
+            .first()
+            .map(|w| truncate(w.title.trim(), 120))
+            .unwrap_or_default()
+    }
+}
+
+fn short_answer_actions(config: &PresentConfig) -> Vec<(&'static str, &'static str)> {
+    let mut actions = Vec::with_capacity(3);
+    if !config.clipboard.is_empty() {
+        actions.push(("copy", "Copy"));
+    }
+    if !config.reply_command.is_empty() || !config.viewer.is_empty() {
+        actions.push(("reply", "Reply"));
+    }
+    if !config.viewer.is_empty() {
+        actions.push(("open", "Open"));
+    }
+    actions
+}
+
+struct ActionChildGuard {
+    child: Option<tokio::process::Child>,
+    pgid: Option<i32>,
+}
+
+impl ActionChildGuard {
+    fn spawn(
+        mut command: Command,
+        program_name: &str,
+    ) -> Option<(Self, tokio::process::ChildStdout)> {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                tracing::warn!("cannot run the notifier {program_name}: {e}");
+                return None;
+            }
+        };
+        let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
+        let stdout = child.stdout.take()?;
+        Some((
+            Self {
+                child: Some(child),
+                pgid,
+            },
+            stdout,
+        ))
+    }
+
+    async fn finish_cleanly(mut self) {
+        self.pgid = None;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait().await;
+        }
+    }
+}
+
+impl Drop for ActionChildGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = child.wait().await;
+                });
+            }
+        }
+    }
+}
+
+fn build_action_notifier_command(
+    config: &PresentConfig,
+    summary: &str,
+    body: &str,
+    replaces: Option<u32>,
+    actions: &[(&str, &str)],
+) -> Command {
     let mut command = Command::new(&config.notifier[0]);
     command
         .args(&config.notifier[1..])
         .arg(format!("--app-name={APP_NAME}"))
         .arg("--urgency=normal")
-        .arg("--action=open=Open")
-        .arg("--")
-        .arg(&summary)
-        .arg(&body)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .arg("--print-id");
+    for (key, label) in actions {
+        command.arg(format!("--action={key}={label}"));
+    }
+    if let Some(id) = replaces {
+        command.arg(format!("--replace-id={id}"));
+    }
+    command.arg("--").arg(summary).arg(body);
+    command
+}
 
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            tracing::warn!("cannot run the notifier {}: {e}", config.notifier[0]);
-            return;
-        }
-    };
+/// Show a short foreground answer notification with actions (`Copy` / `Reply` /
+/// `Open`), reading line 1 (`--print-id`) within [`NOTIFIER_TIMEOUT`] so
+/// `"Thinking…"` is replaced immediately in place, and returning a background
+/// waiter future for line 2 (the clicked action, if any).
+#[allow(clippy::too_many_arguments)]
+async fn start_foreground_action_notification(
+    config: PresentConfig,
+    answers_dir: PathBuf,
+    id: u64,
+    summary: String,
+    body: String,
+    replaces: Option<u32>,
+    actions: Vec<(&'static str, &'static str)>,
+    text: String,
+    denied: Vec<String>,
+    viewer_grace: Duration,
+    action_timeout: Duration,
+    mut cancel_rx: watch::Receiver<bool>,
+) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+    let command = build_action_notifier_command(&config, &summary, &body, replaces, &actions);
+    let (guard, stdout) = ActionChildGuard::spawn(command, &config.notifier[0])?;
+    let mut lines = BufReader::new(stdout).lines();
 
-    let output = tokio::select! {
-        res = child.wait_with_output() => match res {
-            Ok(out) => out,
-            Err(e) => {
-                tracing::debug!("action notifier wait failed: {e}");
-                return;
+    let first_line = tokio::select! {
+        res = tokio::time::timeout(NOTIFIER_TIMEOUT, lines.next_line()) => match res {
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => {
+                tracing::warn!("reading notifier output failed: {e}");
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!("the notifier took longer than {NOTIFIER_TIMEOUT:?}");
+                return None;
             }
         },
-        () = tokio::time::sleep(action_timeout) => return,
-        _ = cancel_rx.changed() => return,
+        _ = cancel_rx.changed() => return None,
     };
 
-    if !output.status.success() {
-        tracing::debug!(
-            "action notifier exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        return;
+    if first_line.is_none() {
+        // Notifier exited immediately without printing an ID.
+        guard.finish_cleanly().await;
+        return None;
     }
 
-    let chosen = String::from_utf8_lossy(&output.stdout);
-    if !chosen.lines().any(|l| l.trim() == "open") {
-        return;
-    }
+    Some(async move {
+        let second_line = tokio::select! {
+            res = lines.next_line() => match res {
+                Ok(Some(line)) => line,
+                Ok(None) | Err(_) => {
+                    guard.finish_cleanly().await;
+                    return;
+                }
+            },
+            () = tokio::time::sleep(action_timeout) => return,
+            _ = cancel_rx.changed() => return,
+        };
+        guard.finish_cleanly().await;
+        dispatch_notification_action(
+            second_line.trim(),
+            &config,
+            &answers_dir,
+            id,
+            &text,
+            &denied,
+            viewer_grace,
+        )
+        .await;
+    })
+}
 
-    let document = format_document(&text, &denied);
-    let file = match write_answer(&answers_dir, id, &document, config.keep_answers) {
+/// Spawn an action notification child synchronously (so queue order is preserved)
+/// and return a background waiter future without blocking `Worker` on stdout.
+#[allow(clippy::too_many_arguments)]
+fn start_background_action_notification(
+    config: PresentConfig,
+    answers_dir: PathBuf,
+    id: u64,
+    summary: &str,
+    body: &str,
+    replaces: Option<u32>,
+    actions: &[(&str, &str)],
+    text: String,
+    denied: Vec<String>,
+    viewer_grace: Duration,
+    action_timeout: Duration,
+    mut cancel_rx: watch::Receiver<bool>,
+) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+    let command = build_action_notifier_command(&config, summary, body, replaces, actions);
+    let (guard, stdout) = ActionChildGuard::spawn(command, &config.notifier[0])?;
+    Some(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        let deadline = tokio::time::Instant::now() + action_timeout;
+
+        // Real `notify-send --print-id -A …` prints the numeric notification ID on
+        // line 1 and the selected action key on line 2; simple mock scripts may
+        // print the action key directly on line 1.
+        let mut chosen: Option<String> = None;
+        for _ in 0..2 {
+            let next = tokio::select! {
+                res = lines.next_line() => match res {
+                    Ok(Some(line)) => line,
+                    Ok(None) | Err(_) => break,
+                },
+                () = tokio::time::sleep_until(deadline) => return,
+                _ = cancel_rx.changed() => return,
+            };
+            let trimmed = next.trim();
+            if matches!(trimmed, "copy" | "reply" | "open") {
+                chosen = Some(trimmed.to_string());
+                break;
+            }
+        }
+
+        guard.finish_cleanly().await;
+        if let Some(action) = chosen {
+            dispatch_notification_action(
+                &action,
+                &config,
+                &answers_dir,
+                id,
+                &text,
+                &denied,
+                viewer_grace,
+            )
+            .await;
+        }
+    })
+}
+
+async fn dispatch_notification_action(
+    action: &str,
+    config: &PresentConfig,
+    answers_dir: &Path,
+    id: u64,
+    text: &str,
+    denied: &[String],
+    viewer_grace: Duration,
+) {
+    match action {
+        "copy" => {
+            let _ = copy_to_clipboard(config, text).await;
+        }
+        "reply" => {
+            if !config.reply_command.is_empty() {
+                let id_str = id.to_string();
+                let program = config.reply_command[0].replace("{id}", &id_str);
+                let args: Vec<String> = config.reply_command[1..]
+                    .iter()
+                    .map(|a| a.replace("{id}", &id_str))
+                    .collect();
+                let log_dir = ipc::runtime_dir().unwrap_or_else(|_| std::env::temp_dir());
+                let stderr = unlinked_log_file(&log_dir, "reply-stderr")
+                    .map(|(_, stdio)| stdio)
+                    .unwrap_or_else(|_| Stdio::null());
+                match Command::new(&program)
+                    .args(&args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(stderr)
+                    .process_group(0)
+                    .spawn()
+                {
+                    Ok(mut child) => {
+                        tokio::spawn(async move {
+                            let _ = child.wait().await;
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("cannot start reply_command {program}: {e}");
+                    }
+                }
+            } else if !config.viewer.is_empty() {
+                let is_hc_viewer = config
+                    .viewer
+                    .iter()
+                    .any(|a| a.contains("hey-computer-viewer"))
+                    || (config
+                        .viewer
+                        .first()
+                        .is_some_and(|p| p.ends_with("hey-computer"))
+                        && config.viewer.get(1).is_some_and(|s| s == "view"));
+                let extra: &[&str] =
+                    if is_hc_viewer && !config.viewer.iter().any(|a| a == "--focus-composer") {
+                        &["--focus-composer"]
+                    } else {
+                        &[]
+                    };
+                open_disarmed_in_viewer(config, answers_dir, id, text, denied, extra, viewer_grace)
+                    .await;
+            }
+        }
+        "open" if !config.viewer.is_empty() => {
+            open_disarmed_in_viewer(config, answers_dir, id, text, denied, &[], viewer_grace).await;
+        }
+        _ => {}
+    }
+}
+
+async fn open_disarmed_in_viewer(
+    config: &PresentConfig,
+    answers_dir: &Path,
+    id: u64,
+    text: &str,
+    denied: &[String],
+    extra_args: &[&str],
+    viewer_grace: Duration,
+) {
+    let document = format_document(text, denied);
+    let file = match write_answer(answers_dir, id, &document, config.keep_answers) {
         Ok(file) => file,
         Err(e) => {
-            tracing::warn!("cannot write task answer file: {e:#}");
+            tracing::warn!("cannot write answer file: {e:#}");
             return;
         }
     };
-    let viewer = match spawn_viewer(&config.viewer, &file) {
+    let viewer = match spawn_viewer(&config.viewer, &file, id, extra_args) {
         Ok(viewer) => viewer,
         Err(e) => {
-            report_viewer_failure(&config, &file, &format!("{e:#}"), None).await;
+            report_viewer_failure(config, &file, &format!("{e:#}"), None).await;
             return;
         }
     };
-    watch_viewer(config, viewer, file, None, viewer_grace).await;
+    watch_viewer(config.clone(), viewer, file, None, viewer_grace).await;
 }
 
 /// Format an answer as Markdown for the viewer, disarming raw HTML and remote
@@ -1840,22 +2401,33 @@ fn unlinked_log_file(dir: &Path, prefix: &str) -> anyhow::Result<(std::fs::File,
     Ok((log, Stdio::from(stderr)))
 }
 
-/// Start the viewer on `file` and return the running child with its unlinked
-/// stderr file so "Answer opened" can be shown at once while [`watch_viewer`]
-/// checks for an early exit.
-fn spawn_viewer(argv: &[String], file: &Path) -> anyhow::Result<SpawnedViewer> {
+/// Start the viewer on `file` (expanding `{file}` and `{id}`) and return the
+/// running child with its unlinked stderr file so "Answer opened" can be shown
+/// at once while [`watch_viewer`] checks for an early exit.
+fn spawn_viewer(
+    argv: &[String],
+    file: &Path,
+    id: u64,
+    extra_args: &[&str],
+) -> anyhow::Result<SpawnedViewer> {
     let dir = file.parent().unwrap_or_else(|| Path::new("."));
     let (log, stderr) = unlinked_log_file(dir, "viewer-stderr")?;
 
-    let file = file.to_string_lossy().into_owned();
+    let file_str = file.to_string_lossy().into_owned();
+    let id_str = id.to_string();
     let mut args: Vec<String> = argv[1..]
         .iter()
-        .map(|a| a.replace("{file}", &file))
+        .map(|a| a.replace("{file}", &file_str).replace("{id}", &id_str))
         .collect();
-    if !argv.iter().any(|a| a.contains("{file}")) {
-        args.push(file.clone());
+    for extra in extra_args {
+        args.push((*extra).to_string());
     }
-    let program = argv[0].replace("{file}", &file);
+    if !argv.iter().any(|a| a.contains("{file}")) {
+        args.push(file_str.clone());
+    }
+    let program = argv[0]
+        .replace("{file}", &file_str)
+        .replace("{id}", &id_str);
     let child = Command::new(&program)
         .args(&args)
         .stdin(Stdio::null())
@@ -1924,6 +2496,18 @@ async fn watch_viewer(
     }
 }
 
+/// Open turn `id`'s answer in the configured viewer using `$XDG_RUNTIME_DIR/hey-computer`
+/// as the temporary Markdown directory and expanding `{id}` + `{file}`.
+pub async fn open_answer_for_turn(
+    config: &PresentConfig,
+    id: u64,
+    text: &str,
+    denied: &[String],
+) -> anyhow::Result<()> {
+    let answers_dir = ipc::runtime_dir()?.join("hey-computer");
+    open_answer(config, &answers_dir, id, text, denied).await
+}
+
 /// Always open an answer in the Markdown viewer (disarming raw HTML and remote
 /// images), regardless of whether it would normally fit in a notification.
 pub async fn open_answer(
@@ -1974,7 +2558,7 @@ async fn open_answer_with_grace(
         }
     };
 
-    let mut viewer = match spawn_viewer(&config.viewer, &file) {
+    let mut viewer = match spawn_viewer(&config.viewer, &file, id, &[]) {
         Ok(viewer) => viewer,
         Err(e) => {
             report_viewer_failure(config, &file, &format!("{e:#}"), None).await;
@@ -2175,6 +2759,861 @@ async fn report_viewer_failure(
         replaces,
     )
     .await;
+}
+
+/// Detect whether sentence 1 of a spoken answer is German (`"de"`) or English
+/// (`"en"`). Latched on sentence 1 for the remainder of the turn.
+pub fn detect_speech_lang(text: &str) -> &'static str {
+    const DE_STOPWORDS: &[&str] = &[
+        "der", "die", "das", "und", "ist", "nicht", "ich", "ein", "eine", "mit", "auf", "für",
+        "sie", "es", "wir", "sind", "wird", "im", "am", "dem", "den", "von", "zu", "heute", "uhr",
+        "grad",
+    ];
+    const EN_STOPWORDS: &[&str] = &[
+        "the", "is", "are", "and", "with", "for", "you", "your", "this", "that", "have", "from",
+    ];
+
+    if text
+        .chars()
+        .any(|c| matches!(c, 'ä' | 'ö' | 'ü' | 'ß' | 'Ä' | 'Ö' | 'Ü'))
+    {
+        return "de";
+    }
+
+    let mut de_seen: HashSet<&str> = HashSet::new();
+    let mut en_seen: HashSet<&str> = HashSet::new();
+    for raw in text.split(|c: char| !c.is_alphabetic()) {
+        if raw.is_empty() {
+            continue;
+        }
+        let lower = raw.to_lowercase();
+        if let Some(&w) = DE_STOPWORDS.iter().find(|&&w| w == lower) {
+            de_seen.insert(w);
+        }
+        if let Some(&w) = EN_STOPWORDS.iter().find(|&&w| w == lower) {
+            en_seen.insert(w);
+        }
+    }
+
+    if !de_seen.is_empty() && de_seen.len() > en_seen.len() {
+        "de"
+    } else {
+        "en"
+    }
+}
+
+/// Strip inline Markdown formatting (`**`, `__`, `` ` ``, and `[label](url)` ->
+/// `label`) before piping a spoken sentence to TTS stdin.
+pub fn strip_speech_markdown(text: &str) -> String {
+    let mut unlinked = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let Some(pos) = rest.find(['!', '[']) else {
+            unlinked.push_str(rest);
+            break;
+        };
+        unlinked.push_str(&rest[..pos]);
+        rest = &rest[pos..];
+        let bracket_rest = if let Some(after_bang) = rest.strip_prefix("![") {
+            Some(after_bang)
+        } else {
+            rest.strip_prefix('[')
+        };
+        if let Some(after_open) = bracket_rest
+            && let Some(label_end) = find_closing_bracket(after_open)
+            && let Some(after_paren_open) = after_open[label_end + 1..].strip_prefix('(')
+            && let Some(paren_end) = find_closing_paren(after_paren_open)
+        {
+            unlinked.push_str(&after_open[..label_end]);
+            rest = &after_paren_open[paren_end + 1..];
+            continue;
+        }
+        let ch_len = rest.chars().next().map_or(1, char::len_utf8);
+        unlinked.push_str(&rest[..ch_len]);
+        rest = &rest[ch_len..];
+    }
+
+    let cleaned = unlinked
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "");
+    cleaned.trim().to_string()
+}
+
+fn find_closing_paren(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 1;
+                if i < bytes.len() {
+                    i += s[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
+            b'\n' => return None,
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += s[i..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct SentenceAccumulator {
+    accumulated: String,
+    pending: String,
+}
+
+impl SentenceAccumulator {
+    fn should_cutoff(&self, limits: Limits) -> bool {
+        let trimmed = self.accumulated.trim();
+        if trimmed.chars().count() > limits.max_chars {
+            return true;
+        }
+        if trimmed.lines().filter(|l| !l.trim().is_empty()).count() > limits.max_lines {
+            return true;
+        }
+        if is_rich(&self.accumulated) {
+            return true;
+        }
+        self.accumulated.lines().any(|line| {
+            let indent = line.len() - line.trim_start_matches(' ').len();
+            if indent > 3 {
+                return false;
+            }
+            let t = line.trim_start();
+            t.starts_with("```")
+                || t.starts_with("~~~")
+                || t.starts_with("$$")
+                || t.starts_with('|')
+        })
+    }
+
+    fn push_delta(&mut self, delta: &str) -> Vec<String> {
+        self.accumulated.push_str(delta);
+        self.pending.push_str(delta);
+        self.drain_completed()
+    }
+
+    fn flush_remaining(&mut self) -> Vec<String> {
+        let mut out = self.drain_completed();
+        let tail = std::mem::take(&mut self.pending);
+        let tail = tail.trim();
+        if !tail.is_empty() {
+            out.push(tail.to_string());
+        }
+        out
+    }
+
+    fn drain_completed(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some((sent_end, next_start)) = next_sentence_split(&self.pending) {
+            let candidate = self.pending[..sent_end].trim();
+            if !candidate.is_empty() {
+                out.push(candidate.to_string());
+            }
+            self.pending.drain(..next_start);
+        }
+        out
+    }
+}
+
+fn next_sentence_split(s: &str) -> Option<(usize, usize)> {
+    for (idx, ch) in s.char_indices() {
+        if s[idx..].starts_with("\n\n") || s[idx..].starts_with("\r\n\r\n") {
+            let ws_len: usize = s[idx..]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .map(char::len_utf8)
+                .sum();
+            return Some((idx, idx + ws_len));
+        }
+        if !matches!(ch, '.' | '!' | '?') {
+            continue;
+        }
+        let mut close_end = idx + ch.len_utf8();
+        while let Some(next_ch) = s[close_end..].chars().next() {
+            if matches!(next_ch, '"' | '\'' | ')' | ']' | '»' | '”' | '’') {
+                close_end += next_ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let Some(after_ch) = s[close_end..].chars().next() else {
+            continue;
+        };
+        if !after_ch.is_whitespace() {
+            continue;
+        }
+        if ch == '.' && is_non_terminal_period(&s[..idx]) {
+            continue;
+        }
+        let ws_len: usize = s[close_end..]
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .map(char::len_utf8)
+            .sum();
+        return Some((close_end, close_end + ws_len));
+    }
+    None
+}
+
+fn is_non_terminal_period(before_dot: &str) -> bool {
+    let seg = before_dot.rsplit('\n').next().unwrap_or(before_dot);
+    let raw_token = seg.rsplit(char::is_whitespace).next().unwrap_or(seg);
+    let prefix_before_token = &seg[..seg.len() - raw_token.len()];
+    let token = raw_token.trim_start_matches(['(', '[', '"', '\'', '*', '_']);
+    if token.is_empty() {
+        return false;
+    }
+    if token.bytes().all(|b| b.is_ascii_digit()) {
+        // Leading list marker (`1. Milk`) or German date/ordinal (`am 25. Mai`).
+        if !prefix_before_token.chars().any(char::is_alphabetic) {
+            return true;
+        }
+        let prev_word = prefix_before_token
+            .split_whitespace()
+            .next_back()
+            .unwrap_or("")
+            .trim_matches(|c: char| !c.is_alphabetic())
+            .to_lowercase();
+        if matches!(
+            prev_word.as_str(),
+            "am" | "den" | "der" | "dem" | "vom" | "zum" | "im" | "nr" | "no"
+        ) {
+            return true;
+        }
+    }
+
+    let lower = token.to_lowercase();
+    if matches!(
+        lower.as_str(),
+        "e.g"
+            | "i.e"
+            | "z.b"
+            | "u.a"
+            | "d.h"
+            | "o.ä"
+            | "s.o"
+            | "u.u"
+            | "bzw"
+            | "ca"
+            | "dr"
+            | "prof"
+            | "nr"
+            | "mr"
+            | "mrs"
+            | "ms"
+            | "vs"
+            | "etc"
+            | "st"
+            | "inkl"
+            | "ggf"
+            | "evtl"
+            | "approx"
+            | "fig"
+    ) {
+        return true;
+    }
+    lower.contains('.')
+        && lower
+            .split('.')
+            .all(|p| !p.is_empty() && p.chars().count() <= 2 && p.chars().all(char::is_alphabetic))
+}
+
+struct SpeechShared {
+    config: SpeakConfig,
+    limits: Limits,
+    speak_enabled: AtomicBool,
+    speaking: AtomicBool,
+    active_turn_id: AtomicU64,
+    epoch: AtomicU64,
+    active_pgid: Mutex<Option<i32>>,
+}
+
+impl SpeechShared {
+    fn new(config: &SpeakConfig, limits: Limits) -> Self {
+        Self {
+            config: config.clone(),
+            limits,
+            speak_enabled: AtomicBool::new(config.enabled),
+            speaking: AtomicBool::new(false),
+            active_turn_id: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+            active_pgid: Mutex::new(None),
+        }
+    }
+
+    fn can_speak(&self) -> bool {
+        self.speak_enabled.load(Ordering::SeqCst)
+            && (!self.config.command.is_empty()
+                || !self.config.command_en.is_empty()
+                || !self.config.command_de.is_empty()
+                || !self.config.earcon_start.is_empty()
+                || !self.config.earcon_done.is_empty())
+    }
+
+    fn kill_active_pgid(&self) {
+        if let Ok(mut guard) = self.active_pgid.lock()
+            && let Some(pgid) = guard.take()
+        {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+enum SpeechCmd {
+    Start {
+        id: u64,
+        epoch: u64,
+    },
+    Chunk {
+        id: u64,
+        delta: String,
+        epoch: u64,
+    },
+    Finish {
+        id: u64,
+        full_text: String,
+        has_widgets: bool,
+        epoch: u64,
+    },
+    Stop {
+        epoch: u64,
+    },
+}
+
+struct TurnSpeech {
+    id: u64,
+    epoch: u64,
+    accumulator: SentenceAccumulator,
+    lang: Option<&'static str>,
+    sentences: VecDeque<String>,
+    finishing: bool,
+    cut_off_to_viewer: bool,
+}
+
+struct RunningTts {
+    epoch: u64,
+    child: tokio::process::Child,
+    pgid: Option<i32>,
+}
+
+#[derive(Default)]
+enum DuckState {
+    #[default]
+    Idle,
+    PausedPlayers(Vec<String>),
+    LoweredPamixer(u32),
+    LoweredWpctl(String),
+}
+
+async fn run_speech_actor(shared: Arc<SpeechShared>, mut rx: mpsc::UnboundedReceiver<SpeechCmd>) {
+    let mut turn: Option<TurnSpeech> = None;
+    let mut running_tts: Option<RunningTts> = None;
+    let mut duck_state = DuckState::Idle;
+    let mut rx_closed = false;
+
+    loop {
+        let current_epoch = shared.epoch.load(Ordering::SeqCst);
+        if let Some(t) = &turn
+            && t.epoch != current_epoch
+        {
+            turn = None;
+        }
+        if let Some(tts) = &running_tts
+            && tts.epoch != current_epoch
+        {
+            kill_running_tts(&shared, &mut running_tts).await;
+        }
+
+        if running_tts.is_none() {
+            let mut completed_turn: Option<(u64, u64, bool)> = None;
+            if let Some(t) = &mut turn {
+                if t.cut_off_to_viewer {
+                    completed_turn = Some((t.id, t.epoch, false));
+                } else if let Some(raw_sentence) = t.sentences.pop_front() {
+                    let lang = *t
+                        .lang
+                        .get_or_insert_with(|| detect_speech_lang(&raw_sentence));
+                    let clean = strip_speech_markdown(&raw_sentence);
+                    let argv = select_tts_command(&shared.config, lang);
+                    if !clean.trim().is_empty() && !argv.is_empty() {
+                        duck_media(shared.config.media_duck, &mut duck_state).await;
+                        shared.speaking.store(true, Ordering::SeqCst);
+                        if let Some(tts) = spawn_tts_sentence(&shared, argv, lang, &clean, t.epoch)
+                        {
+                            running_tts = Some(tts);
+                        } else {
+                            shared.speaking.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    if running_tts.is_none() {
+                        continue;
+                    }
+                } else if t.finishing {
+                    completed_turn = Some((t.id, t.epoch, true));
+                } else if rx_closed {
+                    completed_turn = Some((t.id, t.epoch, false));
+                }
+            }
+
+            if let Some((done_id, done_epoch, play_done_earcon)) = completed_turn {
+                turn = None;
+                shared.speaking.store(false, Ordering::SeqCst);
+                let _ = shared.active_turn_id.compare_exchange(
+                    done_id,
+                    0,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                if play_done_earcon
+                    && !shared.config.earcon_done.is_empty()
+                    && shared.epoch.load(Ordering::SeqCst) == done_epoch
+                {
+                    run_earcon(&shared.config.earcon_done).await;
+                }
+                restore_media(&mut duck_state).await;
+                continue;
+            }
+        }
+
+        if rx_closed && running_tts.is_none() && turn.is_none() {
+            restore_media(&mut duck_state).await;
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            maybe_cmd = rx.recv(), if !rx_closed => {
+                match maybe_cmd {
+                    Some(cmd) => {
+                        handle_speech_cmd(
+                            &shared,
+                            cmd,
+                            &mut turn,
+                            &mut running_tts,
+                            &mut duck_state,
+                        )
+                        .await;
+                    }
+                    None => {
+                        rx_closed = true;
+                    }
+                }
+            }
+            status = async {
+                match running_tts.as_mut() {
+                    Some(tts) => Some(tts.child.wait().await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(tts) = running_tts.take() {
+                    if let Ok(mut guard) = shared.active_pgid.lock()
+                        && *guard == tts.pgid
+                    {
+                        *guard = None;
+                    }
+                    if let Some(Ok(st)) = status
+                        && !st.success()
+                    {
+                        tracing::debug!("tts command exited with {st}");
+                    }
+                }
+                let more_queued = turn
+                    .as_ref()
+                    .is_some_and(|t| !t.cut_off_to_viewer && !t.sentences.is_empty());
+                if !more_queued {
+                    shared.speaking.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+}
+
+async fn handle_speech_cmd(
+    shared: &SpeechShared,
+    cmd: SpeechCmd,
+    turn: &mut Option<TurnSpeech>,
+    running_tts: &mut Option<RunningTts>,
+    duck_state: &mut DuckState,
+) {
+    let current_epoch = shared.epoch.load(Ordering::SeqCst);
+    match cmd {
+        SpeechCmd::Start { id, epoch } => {
+            if epoch != current_epoch || !shared.can_speak() {
+                return;
+            }
+            kill_running_tts(shared, running_tts).await;
+            shared.speaking.store(false, Ordering::SeqCst);
+            if !shared.config.earcon_start.is_empty() {
+                spawn_earcon_detached(&shared.config.earcon_start);
+            }
+            *turn = Some(TurnSpeech {
+                id,
+                epoch,
+                accumulator: SentenceAccumulator::default(),
+                lang: None,
+                sentences: VecDeque::new(),
+                finishing: false,
+                cut_off_to_viewer: false,
+            });
+        }
+        SpeechCmd::Chunk { id, delta, epoch } => {
+            if epoch != current_epoch || !shared.can_speak() {
+                return;
+            }
+            let Some(t) = turn.as_mut() else {
+                return;
+            };
+            if t.id != id || t.epoch != epoch || t.cut_off_to_viewer {
+                return;
+            }
+            let newly_ready = t.accumulator.push_delta(&delta);
+            if t.accumulator.should_cutoff(shared.limits) {
+                t.cut_off_to_viewer = true;
+                t.sentences.clear();
+                kill_running_tts(shared, running_tts).await;
+                shared.speaking.store(false, Ordering::SeqCst);
+                let _ = shared.active_turn_id.compare_exchange(
+                    id,
+                    0,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                restore_media(duck_state).await;
+                return;
+            }
+            t.sentences.extend(newly_ready);
+        }
+        SpeechCmd::Finish {
+            id,
+            full_text,
+            has_widgets,
+            epoch,
+        } => {
+            if epoch != current_epoch {
+                return;
+            }
+            let Some(t) = turn.as_mut() else {
+                let _ = shared.active_turn_id.compare_exchange(
+                    id,
+                    0,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                return;
+            };
+            if t.id != id || t.epoch != epoch {
+                return;
+            }
+            if t.cut_off_to_viewer || has_widgets || !is_short(&full_text, shared.limits) {
+                t.cut_off_to_viewer = true;
+                t.sentences.clear();
+                kill_running_tts(shared, running_tts).await;
+                shared.speaking.store(false, Ordering::SeqCst);
+                let _ = shared.active_turn_id.compare_exchange(
+                    id,
+                    0,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                *turn = None;
+                restore_media(duck_state).await;
+                return;
+            }
+            if t.accumulator.accumulated.is_empty() && !full_text.trim().is_empty() {
+                let _ = t.accumulator.push_delta(&full_text);
+            } else if full_text.starts_with(&t.accumulator.accumulated)
+                && full_text.len() > t.accumulator.accumulated.len()
+            {
+                let suffix = &full_text[t.accumulator.accumulated.len()..];
+                let extra = t.accumulator.push_delta(suffix);
+                t.sentences.extend(extra);
+            }
+            t.sentences.extend(t.accumulator.flush_remaining());
+            t.finishing = true;
+        }
+        SpeechCmd::Stop { epoch } => {
+            let _ = epoch;
+            kill_running_tts(shared, running_tts).await;
+            *turn = None;
+            shared.speaking.store(false, Ordering::SeqCst);
+            if !shared.config.earcon_cancel.is_empty() {
+                spawn_earcon_detached(&shared.config.earcon_cancel);
+            }
+            restore_media(duck_state).await;
+        }
+    }
+}
+
+fn select_tts_command<'a>(speak: &'a SpeakConfig, lang: &str) -> &'a [String] {
+    match lang {
+        "de" if !speak.command_de.is_empty() => &speak.command_de,
+        "en" if !speak.command_en.is_empty() => &speak.command_en,
+        _ => &speak.command,
+    }
+}
+
+fn spawn_tts_sentence(
+    shared: &SpeechShared,
+    argv: &[String],
+    lang: &str,
+    sentence: &str,
+    turn_epoch: u64,
+) -> Option<RunningTts> {
+    if argv.is_empty() {
+        return None;
+    }
+    let program = argv[0].replace("{lang}", lang);
+    let args: Vec<String> = argv[1..]
+        .iter()
+        .map(|a| a.replace("{lang}", lang))
+        .collect();
+    let mut child = match Command::new(&program)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!("cannot start TTS command {program}: {e}");
+            return None;
+        }
+    };
+    let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
+    {
+        let Ok(mut guard) = shared.active_pgid.lock() else {
+            let _ = child.start_kill();
+            return None;
+        };
+        if shared.epoch.load(Ordering::SeqCst) != turn_epoch {
+            if let Some(p) = pgid {
+                unsafe {
+                    libc::kill(-p, libc::SIGKILL);
+                }
+            }
+            let _ = child.start_kill();
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            return None;
+        }
+        *guard = pgid;
+    }
+    if let Some(mut stdin) = child.stdin.take() {
+        let mut payload = sentence.as_bytes().to_vec();
+        payload.push(b'\n');
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&payload).await;
+            let _ = stdin.shutdown().await;
+        });
+    }
+    Some(RunningTts {
+        epoch: turn_epoch,
+        child,
+        pgid,
+    })
+}
+
+async fn kill_running_tts(shared: &SpeechShared, running: &mut Option<RunningTts>) {
+    if let Some(mut tts) = running.take() {
+        if let Ok(mut guard) = shared.active_pgid.lock()
+            && *guard == tts.pgid
+        {
+            *guard = None;
+        }
+        if let Some(pgid) = tts.pgid {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        let _ = tts.child.kill().await;
+        let _ = tts.child.wait().await;
+    }
+}
+
+fn spawn_earcon_detached(argv: &[String]) {
+    if argv.is_empty() {
+        return;
+    }
+    let program = argv[0].clone();
+    let args = argv[1..].to_vec();
+    tokio::spawn(async move {
+        if let Ok(mut child) = Command::new(&program)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        }
+    });
+}
+
+async fn run_earcon(argv: &[String]) {
+    if argv.is_empty() {
+        return;
+    }
+    if let Ok(mut child) = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+    {
+        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    }
+}
+
+async fn run_duck_cmd(program: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_millis(800), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn duck_media(mode: MediaDuck, state: &mut DuckState) {
+    duck_media_with(mode, state, |prog, args| {
+        let prog = prog.to_string();
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        async move {
+            let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+            run_duck_cmd(&prog, &refs).await
+        }
+    })
+    .await;
+}
+
+async fn duck_media_with<F, Fut>(mode: MediaDuck, state: &mut DuckState, mut run: F)
+where
+    F: FnMut(&str, &[&str]) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    if !matches!(state, DuckState::Idle) || mode == MediaDuck::None {
+        return;
+    }
+    match mode {
+        MediaDuck::None => {}
+        MediaDuck::Pause => {
+            let Some(list) = run("playerctl", &["-l"]).await else {
+                return;
+            };
+            let mut paused = Vec::new();
+            for raw in list.lines() {
+                let player = raw.trim();
+                if player.is_empty() {
+                    continue;
+                }
+                if let Some(status) = run("playerctl", &["-p", player, "status"]).await
+                    && status.trim() == "Playing"
+                    && run("playerctl", &["-p", player, "pause"]).await.is_some()
+                {
+                    paused.push(player.to_string());
+                }
+            }
+            if !paused.is_empty() {
+                *state = DuckState::PausedPlayers(paused);
+            }
+        }
+        MediaDuck::Lower => {
+            if let Some(vol_out) = run("pamixer", &["--get-volume"]).await
+                && let Ok(vol) = vol_out.trim().parse::<u32>()
+            {
+                if vol > 0 {
+                    let ducked = ((vol * 35) / 100).to_string();
+                    if run("pamixer", &["--set-volume", &ducked]).await.is_some() {
+                        *state = DuckState::LoweredPamixer(vol);
+                    }
+                }
+                return;
+            }
+            if let Some(wp_out) = run("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]).await
+                && !wp_out.contains("[MUTED]")
+                && let Some(num) = wp_out
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|t| t.parse::<f64>().ok())
+                && num > 0.0
+            {
+                let orig = format!("{num:.2}");
+                let ducked = format!("{:.2}", num * 0.35);
+                if run("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &ducked])
+                    .await
+                    .is_some()
+                {
+                    *state = DuckState::LoweredWpctl(orig);
+                }
+            }
+        }
+    }
+}
+
+async fn restore_media(state: &mut DuckState) {
+    restore_media_with(state, |prog, args| {
+        let prog = prog.to_string();
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        async move {
+            let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+            run_duck_cmd(&prog, &refs).await
+        }
+    })
+    .await;
+}
+
+async fn restore_media_with<F, Fut>(state: &mut DuckState, mut run: F)
+where
+    F: FnMut(&str, &[&str]) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    match std::mem::take(state) {
+        DuckState::Idle => {}
+        DuckState::PausedPlayers(players) => {
+            for player in players {
+                let _ = run("playerctl", &["-p", &player, "play"]).await;
+            }
+        }
+        DuckState::LoweredPamixer(vol) => {
+            let s = vol.to_string();
+            let _ = run("pamixer", &["--set-volume", &s]).await;
+        }
+        DuckState::LoweredWpctl(orig) => {
+            let _ = run("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &orig]).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2453,6 +3892,7 @@ mod tests {
             text: "# Heading\n\nbody".to_string(),
             denied: vec![],
             profile: None,
+            widgets: vec![],
         });
         desktop.finish().await;
         let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -2495,6 +3935,7 @@ mod tests {
             text: "# Heading\n\nbody".to_string(),
             denied: vec![],
             profile: None,
+            widgets: vec![],
         });
         desktop.finish().await;
         let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -2529,6 +3970,7 @@ mod tests {
             text: "# Heading\n\nbody".to_string(),
             denied: vec![],
             profile: None,
+            widgets: vec![],
         });
         desktop.present(Presentation::Progress {
             id: 2,
@@ -2592,6 +4034,7 @@ mod tests {
             text: "# Heading\n\nbody".to_string(),
             denied: vec![],
             profile: None,
+            widgets: vec![],
         });
         desktop.finish().await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2833,6 +4276,7 @@ mod tests {
             text: "Done.".to_string(),
             denied: vec![],
             profile: Some("deep".to_string()),
+            widgets: vec![],
         });
         desktop.finish().await;
         let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -2959,6 +4403,7 @@ mod tests {
             text: "Finished.".to_string(),
             denied: vec![],
             profile: None,
+            widgets: vec![],
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
@@ -3030,6 +4475,7 @@ mod tests {
             text: "ok".to_string(),
             denied: vec![],
             profile: None,
+            widgets: vec![],
         });
         desktop.finish().await;
         let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -3085,6 +4531,7 @@ mod tests {
             text: "ok".to_string(),
             denied: vec![],
             profile: None,
+            widgets: vec![],
         });
         desktop2.finish().await;
         let recorded2 = std::fs::read_to_string(&calls2).unwrap_or_default();
@@ -3268,16 +4715,22 @@ mod tests {
             text: "# Report\n\n<script>x</script>".to_string(),
             denied: vec![],
             profile: Some("deep".to_string()),
+            widgets: vec![],
         });
         desktop.present(Presentation::Answer {
             id: 1,
             text: "Quick reply.".to_string(),
             denied: vec![],
             profile: None,
+            widgets: vec![],
         });
 
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && !opened.exists() {
+        while Instant::now() < deadline
+            && std::fs::read_to_string(&opened)
+                .unwrap_or_default()
+                .is_empty()
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(opened.exists(), "clicking Open must launch viewer");
@@ -3309,6 +4762,7 @@ mod tests {
             text: "Short answer".to_string(),
             denied: vec![],
             profile: None,
+            widgets: vec![],
         });
         let t0 = Instant::now();
         desktop2.finish().await;
@@ -3353,5 +4807,731 @@ mod tests {
         assert!(d.contains("[image: p](https://evil.example/p.png)"), "{d}");
         let e = disarm_html("Price is $5 (`$10` in store) <script>alert(1)</script> `code`");
         assert!(!e.contains("<script>"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn short_answer_replaces_thinking_and_handles_copy_reply_and_open_actions() {
+        let dir = std::env::temp_dir().join(format!("hc-short-actions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. Copy action on short answer (also verifies --replace-id=7 and action flags).
+        let calls = dir.join("notify-copy.log");
+        let copied = dir.join("copied.txt");
+        let action_file = dir.join("action.txt");
+        std::fs::write(&action_file, "copy").unwrap();
+        let notifier_script = format!(
+            "echo \"$*\" >> '{}'; case \"$*\" in *--action=copy=Copy*) echo 8; sleep 0.05; cat '{}' ;; *) echo 7 ;; esac",
+            calls.display(),
+            action_file.display()
+        );
+        let viewer_out = dir.join("viewer.txt");
+        let reply_out = dir.join("reply.txt");
+        let config = PresentConfig {
+            notifier: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                notifier_script,
+                "sh".to_string(),
+            ],
+            clipboard: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("cat > '{}'", copied.display()),
+                "sh".to_string(),
+            ],
+            reply_command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("printf '%s' \"$1\" > '{}'", reply_out.display()),
+                "sh".to_string(),
+                "--reply-to={id}".to_string(),
+            ],
+            viewer: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "{{ printf '%s|' \"$@\"; cat \"$2\"; }} > '{}.tmp' && mv '{}.tmp' '{}'",
+                    viewer_out.display(),
+                    viewer_out.display(),
+                    viewer_out.display()
+                ),
+                "hey-computer-viewer".to_string(),
+                "--turn-id={id}".to_string(),
+                "{file}".to_string(),
+            ],
+            ..PresentConfig::default()
+        };
+
+        let desktop = Desktop::spawn_full(
+            &config,
+            dir.join("answers"),
+            Duration::from_millis(100),
+            PROGRESS_UPDATE_INTERVAL,
+            Duration::from_secs(5),
+        );
+        desktop.present(Presentation::Progress {
+            id: 42,
+            request: "ask".to_string(),
+            profile: None,
+            thinking_label: None,
+        });
+        desktop.present(Presentation::Answer {
+            id: 42,
+            text: "Short <raw> reply.".to_string(),
+            denied: vec![],
+            profile: None,
+            widgets: vec![],
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && std::fs::read_to_string(&copied)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&copied).unwrap(),
+            "Short <raw> reply."
+        );
+        let log = std::fs::read_to_string(&calls).unwrap();
+        assert!(log.contains("--action=copy=Copy"), "{log}");
+        assert!(log.contains("--action=reply=Reply"), "{log}");
+        assert!(log.contains("--action=open=Open"), "{log}");
+        assert!(
+            log.contains("--replace-id=7 -- Answer Short &lt;raw&gt; reply."),
+            "{log}"
+        );
+
+        // 2. Reply action with explicit `reply_command` expands `{id}`.
+        std::fs::write(&action_file, "reply").unwrap();
+        desktop.present(Presentation::Answer {
+            id: 43,
+            text: "Reply target.".to_string(),
+            denied: vec![],
+            profile: None,
+            widgets: vec![],
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && std::fs::read_to_string(&reply_out)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&reply_out).unwrap(),
+            "--reply-to=43"
+        );
+        desktop.finish().await;
+
+        // 3. Reply fallback (empty `reply_command`) opens `hey-computer-viewer` with `--focus-composer` & `{id}`.
+        let mut fallback_cfg = config.clone();
+        fallback_cfg.reply_command.clear();
+        let desktop_fb = Desktop::spawn_full(
+            &fallback_cfg,
+            dir.join("answers-fb"),
+            Duration::from_millis(100),
+            PROGRESS_UPDATE_INTERVAL,
+            Duration::from_secs(5),
+        );
+        std::fs::write(&action_file, "reply").unwrap();
+        desktop_fb.present(Presentation::Answer {
+            id: 44,
+            text: "Compose <here>.".to_string(),
+            denied: vec![],
+            profile: None,
+            widgets: vec![],
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && std::fs::read_to_string(&viewer_out)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        let fb_out = std::fs::read_to_string(&viewer_out).unwrap();
+        assert!(fb_out.contains("--turn-id=44|"), "{fb_out}");
+        assert!(fb_out.contains("|--focus-composer|"), "{fb_out}");
+        assert!(fb_out.contains("Compose &lt;here>."), "{fb_out}");
+
+        // 4. Open action writes disarmed Markdown and opens viewer without `--focus-composer`.
+        let _ = std::fs::remove_file(&viewer_out);
+        std::fs::write(&action_file, "open").unwrap();
+        desktop_fb.present(Presentation::Answer {
+            id: 45,
+            text: "Open <safe>.".to_string(),
+            denied: vec![],
+            profile: None,
+            widgets: vec![],
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && std::fs::read_to_string(&viewer_out)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        let open_out = std::fs::read_to_string(&viewer_out).unwrap();
+        assert!(open_out.contains("--turn-id=45|"), "{open_out}");
+        assert!(!open_out.contains("--focus-composer"), "{open_out}");
+        assert!(open_out.contains("Open &lt;safe>."), "{open_out}");
+
+        desktop_fb.finish().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn action_waiters_evict_lru_oldest_keeping_newest_clickable() {
+        let dir = std::env::temp_dir().join(format!("hc-lru-waiters-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let seq_file = dir.join("seq");
+        let pids_dir = dir.join("pids");
+        std::fs::create_dir_all(&pids_dir).unwrap();
+        let opened_id = dir.join("opened-id.txt");
+
+        // Notifications 1..=16 print their ID and sleep waiting for a click;
+        // notification 17 prints its ID, sleeps briefly, and outputs `open`.
+        let notifier_script = format!(
+            "n=$(cat '{seq}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{seq}'; \
+             echo $$ > '{pids}'/$n; echo $n; \
+             if [ \"$n\" -eq 17 ]; then sleep 0.15; echo open; else exec sleep 30; fi",
+            seq = seq_file.display(),
+            pids = pids_dir.display(),
+        );
+        let config = PresentConfig {
+            notifier: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                notifier_script,
+                "sh".to_string(),
+            ],
+            viewer: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("printf '%s' \"$1\" > '{}'", opened_id.display()),
+                "sh".to_string(),
+                "{id}".to_string(),
+                "{file}".to_string(),
+            ],
+            clipboard: vec![],
+            reply_command: vec![],
+            ..PresentConfig::default()
+        };
+
+        let desktop = Desktop::spawn_full(
+            &config,
+            dir.join("answers"),
+            Duration::from_millis(100),
+            PROGRESS_UPDATE_INTERVAL,
+            Duration::from_secs(30),
+        );
+
+        for id in 1..=17u64 {
+            desktop.present(Presentation::Answer {
+                id,
+                text: format!("Short #{id}"),
+                denied: vec![],
+                profile: None,
+                widgets: vec![],
+            });
+        }
+
+        // Wait until #17's `open` action fires and launches the viewer with `{id} == 17`.
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline
+            && std::fs::read_to_string(&opened_id)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&opened_id).unwrap_or_default(),
+            "17",
+            "17th notification must stay active and open #17 (evicting #1 instead)"
+        );
+
+        let pid1: i32 = std::fs::read_to_string(pids_dir.join("1"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let pid2: i32 = std::fs::read_to_string(pids_dir.join("2"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        // Wait briefly for aborted #1 child reaping, then verify #1 is dead while #2 is still alive.
+        let reap_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < reap_deadline && unsafe { libc::kill(pid1, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert_ne!(
+            unsafe { libc::kill(pid1, 0) },
+            0,
+            "oldest waiter #1 (pid {pid1}) must be killed on 17th arrival"
+        );
+        assert_eq!(
+            unsafe { libc::kill(pid2, 0) },
+            0,
+            "waiter #2 (pid {pid2}) must remain alive"
+        );
+
+        desktop.finish().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn answers_and_tasks_with_widgets_always_route_to_viewer_and_expand_id() {
+        let dir = std::env::temp_dir().join(format!("hc-widgets-route-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let viewer_args = dir.join("viewer-args.txt");
+
+        let config = PresentConfig {
+            notifier: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("echo \"$*\" >> '{}'; echo 7", calls.display()),
+                "sh".to_string(),
+            ],
+            viewer: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("printf '%s|%s' \"$1\" \"$2\" > '{}'", viewer_args.display()),
+                "sh".to_string(),
+                "--turn-id={id}".to_string(),
+                "{file}".to_string(),
+            ],
+            ..PresentConfig::default()
+        };
+
+        let widget = WidgetSpec {
+            id: "w1".to_string(),
+            kind: "calendar_agenda".to_string(),
+            title: "Today's Agenda".to_string(),
+            data: serde_json::json!({"events": []}),
+        };
+
+        let desktop = Desktop::spawn_full(
+            &config,
+            dir.join("answers"),
+            Duration::from_millis(100),
+            PROGRESS_UPDATE_INTERVAL,
+            Duration::from_secs(5),
+        );
+        // Short text ("Sunny.") + non-empty widgets must bypass short notification and open viewer!
+        desktop.present(Presentation::Answer {
+            id: 91,
+            text: "Sunny.".to_string(),
+            denied: vec![],
+            profile: None,
+            widgets: vec![widget.clone()],
+        });
+        // TaskComplete with short text + widget uses `#id · headline` and offers `Open`.
+        desktop.present(Presentation::TaskComplete {
+            id: 92,
+            request: "agenda".to_string(),
+            text: "Sunny.".to_string(),
+            denied: vec![],
+            profile: None,
+            widgets: vec![widget],
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .contains("Task complete #92")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        desktop.finish().await;
+
+        let args_recorded = std::fs::read_to_string(&viewer_args).unwrap();
+        assert!(
+            args_recorded.starts_with("--turn-id=91|"),
+            "{args_recorded}"
+        );
+        assert!(args_recorded.ends_with("-91.md"), "{args_recorded}");
+
+        let notified = std::fs::read_to_string(&calls).unwrap();
+        assert!(notified.contains("Answer opened Sunny."), "{notified}");
+        assert!(
+            notified.contains("--action=open=Open -- Task complete #92 · Sunny."),
+            "{notified}"
+        );
+
+        // Also test `open_answer` with id=0 vs id=55 for `{id}` expansion.
+        open_answer_with_grace(
+            &config,
+            &dir.join("answers"),
+            0,
+            "file mode",
+            &[],
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        let zero_args = std::fs::read_to_string(&viewer_args).unwrap();
+        assert!(zero_args.starts_with("--turn-id=0|"), "{zero_args}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn detect_speech_lang_sentence_segmentation_and_markdown_sanitizer() {
+        assert_eq!(detect_speech_lang("Draußen sind es 18°C."), "de");
+        assert_eq!(detect_speech_lang("Schöne Grüße aus Hamburg!"), "de");
+        assert_eq!(
+            detect_speech_lang("Es ist 14:32 Uhr und heute scheint die Sonne."),
+            "de"
+        );
+        assert_eq!(detect_speech_lang("Ich bin heute im Büro."), "de");
+        assert_eq!(detect_speech_lang("It is 14:32 and sunny today."), "en");
+        assert_eq!(
+            detect_speech_lang("The process might die with your current config."),
+            "en"
+        );
+        assert_eq!(detect_speech_lang("Done."), "en");
+
+        assert_eq!(
+            strip_speech_markdown(
+                "Run **hyprctl** `version` — see [the docs](https://wiki.hypr.land) for __details__."
+            ),
+            "Run hyprctl version — see the docs for details."
+        );
+
+        let mut acc = SentenceAccumulator::default();
+        let s1 = acc.push_delta("Pi is ca. 3.14, e.g. for Dr. Smith in Nr. 5 bzw. z.B. here! ");
+        assert_eq!(
+            s1,
+            vec!["Pi is ca. 3.14, e.g. for Dr. Smith in Nr. 5 bzw. z.B. here!"]
+        );
+        assert!(acc.push_delta("1. First item").is_empty());
+        let s2 = acc.push_delta(" works. Second fragment");
+        assert_eq!(s2, vec!["1. First item works."]);
+        assert_eq!(acc.flush_remaining(), vec!["Second fragment"]);
+    }
+
+    #[tokio::test]
+    async fn speech_actor_streams_sentences_latches_language_and_cuts_off_on_rich_or_cancel() {
+        let dir = std::env::temp_dir().join(format!("hc-speech-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tts_log = dir.join("tts.log");
+
+        // 1. Streaming DE sentences with language latching on sentence 1 + earcons.
+        let mut config = PresentConfig {
+            notifications: false,
+            ..PresentConfig::default()
+        };
+        config.speak = SpeakConfig {
+            enabled: true,
+            voice_only: true,
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "printf 'generic:%s:%s\\n' \"$1\" \"$(cat)\" >> '{}'",
+                    tts_log.display()
+                ),
+                "sh".to_string(),
+                "{lang}".to_string(),
+            ],
+            command_de: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("printf 'de:%s\\n' \"$(cat)\" >> '{}'", tts_log.display()),
+                "sh".to_string(),
+            ],
+            command_en: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("printf 'en:%s\\n' \"$(cat)\" >> '{}'", tts_log.display()),
+                "sh".to_string(),
+            ],
+            earcon_start: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("echo earcon:start >> '{}'", tts_log.display()),
+                "sh".to_string(),
+            ],
+            earcon_done: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("echo earcon:done >> '{}'", tts_log.display()),
+                "sh".to_string(),
+            ],
+            earcon_cancel: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("echo earcon:cancel >> '{}'", tts_log.display()),
+                "sh".to_string(),
+            ],
+            media_duck: MediaDuck::None,
+        };
+
+        let desktop = Desktop::spawn(&config, dir.join("answers"));
+        desktop.present(Presentation::SpeechStart { id: 10 });
+        desktop.present(Presentation::SpeechChunk {
+            id: 10,
+            delta: "Es ist 14:32 Uhr. ".to_string(),
+        });
+        // Second sentence has no German stopwords/umlauts ("OK, **done** via [link](https://x.test).")
+        // yet must remain latched to `"de"`!
+        desktop.present(Presentation::SpeechChunk {
+            id: 10,
+            delta: "OK, **done** via [link](https://x.test).".to_string(),
+        });
+        desktop.present(Presentation::SpeechFinish {
+            id: 10,
+            full_text: "Es ist 14:32 Uhr. OK, **done** via [link](https://x.test).".to_string(),
+            has_widgets: false,
+        });
+        desktop.finish().await;
+
+        let log = std::fs::read_to_string(&tts_log).unwrap();
+        assert!(log.contains("earcon:start"), "{log}");
+        assert!(log.contains("de:Es ist 14:32 Uhr."), "{log}");
+        assert!(log.contains("de:OK, done via link."), "{log}");
+        assert!(log.ends_with("earcon:done\n"), "{log}");
+
+        // 2. Mid-stream rich cutoff kills in-flight TTS immediately when code fence arrives.
+        let cutoff_log = dir.join("cutoff.log");
+        let cutoff_pid = dir.join("cutoff.pid");
+        let mut cutoff_cfg = config.clone();
+        cutoff_cfg.speak.command_en = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "echo $$ > '{}'; printf 'say:%s\\n' \"$(cat)\" >> '{}'; exec sleep 10",
+                cutoff_pid.display(),
+                cutoff_log.display()
+            ),
+            "sh".to_string(),
+        ];
+        cutoff_cfg.speak.earcon_done = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo earcon:done >> '{}'", cutoff_log.display()),
+            "sh".to_string(),
+        ];
+
+        let desktop2 = Desktop::spawn(&cutoff_cfg, dir.join("answers2"));
+        desktop2.present(Presentation::SpeechStart { id: 20 });
+        desktop2.present(Presentation::SpeechChunk {
+            id: 20,
+            delta: "Here is the snippet you asked for. ".to_string(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !cutoff_pid.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cutoff_pid.exists(), "sentence 1 TTS should have started");
+
+        let t_cut = Instant::now();
+        desktop2.present(Presentation::SpeechChunk {
+            id: 20,
+            delta: "\n```rust\nfn main() {}\n```\n".to_string(),
+        });
+        desktop2.present(Presentation::SpeechFinish {
+            id: 20,
+            full_text: "Here is the snippet you asked for. \n```rust\nfn main() {}\n```\n"
+                .to_string(),
+            has_widgets: false,
+        });
+        desktop2.finish().await;
+        assert!(
+            t_cut.elapsed() < Duration::from_secs(2),
+            "rich cutoff must kill active TTS without waiting for sleep 10"
+        );
+        let c_log = std::fs::read_to_string(&cutoff_log).unwrap_or_default();
+        assert!(
+            c_log.contains("say:Here is the snippet you asked for."),
+            "{c_log}"
+        );
+        assert!(!c_log.contains("earcon:done"), "{c_log}");
+
+        // 3. Immediate post-turn `stop_speech(None)` kills active TTS in <50ms, skips queued
+        //    sentence 2, and fires `earcon_cancel`.
+        let cancel_log = dir.join("cancel.log");
+        let cancel_pid = dir.join("cancel.pid");
+        let mut cancel_cfg = config.clone();
+        cancel_cfg.speak.command_en = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "printf 'tts:%s\\n' \"$(cat)\" >> '{}'; echo $$ > '{}'; exec sleep 10",
+                cancel_log.display(),
+                cancel_pid.display()
+            ),
+            "sh".to_string(),
+        ];
+        cancel_cfg.speak.earcon_done = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo earcon:done >> '{}'", cancel_log.display()),
+            "sh".to_string(),
+        ];
+        cancel_cfg.speak.earcon_cancel = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo earcon:cancel >> '{}'", cancel_log.display()),
+            "sh".to_string(),
+        ];
+
+        let desktop3 = Desktop::spawn(&cancel_cfg, dir.join("answers3"));
+        desktop3.present(Presentation::SpeechStart { id: 77 });
+        desktop3.present(Presentation::SpeechChunk {
+            id: 77,
+            delta: "First spoken sentence. Second spoken sentence.".to_string(),
+        });
+        desktop3.present(Presentation::SpeechFinish {
+            id: 77,
+            full_text: "First spoken sentence. Second spoken sentence.".to_string(),
+            has_widgets: false,
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !cancel_pid.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(desktop3.speak_status(), (true, true));
+
+        let pid77: i32 = std::fs::read_to_string(&cancel_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let t_stop = Instant::now();
+        assert_eq!(desktop3.stop_speech(Some(999)), None);
+        assert_eq!(desktop3.stop_speech(None), Some(77));
+        assert!(
+            t_stop.elapsed() < Duration::from_millis(50),
+            "stop_speech took {:?}",
+            t_stop.elapsed()
+        );
+        assert_eq!(desktop3.speak_status(), (true, false));
+        assert_eq!(desktop3.stop_speech(None), None);
+
+        desktop3.finish().await;
+        assert!(
+            t_stop.elapsed() < Duration::from_secs(2),
+            "post-turn stop_speech must terminate sleep 10 immediately"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if std::fs::read_to_string(&cancel_log)
+                .unwrap_or_default()
+                .contains("earcon:cancel")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_ne!(unsafe { libc::kill(pid77, 0) }, 0);
+        let k_log = std::fs::read_to_string(&cancel_log).unwrap_or_default();
+        assert!(k_log.contains("tts:First spoken sentence."), "{k_log}");
+        assert!(!k_log.contains("Second spoken sentence"), "{k_log}");
+        assert!(k_log.contains("earcon:cancel"), "{k_log}");
+        assert!(!k_log.contains("earcon:done"), "{k_log}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn media_ducking_resumes_only_playing_players_and_restores_volume() {
+        // 1. MediaDuck::Pause pauses only `Playing` players and resumes only those.
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut state = DuckState::Idle;
+        {
+            let calls = Arc::clone(&calls);
+            duck_media_with(MediaDuck::Pause, &mut state, move |prog, args| {
+                let call = format!("{prog} {}", args.join(" "));
+                calls.lock().unwrap().push(call.clone());
+                async move {
+                    match call.as_str() {
+                        "playerctl -l" => Some("spotify\nfirefox\n".to_string()),
+                        "playerctl -p spotify status" => Some("Playing\n".to_string()),
+                        "playerctl -p firefox status" => Some("Paused\n".to_string()),
+                        "playerctl -p spotify pause" => Some(String::new()),
+                        _ => None,
+                    }
+                }
+            })
+            .await;
+        }
+        {
+            let calls = Arc::clone(&calls);
+            restore_media_with(&mut state, move |prog, args| {
+                let call = format!("{prog} {}", args.join(" "));
+                calls.lock().unwrap().push(call);
+                async { Some(String::new()) }
+            })
+            .await;
+        }
+        let log = calls.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "playerctl -l",
+                "playerctl -p spotify status",
+                "playerctl -p spotify pause",
+                "playerctl -p firefox status",
+                "playerctl -p spotify play",
+            ]
+        );
+
+        // 2. MediaDuck::Lower falls back to `wpctl` when `pamixer` is absent and restores exact volume.
+        let wp_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut wp_state = DuckState::Idle;
+        {
+            let wp_calls = Arc::clone(&wp_calls);
+            duck_media_with(MediaDuck::Lower, &mut wp_state, move |prog, args| {
+                let call = format!("{prog} {}", args.join(" "));
+                wp_calls.lock().unwrap().push(call.clone());
+                async move {
+                    match call.as_str() {
+                        "pamixer --get-volume" => None,
+                        "wpctl get-volume @DEFAULT_AUDIO_SINK@" => {
+                            Some("Volume: 0.80\n".to_string())
+                        }
+                        "wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.28" => Some(String::new()),
+                        _ => None,
+                    }
+                }
+            })
+            .await;
+        }
+        {
+            let wp_calls = Arc::clone(&wp_calls);
+            restore_media_with(&mut wp_state, move |prog, args| {
+                let call = format!("{prog} {}", args.join(" "));
+                wp_calls.lock().unwrap().push(call);
+                async { Some(String::new()) }
+            })
+            .await;
+        }
+        assert_eq!(
+            *wp_calls.lock().unwrap(),
+            vec![
+                "pamixer --get-volume",
+                "wpctl get-volume @DEFAULT_AUDIO_SINK@",
+                "wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.28",
+                "wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.80",
+            ]
+        );
     }
 }

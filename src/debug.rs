@@ -100,6 +100,7 @@ pub async fn present(config: &Config, text: String) -> Result<()> {
         text,
         denied: Vec::new(),
         profile: None,
+        widgets: Vec::new(),
     });
     desktop.finish().await;
     Ok(())

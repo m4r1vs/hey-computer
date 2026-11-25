@@ -260,6 +260,10 @@ async fn connection(
 
     match request {
         Request::Status => send(&mut write, &Reply::Status(handle.status())).await,
+        Request::Speak { action } => {
+            let (enabled, speaking) = handle.control_speak(action);
+            send(&mut write, &Reply::SpeakStatus { enabled, speaking }).await
+        }
         Request::ScheduleReload => {
             scheduler.reload();
             send(
@@ -298,7 +302,19 @@ async fn connection(
             suppress_token,
             attachments,
             source,
+            reply_to,
+            stream,
+            distill,
         } => {
+            if new && reply_to.is_some() {
+                return send(
+                    &mut write,
+                    &Reply::Error {
+                        message: "cannot combine `new` and `reply_to`".to_string(),
+                    },
+                )
+                .await;
+            }
             if let Some(tok) = &suppress_token
                 && tok.trim().is_empty()
             {
@@ -347,7 +363,50 @@ async fn connection(
                 suppress_token,
                 attachments: loaded_attachments,
                 source,
+                reply_to,
+                distill,
+                schedule_id: None,
+                schedule_has_script: false,
             };
+            if stream {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let id = match handle.ask(params, Sink::Stream(tx)) {
+                    Ok(id) => id,
+                    Err(message) => return send(&mut write, &Reply::Error { message }).await,
+                };
+                send(&mut write, &Reply::Accepted { id }).await?;
+                loop {
+                    let next = tokio::select! {
+                        item = rx.recv() => item,
+                        () = hung_up(&mut reader) => {
+                            tracing::debug!("the streaming client of request {id} left");
+                            handle.cancel(Some(id), FailReason::Cancelled);
+                            return Ok(());
+                        }
+                    };
+                    match next {
+                        Some(reply) => {
+                            let terminal =
+                                matches!(reply, Reply::Answer { .. } | Reply::Failed { .. });
+                            send(&mut write, &reply).await?;
+                            if terminal {
+                                return Ok(());
+                            }
+                        }
+                        None => {
+                            return send(
+                                &mut write,
+                                &Reply::Failed {
+                                    id,
+                                    reason: FailReason::AgentDown,
+                                    message: "the daemon is shutting down".to_string(),
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
             if !wait {
                 return match handle.ask(params, Sink::Present) {
                     Ok(id) => send(&mut write, &Reply::Accepted { id }).await,
@@ -406,4 +465,348 @@ async fn send(write: &mut tokio::net::unix::OwnedWriteHalf, reply: &Reply) -> Re
     write.write_all(line.as_bytes()).await.context("replying")?;
     write.flush().await.context("replying")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::present::{Presentation, Recorder};
+    use crate::protocol::{InputSource, SpeakAction};
+    use crate::store;
+    use tokio::sync::oneshot;
+
+    /// Spawn an in-process daemon backed by a tiny Python ACP script to test
+    /// streaming IPC, `mcp-ui` widget capture, voice vs. text modality, and
+    /// `reply_to` Path A (live session) + Path B (DB-seeded session) resumption.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_widget_capture_voice_modality_and_reply_to_resumption() {
+        let dir = std::env::temp_dir().join(format!("hc-daemon-p5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("d.sock");
+        let agent_script = dir.join("fake-acp.sh");
+        let agent_log = dir.join("agent.log");
+
+        std::fs::write(
+            &agent_script,
+            r#"#!/bin/sh
+log_path="$1"
+state_dir="$2"
+seq=0
+
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  mid=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"sh-mock","version":"0.1"}}}\n' "$mid"
+      ;;
+    *'"method":"session/new"'*)
+      seq=$((seq + 1))
+      sid="s${seq}"
+      echo 0 > "${state_dir}/turns_${sid}"
+      printf 'new %s\n' "$sid" >> "$log_path"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s","configOptions":[{"id":"model","currentValue":"gemini-4-hydrogen"},{"id":"thought_level","currentValue":"low"},{"id":"mode","currentValue":"default"}]}}\n' "$mid" "$sid"
+      ;;
+    *'"method":"session/set_config_option"'*|*'"method":"session/close"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$mid"
+      ;;
+    *'"method":"session/prompt"'*)
+      sid=$(printf '%s\n' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+      prev=$(cat "${state_dir}/turns_${sid}" 2>/dev/null || echo 0)
+      turn_n=$((prev + 1))
+      echo "$turn_n" > "${state_dir}/turns_${sid}"
+      printf 'prompt %s t%s :: %s\n' "$sid" "$turn_n" "$line" >> "$log_path"
+      case "$line" in
+        *'"text":"TRIGGER_WIDGET_CARD"'*)
+          tc_id="tc_${seq}_${turn_n}"
+          tc=$(printf '{"sessionUpdate":"tool_call","toolCallId":"%s","name":"call_mcp_tool","kind":"execute","status":"pending","rawInput":{"ServerName":"mcp-ui","ToolName":"show_widget","Arguments":{"id":"w-board","kind":"transit_board","title":"U3 Borgweg","data":{"departures":[{"line":"U3","inMin":4}]}}}}' "$tc_id")
+          printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":%s}}\n' "$sid" "$tc"
+          printf '{"jsonrpc":"2.0","id":"perm1","method":"session/request_permission","params":{"sessionId":"%s","toolCall":%s,"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}}\n' "$sid" "$tc"
+          IFS= read -r _perm_reply
+          printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"tool_call_update","toolCallId":"%s","status":"completed"}}}\n' "$sid" "$tc_id"
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$mid"
+          ;;
+        *)
+          printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ack %s/t%s"}}}}\n' "$sid" "$sid" "$turn_n"
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$mid"
+          ;;
+      esac
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&agent_script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut cfg = Config {
+            state_dir: dir.join("state"),
+            ..Config::default()
+        };
+        cfg.agent.command = vec![
+            "/bin/sh".to_string(),
+            agent_script.to_string_lossy().into_owned(),
+            agent_log.to_string_lossy().into_owned(),
+            dir.to_string_lossy().into_owned(),
+        ];
+        cfg.conversation.follow_up_secs = 0.05;
+        cfg.present.speak.enabled = true;
+        cfg.present.speak.voice_only = true;
+
+        let recorder = Recorder::new();
+        let presenter: Arc<dyn Presenter> = recorder.clone();
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let sock_clone = socket.clone();
+        let state_dir = cfg.state_dir.clone();
+        let daemon_task = tokio::spawn(async move {
+            serve(cfg, &sock_clone, presenter, async {
+                let _ = stop_rx.await;
+            })
+            .await
+        });
+
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 1. Streaming widget-only turn emits Progress, Widget, and Answer (never FailReason::Empty).
+        let (t1_id, mut stream_client) = ipc::ask_request(
+            &socket,
+            &Request::Ask {
+                text: "TRIGGER_WIDGET_CARD".to_string(),
+                wait: true,
+                new: true,
+                profile: None,
+                background: false,
+                suppress_token: None,
+                attachments: vec![],
+                source: InputSource::Typed,
+                reply_to: None,
+                stream: true,
+                distill: false,
+            },
+        )
+        .await
+        .unwrap();
+        let mut seen_widget = false;
+        let mut seen_progress = false;
+        loop {
+            match stream_client
+                .next(Some(Duration::from_secs(10)))
+                .await
+                .unwrap()
+            {
+                Reply::Progress { status, .. } => {
+                    if status.contains("Render widget: U3 Borgweg") {
+                        seen_progress = true;
+                    }
+                }
+                Reply::Widget { widget, .. } => {
+                    assert_eq!(widget.id, "w-board");
+                    assert_eq!(widget.kind, "transit_board");
+                    seen_widget = true;
+                }
+                Reply::Answer {
+                    id,
+                    text,
+                    widgets,
+                    conversation_id,
+                    ..
+                } => {
+                    assert_eq!(id, t1_id);
+                    assert!(text.is_empty());
+                    assert_eq!(widgets.len(), 1);
+                    assert_eq!(conversation_id, Some(t1_id));
+                    break;
+                }
+                other => panic!("unexpected stream reply: {other:?}"),
+            }
+        }
+        assert!(seen_progress, "expected Render widget progress");
+        assert!(seen_widget, "expected streamed Reply::Widget");
+
+        // 2. Wait past follow_up_secs (50 ms) and test Path A (`reply_to = Some(t1_id)`):
+        //    reuses live session `s1` (`ack s1/t2`) even after follow_up_secs expired!
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let (t2_id, mut c2) = ipc::ask_request(
+            &socket,
+            &Request::Ask {
+                text: "follow up on board".to_string(),
+                wait: true,
+                new: false,
+                profile: None,
+                background: false,
+                suppress_token: None,
+                attachments: vec![],
+                source: InputSource::Typed,
+                reply_to: Some(t1_id),
+                stream: false,
+                distill: false,
+            },
+        )
+        .await
+        .unwrap();
+        match c2.next(Some(Duration::from_secs(10))).await.unwrap() {
+            Reply::Answer {
+                text,
+                conversation_id,
+                ..
+            } => {
+                assert_eq!(text, "ack s1/t2");
+                assert_eq!(conversation_id, Some(t1_id));
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        // 3. Branching `reply_to = Some(t1_id)` now that `last_turn_id == Some(t2_id)`
+        //    takes Path B: opens a fresh session seeded with `<untrusted_conversation_history>`.
+        let (_t3_id, mut c3) = ipc::ask_request(
+            &socket,
+            &Request::Ask {
+                text: "branch from turn 1".to_string(),
+                wait: true,
+                new: false,
+                profile: None,
+                background: false,
+                suppress_token: None,
+                attachments: vec![],
+                source: InputSource::Typed,
+                reply_to: Some(t1_id),
+                stream: false,
+                distill: false,
+            },
+        )
+        .await
+        .unwrap();
+        match c3.next(Some(Duration::from_secs(10))).await.unwrap() {
+            Reply::Answer {
+                text,
+                conversation_id,
+                ..
+            } => {
+                assert!(
+                    text.ends_with("/t1"),
+                    "expected fresh seeded session, got {text}"
+                );
+                assert_eq!(conversation_id, Some(t1_id));
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        assert!(t2_id > t1_id);
+
+        // 4. Voice vs. Text Modality on Sink::Present (`wait = false`):
+        //    - Typed request NEVER emits Speech* when `voice_only = true`.
+        //    - Voice request prepends `<modality source="voice">` and DOES emit SpeechStart/SpeechChunk/SpeechFinish!
+        let (typed_id, _) = ipc::ask_request(
+            &socket,
+            &Request::Ask {
+                text: "typed hello".to_string(),
+                wait: false,
+                new: true,
+                profile: None,
+                background: false,
+                suppress_token: None,
+                attachments: vec![],
+                source: InputSource::Typed,
+                reply_to: None,
+                stream: false,
+                distill: false,
+            },
+        )
+        .await
+        .unwrap();
+        recorder
+            .wait_for(Duration::from_secs(5), |items| {
+                items
+                    .iter()
+                    .any(|i| matches!(i, Presentation::Answer { id, .. } if *id == typed_id))
+            })
+            .await
+            .unwrap();
+        assert!(
+            !recorder.items().iter().any(|i| matches!(
+                i,
+                Presentation::SpeechStart { .. }
+                    | Presentation::SpeechChunk { .. }
+                    | Presentation::SpeechFinish { .. }
+            )),
+            "typed request must not emit Speech* when voice_only is true: {:?}",
+            recorder.items()
+        );
+
+        let (voice_id, _) = ipc::ask_request(
+            &socket,
+            &Request::Ask {
+                text: "spoken hello".to_string(),
+                wait: false,
+                new: true,
+                profile: None,
+                background: false,
+                suppress_token: None,
+                attachments: vec![],
+                source: InputSource::Voice,
+                reply_to: None,
+                stream: false,
+                distill: false,
+            },
+        )
+        .await
+        .unwrap();
+        let items = recorder
+            .wait_for(Duration::from_secs(5), |items| {
+                items
+                    .iter()
+                    .any(|i| matches!(i, Presentation::Answer { id, .. } if *id == voice_id))
+            })
+            .await
+            .unwrap();
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::SpeechStart { id } if *id == voice_id))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::SpeechChunk { id, .. } if *id == voice_id))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::SpeechFinish { id, .. } if *id == voice_id))
+        );
+
+        // Speak IPC request works over the socket.
+        match ipc::request(
+            &socket,
+            &Request::Speak {
+                action: SpeakAction::Toggle,
+            },
+        )
+        .await
+        .unwrap()
+        {
+            Reply::SpeakStatus { enabled, .. } => assert!(!enabled),
+            other => panic!("expected SpeakStatus, got {other:?}"),
+        }
+        assert!(!store::load_speak_state(&state_dir, true));
+
+        let logs = std::fs::read_to_string(&agent_log).unwrap();
+        assert!(
+            logs.contains("<untrusted_conversation_history>"),
+            "Path B must seed conversation history: {logs}"
+        );
+        assert!(
+            logs.contains(r#"<modality source=\"voice\">"#),
+            "Voice ask must carry voice modality header: {logs}"
+        );
+
+        let _ = stop_tx.send(());
+        daemon_task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

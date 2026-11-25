@@ -260,6 +260,7 @@ async fn without_wait_the_daemon_presents_progress_then_the_answer() {
                 text: "Hello from the mock.".to_string(),
                 denied: vec![],
                 profile: None,
+                widgets: vec![],
             },
         ]
     );
@@ -995,6 +996,7 @@ async fn without_wait_tool_calls_emit_progress_updates() {
                 text: "All good.".to_string(),
                 denied: vec![],
                 profile: None,
+                widgets: vec![],
             },
         ]
     );
@@ -1273,6 +1275,9 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1296,6 +1301,9 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1325,6 +1333,9 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1345,6 +1356,9 @@ async fn profiles_preserve_spare_inherit_on_follow_up_and_switch_in_place() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1417,6 +1431,9 @@ async fn mid_session_config_rejection_falls_back_to_a_fresh_session() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1447,6 +1464,9 @@ async fn unknown_profile_returns_error_without_superseding_running_request() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1506,6 +1526,9 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
                 },
             ],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1548,6 +1571,9 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
                 path: note,
             }],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1575,6 +1601,9 @@ async fn attachments_are_loaded_before_accepted_and_forwarded_as_acp_blocks() {
                 path: h.dir.join("missing.png"),
             }],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1621,6 +1650,9 @@ async fn background_task_runs_concurrently_with_interactive_and_survives_interac
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1719,6 +1751,9 @@ async fn background_tasks_queue_fifo_respect_max_queued_and_cancel_by_id() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1736,6 +1771,9 @@ async fn background_tasks_queue_fifo_respect_max_queued_and_cancel_by_id() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1755,6 +1793,9 @@ async fn background_tasks_queue_fifo_respect_max_queued_and_cancel_by_id() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1805,6 +1846,9 @@ async fn suppress_token_silences_heartbeats_and_notifies_on_alerts() {
             suppress_token: Some("HEARTBEAT_OK".to_string()),
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1831,6 +1875,9 @@ async fn suppress_token_silences_heartbeats_and_notifies_on_alerts() {
             suppress_token: Some("HEARTBEAT_OK".to_string()),
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1852,6 +1899,9 @@ async fn suppress_token_silences_heartbeats_and_notifies_on_alerts() {
             suppress_token: Some("HEARTBEAT_OK".to_string()),
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -1950,6 +2000,9 @@ async fn mcp_config_is_written_privately_and_profile_mcp_allowlist_is_enforced()
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2225,6 +2278,9 @@ async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Voice,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2244,6 +2300,9 @@ async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Voice,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2268,6 +2327,9 @@ async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Voice,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2292,6 +2354,9 @@ async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Typed,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2315,6 +2380,9 @@ async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Voice,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2353,6 +2421,9 @@ async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Voice,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2419,6 +2490,9 @@ async fn triage_background_promotion_clears_running_and_expiring_recurring_sched
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2443,6 +2517,9 @@ async fn triage_background_promotion_clears_running_and_expiring_recurring_sched
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Typed,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2577,6 +2654,9 @@ async fn section3_ux_and_conductor_quirks_regression() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Voice,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2612,6 +2692,9 @@ async fn section3_ux_and_conductor_quirks_regression() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Voice,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2647,6 +2730,9 @@ async fn section3_ux_and_conductor_quirks_regression() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Voice,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2663,6 +2749,9 @@ async fn section3_ux_and_conductor_quirks_regression() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Voice,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2702,6 +2791,9 @@ async fn section3_ux_and_conductor_quirks_regression() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Typed,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2775,6 +2867,9 @@ async fn section3_ux_and_conductor_quirks_regression() {
             suppress_token: None,
             attachments: vec![],
             source: InputSource::Voice,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await
@@ -2784,4 +2879,352 @@ async fn section3_ux_and_conductor_quirks_regression() {
 
     h.stop().await;
     let _ = std::fs::remove_dir_all(&tmp_mem_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase5_mcp_ui_streaming_reply_to_resumption_and_voice_tts_modality() {
+    use hey_computer::config::Profile;
+    use hey_computer::protocol::SpeakAction;
+
+    let script = r##"{
+      "turns": [
+        {
+          "match": "show_agenda",
+          "steps": [
+            {
+              "permission": {
+                "server": "mcp-ui",
+                "command": "show_widget",
+                "arguments": {
+                  "id": "w-cal",
+                  "kind": "calendar_agenda",
+                  "title": "Morning Agenda",
+                  "data": { "events": [{ "title": "Standup", "start": "09:30" }] }
+                }
+              }
+            },
+            { "chunk": "Here is " },
+            { "chunk": "your agenda." }
+          ]
+        },
+        {
+          "match": "live_followup",
+          "steps": ["turn_info"]
+        },
+        {
+          "match": "resume_after_close",
+          "steps": ["echo"]
+        },
+        {
+          "match": "bg_seed_fact",
+          "steps": [{ "chunk": "Seed fact: project codename is Aurora." }]
+        },
+        {
+          "match": "voice_hello",
+          "steps": ["echo"]
+        },
+        {
+          "match": "typed_hello",
+          "steps": ["echo"]
+        }
+      ],
+      "default": ["echo"]
+    }"##;
+
+    let h = Harness::start(script, |cfg| {
+        // `follow_up_secs` is tiny so we can verify `reply_to` reuses the live
+        // ACP session even after `follow_up_secs` expires!
+        cfg.conversation.follow_up_secs = 0.05;
+        cfg.profiles.insert(
+            "lean".to_string(),
+            Profile {
+                // Even with `mcp_servers = Some([])`, `mcp-ui` must stay allowed
+                // on non-restricted lanes!
+                mcp_servers: Some(vec![]),
+                ..Profile::default()
+            },
+        );
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    // 1. Verify `mcp-ui` is auto-registered in `<agent_dir>/config/mcp_config.json`.
+    let mcp_cfg_path = h.dir.join("state/agy/config/mcp_config.json");
+    let mcp_cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp_cfg_path).unwrap()).unwrap();
+    assert_eq!(mcp_cfg["mcpServers"]["mcp-ui"]["type"], "stdio");
+
+    // 2. `stream: true` on `lean` profile streams `Chunk` + `Widget` + `Answer`
+    //    and persists `widgets_json` + `conversation_id` in SQLite v4.
+    let (agenda_id, mut stream_client) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "show_agenda".to_string(),
+            wait: true,
+            new: true,
+            profile: Some("lean".to_string()),
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Typed,
+            reply_to: None,
+            stream: true,
+            distill: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut chunks = String::new();
+    let mut streamed_widgets = Vec::new();
+    let final_answer = loop {
+        match stream_client
+            .next(Some(Duration::from_secs(10)))
+            .await
+            .unwrap()
+        {
+            Reply::Chunk { id, text } => {
+                assert_eq!(id, agenda_id);
+                chunks.push_str(&text);
+            }
+            Reply::Progress { id, .. } => assert_eq!(id, agenda_id),
+            Reply::Widget { id, widget } => {
+                assert_eq!(id, agenda_id);
+                streamed_widgets.push(widget);
+            }
+            Reply::Answer {
+                id,
+                text,
+                widgets,
+                conversation_id,
+                profile,
+                ..
+            } => {
+                assert_eq!(id, agenda_id);
+                assert_eq!(conversation_id, Some(agenda_id));
+                assert_eq!(profile.as_deref(), Some("lean"));
+                assert_eq!(widgets.len(), 1);
+                assert_eq!(widgets[0].kind, "calendar_agenda");
+                break text;
+            }
+            other => panic!("unexpected stream frame: {other:?}"),
+        }
+    };
+    assert_eq!(chunks, "Here is your agenda.");
+    assert_eq!(final_answer, "Here is your agenda.");
+    assert_eq!(streamed_widgets.len(), 1);
+
+    let stored = hey_computer::store::get_turn(&h.dir.join("state"), agenda_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.widgets.len(), 1);
+    assert_eq!(stored.conversation_id, Some(agenda_id));
+
+    // 3. Path A: Wait past `follow_up_secs` (50 ms) and send `reply_to: Some(agenda_id)` —
+    //    must reuse the still-open live ACP session (`turn 2 in mock-1`)!
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let (_, mut live_reply_client) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "live_followup".to_string(),
+            wait: true,
+            new: false,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Typed,
+            reply_to: Some(agenda_id),
+            stream: false,
+            distill: false,
+        },
+    )
+    .await
+    .unwrap();
+    let live_reply = live_reply_client
+        .next(Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    assert!(
+        answer(&live_reply).starts_with("turn 2 in "),
+        "expected live session reuse on reply_to, got: {}",
+        answer(&live_reply)
+    );
+
+    // 4. Path B: Background task closes its ACP session immediately on completion;
+    //    `reply_to: Some(bg_id)` seeds `<untrusted_conversation_history>` from `history.db`!
+    let (bg_id, mut bg_client) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "bg_seed_fact".to_string(),
+            wait: true,
+            new: true,
+            profile: None,
+            background: true,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
+        },
+    )
+    .await
+    .unwrap();
+    let bg_ans = bg_client.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert_eq!(answer(&bg_ans), "Seed fact: project codename is Aurora.");
+
+    let (resumed_id, mut resumed_client) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "resume_after_close".to_string(),
+            wait: true,
+            new: false,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Typed,
+            reply_to: Some(bg_id),
+            stream: false,
+            distill: false,
+        },
+    )
+    .await
+    .unwrap();
+    let resumed_ans = resumed_client
+        .next(Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    let echoed = answer(&resumed_ans);
+    assert!(
+        echoed.contains("<untrusted_conversation_history>")
+            && echoed.contains("Aurora")
+            && echoed.contains("resume_after_close"),
+        "expected DB-seeded history block, got: {echoed}"
+    );
+    let resumed_row = hey_computer::store::get_turn(&h.dir.join("state"), resumed_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed_row.conversation_id, Some(bg_id));
+
+    // 5. Voice vs. text modality + post-turn `cancel` stopping TTS playback:
+    let speak_reply = ipc::request(
+        &h.socket,
+        &Request::Speak {
+            action: SpeakAction::On,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        speak_reply,
+        Reply::SpeakStatus {
+            enabled: true,
+            speaking: false
+        }
+    );
+    assert!(h.status().await.speak);
+
+    // 5a. Typed non-waiting ask: text-only (no `<modality source="voice">`, zero `Speech*` events).
+    let (typed_id, _) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "typed_hello".to_string(),
+            wait: false,
+            new: true,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Typed,
+            reply_to: None,
+            stream: false,
+            distill: false,
+        },
+    )
+    .await
+    .unwrap();
+    let items_after_typed = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::Answer { id, .. } if *id == typed_id))
+        })
+        .await
+        .expect("typed answer presented");
+    assert!(
+        !items_after_typed.iter().any(|i| matches!(
+            i,
+            Presentation::SpeechStart { id }
+                | Presentation::SpeechChunk { id, .. }
+                | Presentation::SpeechFinish { id, .. }
+                if *id == typed_id
+        )),
+        "typed ask must not trigger TTS speech: {items_after_typed:?}"
+    );
+
+    // 5b. Voice non-waiting ask: injects `<modality source="voice">` AND streams TTS events!
+    let (voice_id, _) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "voice_hello".to_string(),
+            wait: false,
+            new: true,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Voice,
+            reply_to: None,
+            stream: false,
+            distill: false,
+        },
+    )
+    .await
+    .unwrap();
+    let items_after_voice = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::Answer { id, .. } if *id == voice_id))
+        })
+        .await
+        .expect("voice answer presented");
+    let voice_answer = items_after_voice
+        .iter()
+        .find_map(|i| match i {
+            Presentation::Answer { id, text, .. } if *id == voice_id => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        voice_answer.contains("<modality source=\"voice\">"),
+        "voice prompt must carry voice modality hint: {voice_answer}"
+    );
+    assert!(
+        items_after_voice
+            .iter()
+            .any(|i| matches!(i, Presentation::SpeechStart { id } if *id == voice_id))
+            && items_after_voice
+                .iter()
+                .any(|i| matches!(i, Presentation::SpeechChunk { id, .. } if *id == voice_id))
+            && items_after_voice
+                .iter()
+                .any(|i| matches!(i, Presentation::SpeechFinish { id, .. } if *id == voice_id)),
+        "voice ask must emit SpeechStart/SpeechChunk/SpeechFinish: {items_after_voice:?}"
+    );
+
+    // 5c. Simulate ongoing TTS audio after the ACP turn has completed; `Request::Cancel`
+    //     must stop active speech and return `Some(voice_id)`!
+    h.recorder.simulate_speaking(Some(voice_id));
+    let cancel_reply = ipc::request(&h.socket, &Request::Cancel { id: None })
+        .await
+        .unwrap();
+    assert_eq!(cancel_reply, Reply::Cancelled { id: Some(voice_id) });
+    assert!(h.recorder.stopped_speech().contains(&None));
+
+    h.stop().await;
 }

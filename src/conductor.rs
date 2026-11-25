@@ -25,7 +25,9 @@ use crate::context::{self, ContextProvider, SystemContext};
 use crate::environment::{self, Paths};
 use crate::policy::{LanePolicy, PermissionDecision};
 use crate::present::{Presentation, Presenter, Urgency};
-use crate::protocol::{AgentState, FailReason, InputSource, Reply, Status};
+use crate::protocol::{
+    AgentState, FailReason, InputSource, Reply, SpeakAction, Status, WidgetSpec,
+};
 use crate::routing::{self, HeuristicResult, LaneChoice, RouteDecision, TierChoice};
 use crate::store::{self, Lane, NewTurn, Store, TurnStatus};
 
@@ -45,6 +47,10 @@ const MEMORY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Upper bound on internal `<agent_dir>/.../mcp/` schema `read_file` calls
 /// exempted from `max_tool_calls` within a single turn.
 const MAX_EXEMPT_SCHEMA_READS: usize = 64;
+/// Maximum turns loaded from `history.db` when seeding a closed `reply_to` thread.
+const MAX_SEEDED_HISTORY_TURNS: usize = 12;
+/// Maximum characters injected inside `<untrusted_conversation_history>`.
+const MAX_SEEDED_HISTORY_CHARS: usize = 24_000;
 
 /// Where a request's result goes.
 pub enum Sink {
@@ -52,6 +58,9 @@ pub enum Sink {
     Present,
     /// A waiting client gets it, and nothing is shown.
     Client(oneshot::Sender<Reply>),
+    /// A streaming waiting client gets incremental `Progress` / `Chunk` /
+    /// `Widget` / `Reset` events followed by the terminal `Answer` / `Failed`.
+    Stream(mpsc::UnboundedSender<Reply>),
 }
 
 /// Parameters submitted to [`Handle::ask`].
@@ -63,6 +72,10 @@ pub struct AskParams {
     pub suppress_token: Option<String>,
     pub attachments: Vec<LoadedAttachment>,
     pub source: InputSource,
+    pub reply_to: Option<u64>,
+    pub distill: bool,
+    pub schedule_id: Option<u64>,
+    pub schedule_has_script: bool,
 }
 
 /// What became of a request.
@@ -72,6 +85,9 @@ pub enum Outcome {
         text: String,
         denied: Vec<String>,
         suppressed: bool,
+        widgets: Vec<WidgetSpec>,
+        conversation_id: Option<u64>,
+        profile: Option<String>,
     },
     Failed {
         reason: FailReason,
@@ -93,11 +109,17 @@ impl Outcome {
                 text,
                 denied,
                 suppressed,
+                widgets,
+                conversation_id,
+                profile,
             } => Reply::Answer {
                 id,
                 text,
                 denied,
                 suppressed,
+                widgets,
+                conversation_id,
+                profile,
             },
             Self::Failed { reason, message } => Reply::Failed {
                 id,
@@ -168,9 +190,12 @@ pub struct Ask {
     pub suppress_token: Option<String>,
     pub attachments: Vec<LoadedAttachment>,
     pub source: InputSource,
+    pub reply_to: Option<u64>,
+    pub reply_to_root_conv_id: Option<u64>,
     pub auto_routed_fast: bool,
     pub auto_backgrounded: bool,
     pub pre_progress_shown: bool,
+    pub speech_started: bool,
     pub captured_ambient: Option<Option<String>>,
     pub escalated_once: bool,
     pub sink: Sink,
@@ -206,6 +231,8 @@ struct Shared {
 #[derive(Clone)]
 pub struct Handle {
     config: Arc<Config>,
+    presenter: Arc<dyn Presenter>,
+    state_dir: Option<PathBuf>,
     shared: Arc<Mutex<Shared>>,
     messages: mpsc::UnboundedSender<Message>,
     /// Set at shutdown; interrupts whatever the conductor is waiting on.
@@ -222,11 +249,31 @@ impl Handle {
     }
 
     /// Queue an interactive or background request. Returns its monotonic id,
-    /// or an error if the background queue is full.
+    /// or an error if the background queue is full or `reply_to` does not exist.
     pub fn ask(&self, params: AskParams, sink: Sink) -> std::result::Result<u64, String> {
+        let mut effective_profile = params.profile;
+        let mut reply_to_root_conv_id = None;
+        if let Some(target_id) = params.reply_to {
+            if self.store.is_some()
+                && let Some(sd) = &self.state_dir
+            {
+                let target = store::get_turn(sd, target_id)
+                    .map_err(|e| format!("reading turn #{target_id}: {e:#}"))?
+                    .ok_or_else(|| format!("turn #{target_id} not found in history"))?;
+                reply_to_root_conv_id = Some(target.conversation_id.unwrap_or(target.id));
+                if effective_profile.is_none()
+                    && !target.profile.is_empty()
+                    && self.config.resolve_profile(Some(&target.profile)).is_ok()
+                {
+                    effective_profile = Some(target.profile);
+                }
+            } else {
+                reply_to_root_conv_id = Some(target_id);
+            }
+        }
+
         let token = Arc::new(CancelToken::default());
         let mut effective_background = params.background;
-        let mut effective_profile = params.profile;
         let mut auto_backgrounded = false;
         let id = {
             let mut shared = self
@@ -244,7 +291,8 @@ impl Handle {
                 && shared.bg_queued < self.config.tasks.max_queued
             {
                 let now = Instant::now();
-                let is_followup = !params.new && shared.follow_up_until.is_some_and(|u| u > now);
+                let is_followup = params.reply_to.is_some()
+                    || (!params.new && shared.follow_up_until.is_some_and(|u| u > now));
                 if !is_followup
                     && let HeuristicResult::Decided(RouteDecision {
                         lane: LaneChoice::Background,
@@ -289,6 +337,10 @@ impl Handle {
                 id
             }
         };
+        if !effective_background {
+            // Barge-in: new interactive requests silence any ongoing TTS playback.
+            self.presenter.stop_speech(None);
+        }
         let lane = if effective_background {
             Lane::Background
         } else {
@@ -304,6 +356,15 @@ impl Handle {
             .filter(|p| *p != "default")
             .unwrap_or("")
             .to_string();
+        let origin = if params.distill {
+            store::TurnOrigin::Distill
+        } else if params.schedule_id.is_some() && params.schedule_has_script {
+            store::TurnOrigin::ScheduleScript
+        } else if params.schedule_id.is_some() {
+            store::TurnOrigin::Schedule
+        } else {
+            store::TurnOrigin::from_input_source(params.source)
+        };
         if let Some(store) = &self.store {
             store.create_turn(NewTurn {
                 id,
@@ -317,6 +378,8 @@ impl Handle {
                     .iter()
                     .map(LoadedAttachment::meta)
                     .collect(),
+                origin,
+                schedule_id: params.schedule_id,
             });
         }
         let ask = Ask {
@@ -328,9 +391,12 @@ impl Handle {
             suppress_token: params.suppress_token,
             attachments: params.attachments,
             source: params.source,
+            reply_to: params.reply_to,
+            reply_to_root_conv_id,
             auto_routed_fast: false,
             auto_backgrounded,
             pre_progress_shown: false,
+            speech_started: false,
             captured_ambient: None,
             escalated_once: false,
             sink,
@@ -368,39 +434,38 @@ impl Handle {
 
     /// Cancel the active interactive request (`only == None`, falling back to
     /// the most recent auto-backgrounded task when the interactive lane is
-    /// idle), or a specific interactive or background request (`only == Some(id)`).
+    /// idle), a specific interactive or background request (`only == Some(id)`),
+    /// or active post-turn TTS playback.
     pub fn cancel(&self, only: Option<u64>, reason: FailReason) -> Option<u64> {
-        let cancelled = {
-            let shared = self.shared.lock().ok()?;
-            match only {
-                None => {
-                    let fg_cancelled = shared
-                        .fg_latest
-                        .as_ref()
-                        .and_then(|(id, token)| token.cancel(reason).then_some(*id));
-                    fg_cancelled.or_else(|| {
-                        let id = shared.last_auto_bg?;
-                        let token = shared.bg_tasks.get(&id)?;
-                        token.cancel(reason).then_some(id)
-                    })
-                }
-                Some(target) => {
-                    if let Some((id, token)) = shared.fg_latest.as_ref()
-                        && *id == target
-                    {
-                        token.cancel(reason).then_some(*id)
-                    } else if let Some(token) = shared.bg_tasks.get(&target) {
-                        token.cancel(reason).then_some(target)
-                    } else {
-                        None
-                    }
+        let speech_stopped = self.presenter.stop_speech(only);
+        let cancelled = self.shared.lock().ok().and_then(|shared| match only {
+            None => {
+                let fg_cancelled = shared
+                    .fg_latest
+                    .as_ref()
+                    .and_then(|(id, token)| token.cancel(reason).then_some(*id));
+                fg_cancelled.or_else(|| {
+                    let id = shared.last_auto_bg?;
+                    let token = shared.bg_tasks.get(&id)?;
+                    token.cancel(reason).then_some(id)
+                })
+            }
+            Some(target) => {
+                if let Some((id, token)) = shared.fg_latest.as_ref()
+                    && *id == target
+                {
+                    token.cancel(reason).then_some(*id)
+                } else if let Some(token) = shared.bg_tasks.get(&target) {
+                    token.cancel(reason).then_some(target)
+                } else {
+                    None
                 }
             }
-        };
+        });
         if cancelled.is_some() {
             let _ = self.messages.send(Message::Wake);
         }
-        cancelled
+        cancelled.or(speech_stopped)
     }
 
     pub fn status(&self) -> Status {
@@ -424,6 +489,7 @@ impl Handle {
             ),
             None => (waiting, None, None),
         };
+        let (speak, speaking) = self.presenter.speak_status();
         Status {
             agent: shared.agent,
             running,
@@ -436,7 +502,32 @@ impl Handle {
             handled: shared.handled,
             background_running: shared.bg_running,
             background_queued: shared.bg_queued,
+            speak,
+            speaking,
         }
+    }
+
+    pub fn control_speak(&self, action: SpeakAction) -> (bool, bool) {
+        let (current_enabled, current_speaking) = self.presenter.speak_status();
+        let next = match action {
+            SpeakAction::Status => return (current_enabled, current_speaking),
+            SpeakAction::On => true,
+            SpeakAction::Off => false,
+            SpeakAction::Toggle => !current_enabled,
+        };
+        self.presenter.set_speak_enabled(next);
+        if let Some(state_dir) = &self.state_dir
+            && let Err(e) = store::save_speak_state(state_dir, next)
+        {
+            tracing::warn!(
+                "cannot persist speak state in {}: {e:#}",
+                state_dir.display()
+            );
+        }
+        if !next {
+            self.presenter.stop_speech(None);
+        }
+        self.presenter.speak_status()
     }
 
     /// Stop the conductor and the agent; waits for neither.
@@ -471,6 +562,17 @@ pub fn spawn_with_store(
         Some((s, id)) => (Some(s), id),
         None => (None, 0),
     };
+    let state_dir = if !config.state_dir.as_os_str().is_empty() || store.is_some() {
+        config.state_dir().ok()
+    } else {
+        None
+    };
+    let initial_speak = match &state_dir {
+        Some(sd) => store::load_speak_state(sd, config.present.speak.enabled),
+        None => config.present.speak.enabled,
+    };
+    presenter.set_speak_enabled(initial_speak);
+
     let shared = Arc::new(Mutex::new(Shared {
         next_id: initial_last_id,
         fg_latest: None,
@@ -486,16 +588,23 @@ pub fn spawn_with_store(
     let (messages, inbox) = mpsc::unbounded_channel();
     let (done_tx, done_rx) = mpsc::unbounded_channel();
     let stop = Arc::new(CancelToken::default());
-    let known_mcp_servers: Vec<String> = config.mcp.keys().cloned().collect();
+    let mut known_mcp_servers: Vec<String> = config.mcp.keys().cloned().collect();
+    if !known_mcp_servers
+        .iter()
+        .any(|s| s == crate::mcp::INTERNAL_UI_MCP_SERVER)
+    {
+        known_mcp_servers.push(crate::mcp::INTERNAL_UI_MCP_SERVER.to_string());
+    }
     let conductor = Conductor {
         policy: Arc::new(
             LanePolicy::standard(&config.permissions.deny)
                 .with_known_mcp_servers(known_mcp_servers),
         ),
         config: Arc::clone(&config),
-        presenter,
+        presenter: Arc::clone(&presenter),
         context,
         store: store.clone(),
+        state_dir: state_dir.clone(),
         shared: Arc::clone(&shared),
         inbox,
         done_tx,
@@ -518,6 +627,8 @@ pub fn spawn_with_store(
     (
         Handle {
             config,
+            presenter,
+            state_dir,
             shared,
             messages,
             stop,
@@ -555,6 +666,8 @@ struct Conversation {
     session: String,
     /// First turn id in this conversation (for threading in history.db).
     conversation_id: u64,
+    /// Most recent completed turn id in this live session (for Path A `reply_to`).
+    last_turn_id: Option<u64>,
     profile_name: Option<String>,
     model: String,
     thought_level: String,
@@ -566,6 +679,7 @@ struct Conversation {
 struct TurnFinished {
     ask: Ask,
     session: String,
+    conv_id: Option<u64>,
     used_profile: Option<String>,
     started: Instant,
     end: TurnEnd,
@@ -576,6 +690,7 @@ struct Conductor {
     presenter: Arc<dyn Presenter>,
     context: Arc<dyn ContextProvider>,
     store: Option<Store>,
+    state_dir: Option<PathBuf>,
     policy: Arc<LanePolicy>,
     shared: Arc<Mutex<Shared>>,
     inbox: mpsc::UnboundedReceiver<Message>,
@@ -634,6 +749,9 @@ struct TurnContext<'a> {
     policy: &'a LanePolicy,
     budgets: Budgets,
     progress: Option<&'a Arc<dyn Presenter>>,
+    speech: Option<&'a Arc<dyn Presenter>>,
+    voice_stop: Option<&'a Arc<dyn Presenter>>,
+    stream_tx: Option<&'a mpsc::UnboundedSender<Reply>>,
     agent_dir: Option<&'a Path>,
     id: u64,
 }
@@ -912,7 +1030,10 @@ fn is_internal_mcp_schema_path(path_str: &str, agent_dir: Option<&Path>) -> bool
     if rel.starts_with("workspace") {
         return false;
     }
-    rel.components().any(|c| c.as_os_str() == "mcp")
+    rel.components().any(|c| {
+        let s = c.as_os_str();
+        s == "mcp" || s == crate::mcp::INTERNAL_UI_MCP_SERVER
+    })
 }
 
 fn tool_signature(call: &Value) -> ((String, String), bool) {
@@ -1337,7 +1458,7 @@ impl Conductor {
         };
 
         let mut retried_auth = false;
-        let (session, resolved, conv_id) = loop {
+        let (session, resolved, conv_id, seeded_history) = loop {
             let was_live = self.live.is_some();
             if !was_live {
                 self.restart_at = None;
@@ -1375,8 +1496,32 @@ impl Conductor {
                     .profile
                     .clone()
                     .or_else(|| self.config.tasks.profile.clone());
+                let bg_cid = match ask.reply_to {
+                    Some(target_id) => ask.reply_to_root_conv_id.unwrap_or(target_id),
+                    None => ask.id,
+                };
+                let seeded = match ask.reply_to {
+                    Some(target_id) => self.load_seeded_history(target_id).await,
+                    None => None,
+                };
                 tokio::select! {
-                    res = self.new_background_session(effective_req.as_deref()) => res.map(|(s, r)| (s, r, None)),
+                    res = self.new_background_session(effective_req.as_deref()) => {
+                        res.map(|(s, r)| (s, r, Some(bg_cid), seeded))
+                    }
+                    reason = interrupts.wait() => {
+                        self.finish_request(ask, cancelled(reason), display_profile, false);
+                        return;
+                    }
+                }
+            } else if let Some(target_id) = ask.reply_to {
+                tokio::select! {
+                    res = self.session_for_reply_to(
+                        ask.id,
+                        target_id,
+                        ask.reply_to_root_conv_id,
+                        ask.new,
+                        ask.profile.as_deref(),
+                    ) => res,
                     reason = interrupts.wait() => {
                         self.finish_request(ask, cancelled(reason), display_profile, false);
                         return;
@@ -1385,8 +1530,12 @@ impl Conductor {
             } else {
                 tokio::select! {
                     res = self.session_for(ask.id, ask.new, ask.profile.as_deref()) => res.map(|(s, r)| {
-                        let cid = self.conversation.as_ref().map(|c| c.conversation_id);
-                        (s, r, cid)
+                        let cid = self
+                            .conversation
+                            .as_ref()
+                            .map(|c| c.conversation_id)
+                            .or(Some(ask.id));
+                        (s, r, cid, None)
                     }),
                     reason = interrupts.wait() => {
                         self.finish_request(ask, cancelled(reason), display_profile, false);
@@ -1396,7 +1545,7 @@ impl Conductor {
             };
 
             match session_result {
-                Ok(triple) => break triple,
+                Ok(quad) => break quad,
                 Err(outcome) => {
                     if was_live
                         && !retried_auth
@@ -1476,6 +1625,18 @@ impl Conductor {
         );
         let presenter = (!ask.background && matches!(ask.sink, Sink::Present))
             .then(|| Arc::clone(&self.presenter));
+        let emit_speech = !ask.background
+            && ask.suppress_token.is_none()
+            && matches!(ask.sink, Sink::Present)
+            && (ask.source == InputSource::Voice || !self.config.present.speak.voice_only);
+        ask.speech_started = emit_speech;
+        let speech_presenter = emit_speech.then(|| Arc::clone(&self.presenter));
+        let voice_stop_presenter =
+            (emit_speech || ask.source == InputSource::Voice).then(|| Arc::clone(&self.presenter));
+        let stream_tx = match &ask.sink {
+            Sink::Stream(tx) => Some(tx.clone()),
+            Sink::Present | Sink::Client(_) => None,
+        };
         let agent_dir = self.paths.as_ref().map(|p| p.agent_dir.clone());
         let done_tx = self.done_tx.clone();
         let stop = Arc::clone(&self.stop);
@@ -1505,6 +1666,7 @@ impl Conductor {
                                 let _ = done_tx.send(TurnFinished {
                                     ask,
                                     session,
+                                    conv_id,
                                     used_profile,
                                     started,
                                     end: TurnEnd {
@@ -1533,12 +1695,21 @@ impl Conductor {
             } else {
                 None
             };
-            let header = match (budget_header, ambient) {
-                (Some(b), Some(a)) => Some(format!("{b}\n\n{a}")),
-                (Some(b), None) => Some(b),
-                (None, Some(a)) => Some(a),
-                (None, None) => None,
-            };
+            let modality_header = context::format_modality(ask.source);
+            let mut header_parts: Vec<&str> = Vec::new();
+            if let Some(b) = budget_header.as_deref() {
+                header_parts.push(b);
+            }
+            if let Some(m) = modality_header {
+                header_parts.push(m);
+            }
+            if let Some(a) = ambient.as_deref() {
+                header_parts.push(a);
+            }
+            if let Some(h) = seeded_history.as_deref() {
+                header_parts.push(h);
+            }
+            let header = (!header_parts.is_empty()).then(|| header_parts.join("\n\n"));
             if let Some(header) = &header {
                 tracing::debug!("request {}: ambient context: {:?}", ask.id, header);
             }
@@ -1553,6 +1724,9 @@ impl Conductor {
                 policy: &policy,
                 budgets,
                 progress: presenter.as_ref(),
+                speech: speech_presenter.as_ref(),
+                voice_stop: voice_stop_presenter.as_ref(),
+                stream_tx: stream_tx.as_ref(),
                 agent_dir: agent_dir.as_deref(),
                 id: ask.id,
             };
@@ -1560,6 +1734,7 @@ impl Conductor {
             let _ = done_tx.send(TurnFinished {
                 ask,
                 session,
+                conv_id,
                 used_profile,
                 started,
                 end,
@@ -1571,6 +1746,7 @@ impl Conductor {
         let TurnFinished {
             ask,
             session,
+            conv_id,
             used_profile,
             started,
             mut end,
@@ -1585,13 +1761,26 @@ impl Conductor {
             self.fg_active = None;
         }
 
+        if let Outcome::Answer {
+            conversation_id,
+            profile,
+            ..
+        } = &mut end.outcome
+        {
+            *conversation_id = conv_id.or(Some(ask.id));
+            *profile = used_profile.clone();
+        }
+
         // Apply --suppress-token check before updating follow-up window or persistence.
         if let Some(token) = ask.suppress_token.as_deref()
             && let Outcome::Answer {
                 text,
                 denied,
                 suppressed,
+                widgets,
+                ..
             } = &mut end.outcome
+            && widgets.is_empty()
             && is_suppressed(text, token, denied)
         {
             *suppressed = true;
@@ -1660,6 +1849,7 @@ impl Conductor {
                 ) {
                     conversation.last = Instant::now();
                     conversation.turns += 1;
+                    conversation.last_turn_id = Some(ask.id);
                     let until = secs(self.config.conversation.follow_up_secs)
                         .and_then(|window| conversation.last.checked_add(window));
                     self.set_follow_up(until);
@@ -1726,11 +1916,18 @@ impl Conductor {
                 ask.id,
                 self.config.routing.deep_profile
             );
+            self.presenter.stop_speech(Some(ask.id));
+            if let Sink::Stream(ref tx) = ask.sink {
+                let _ = tx.send(Reply::Reset { id: ask.id });
+            }
             let mut retry = ask;
+            retry.speech_started = false;
             retry.escalated_once = true;
             retry.auto_routed_fast = false;
             retry.profile = Some(self.config.routing.deep_profile.clone());
-            retry.new = true;
+            if retry.reply_to.is_none() {
+                retry.new = true;
+            }
             self.fg_pending = Some(retry);
             return;
         }
@@ -1744,7 +1941,7 @@ impl Conductor {
     /// Apply Tier 1 heuristics and (for non-voice unsure new turns) Tier 3
     /// restricted LLM triage. Returns `Some(reason)` if cancelled during triage.
     async fn apply_routing(&mut self, ask: &mut Ask) -> Option<FailReason> {
-        let is_followup = !ask.new && self.is_in_follow_up_window();
+        let is_followup = ask.reply_to.is_some() || (!ask.new && self.is_in_follow_up_window());
         let can_background = matches!(ask.sink, Sink::Present);
         let heuristic = routing::classify_heuristic(
             &ask.text,
@@ -1936,6 +2133,9 @@ impl Conductor {
             policy: &restricted,
             budgets,
             progress: None,
+            speech: None,
+            voice_stop: None,
+            stream_tx: None,
             agent_dir: None,
             id: ask.id,
         };
@@ -2034,8 +2234,19 @@ impl Conductor {
                         now_ms,
                     );
                 }
-                Outcome::Answer { text, denied, .. } => {
-                    store.finish_completed(ask.id, text.clone(), denied.clone(), now_ms);
+                Outcome::Answer {
+                    text,
+                    denied,
+                    widgets,
+                    ..
+                } => {
+                    store.finish_completed_with_widgets(
+                        ask.id,
+                        text.clone(),
+                        denied.clone(),
+                        widgets.clone(),
+                        now_ms,
+                    );
                 }
                 Outcome::Failed {
                     reason: reason @ (FailReason::Cancelled | FailReason::Superseded),
@@ -2110,6 +2321,7 @@ impl Conductor {
         }
         if self.config.instructions.memory_file.as_os_str().is_empty()
             && self.config.instructions.memory_files.is_empty()
+            && self.config.user_skills_dir().is_none()
         {
             return None;
         }
@@ -2448,6 +2660,7 @@ impl Conductor {
         self.conversation = Some(Conversation {
             session: session.clone(),
             conversation_id: turn_id,
+            last_turn_id: None,
             profile_name: resolved.name.clone(),
             model: resolved.model.clone(),
             thought_level: resolved.thought_level.clone(),
@@ -2455,6 +2668,157 @@ impl Conductor {
             turns: 0,
         });
         Ok((session, resolved))
+    }
+
+    async fn load_seeded_history(&self, target_id: u64) -> Option<String> {
+        let state_dir = self.state_dir.clone()?;
+        if let Some(store) = &self.store {
+            store.flush().await;
+        }
+        let turns = tokio::task::spawn_blocking(move || {
+            store::conversation_turns(&state_dir, target_id, false, MAX_SEEDED_HISTORY_TURNS)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+        context::format_conversation_history(&turns, MAX_SEEDED_HISTORY_CHARS)
+    }
+
+    /// Resume a conversation explicitly targeted by `reply_to`:
+    /// - Path A: reuse the live ACP session in place when it matches `root_conv_id`
+    ///   and its latest completed turn is `target_id` (even past `follow_up_secs`).
+    /// - Path B: otherwise load `history.db` turns up to `target_id`, open a fresh
+    ///   ACP session linked to `root_conv_id`, and seed `<untrusted_conversation_history>`.
+    async fn session_for_reply_to(
+        &mut self,
+        _turn_id: u64,
+        target_id: u64,
+        root_hint: Option<u64>,
+        new: bool,
+        requested: Option<&str>,
+    ) -> Result<(String, ResolvedProfile, Option<u64>, Option<String>), Outcome> {
+        let root_conv_id = root_hint
+            .or_else(|| {
+                self.conversation
+                    .as_ref()
+                    .filter(|c| c.last_turn_id == Some(target_id))
+                    .map(|c| c.conversation_id)
+            })
+            .unwrap_or(target_id);
+
+        if !new
+            && let Some(conversation) = &self.conversation
+            && conversation.conversation_id == root_conv_id
+            && conversation.last_turn_id == Some(target_id)
+        {
+            if requested.is_none() {
+                let resolved = self
+                    .config
+                    .resolve_profile(conversation.profile_name.as_deref())
+                    .map_err(|e| Outcome::failed(FailReason::AgentError, e))?;
+                tracing::info!(
+                    "resuming live session for reply_to #{} (turn {})",
+                    target_id,
+                    conversation.turns + 1
+                );
+                return Ok((
+                    conversation.session.clone(),
+                    resolved,
+                    Some(root_conv_id),
+                    None,
+                ));
+            }
+
+            let resolved = self
+                .config
+                .resolve_profile(requested)
+                .map_err(|e| Outcome::failed(FailReason::AgentError, e))?;
+            if resolved.model == conversation.model
+                && resolved.thought_level == conversation.thought_level
+            {
+                let session = conversation.session.clone();
+                let turns = conversation.turns + 1;
+                if let Some(conv) = &mut self.conversation {
+                    conv.profile_name = resolved.name.clone();
+                }
+                tracing::info!("resuming live session for reply_to #{target_id} (turn {turns})");
+                return Ok((session, resolved, Some(root_conv_id), None));
+            }
+
+            let session = conversation.session.clone();
+            let prev_model = conversation.model.clone();
+            let prev_thought = conversation.thought_level.clone();
+            let turns = conversation.turns + 1;
+            match self
+                .apply_profile_switch(&session, &prev_model, &prev_thought, &resolved)
+                .await?
+            {
+                true => {
+                    if let Some(conv) = &mut self.conversation {
+                        conv.profile_name = resolved.name.clone();
+                        conv.model = resolved.model.clone();
+                        conv.thought_level = resolved.thought_level.clone();
+                    }
+                    tracing::info!(
+                        "switched profile in place on reply_to #{target_id} (turn {turns})"
+                    );
+                    return Ok((session, resolved, Some(root_conv_id), None));
+                }
+                false => {
+                    tracing::warn!(
+                        "mid-conversation profile switch refused on reply_to #{target_id}; seeding new session from history"
+                    );
+                }
+            }
+        }
+
+        let seeded = self.load_seeded_history(target_id).await;
+        let resolved = self
+            .config
+            .resolve_profile(requested)
+            .map_err(|e| Outcome::failed(FailReason::AgentError, e))?;
+
+        if let Some(old) = self.conversation.take()
+            && let Some(live) = &self.live
+        {
+            drop(
+                live.conn
+                    .start_call("session/close", json!({"sessionId": old.session})),
+            );
+        }
+        self.set_follow_up(None);
+
+        let spare_matches = self
+            .live
+            .as_ref()
+            .and_then(|live| live.spare.as_ref())
+            .is_some_and(|spare| {
+                spare.model == resolved.model && spare.thought_level == resolved.thought_level
+            });
+        let session = if spare_matches {
+            self.live
+                .as_mut()
+                .and_then(|live| live.spare.take())
+                .expect("checked above")
+                .session
+        } else {
+            self.new_session(&resolved, self.policy.allow_mcp).await?
+        };
+        tracing::info!(
+            "opened DB-seeded session for reply_to #{target_id} (root conversation #{root_conv_id})"
+        );
+        self.conversation = Some(Conversation {
+            session: session.clone(),
+            conversation_id: root_conv_id,
+            last_turn_id: None,
+            profile_name: resolved.name.clone(),
+            model: resolved.model.clone(),
+            thought_level: resolved.thought_level.clone(),
+            last: Instant::now(),
+            turns: 0,
+        });
+        Ok((session, resolved, Some(root_conv_id), seeded))
     }
 
     async fn apply_profile_switch(
@@ -2661,6 +3025,9 @@ fn deliver(
         Sink::Client(reply) => {
             let _ = reply.send(outcome.into_reply(ask.id));
         }
+        Sink::Stream(tx) => {
+            let _ = tx.send(outcome.into_reply(ask.id));
+        }
         Sink::Present => {
             let Some(presenter) = presenter else {
                 return;
@@ -2669,11 +3036,26 @@ fn deliver(
                 Outcome::Answer {
                     suppressed: true, ..
                 } => {
+                    if ask.speech_started {
+                        presenter.stop_speech(Some(ask.id));
+                    }
                     if !ask.background {
                         presenter.present(Presentation::DismissProgress { id: ask.id });
                     }
                 }
-                Outcome::Answer { text, denied, .. } => {
+                Outcome::Answer {
+                    text,
+                    denied,
+                    widgets,
+                    ..
+                } => {
+                    if ask.speech_started {
+                        presenter.present(Presentation::SpeechFinish {
+                            id: ask.id,
+                            full_text: text.clone(),
+                            has_widgets: !widgets.is_empty(),
+                        });
+                    }
                     if ask.background {
                         presenter.present(Presentation::TaskComplete {
                             id: ask.id,
@@ -2681,6 +3063,7 @@ fn deliver(
                             text,
                             denied,
                             profile,
+                            widgets,
                         });
                     } else {
                         presenter.present(Presentation::Answer {
@@ -2688,10 +3071,14 @@ fn deliver(
                             text,
                             denied,
                             profile,
+                            widgets,
                         });
                     }
                 }
                 Outcome::Failed { reason, message } => {
+                    if ask.speech_started {
+                        presenter.stop_speech(Some(ask.id));
+                    }
                     presenter.present(Presentation::Failure {
                         id: ask.id,
                         reason,
@@ -2756,15 +3143,18 @@ fn log_outcome(id: u64, outcome: &Outcome, started: Instant) {
             text,
             denied,
             suppressed,
+            widgets,
+            ..
         } => {
             tracing::info!(
-                "request {id}: {} in {elapsed:.2} s, {} characters, {} refused",
+                "request {id}: {} in {elapsed:.2} s, {} characters, {} widgets, {} refused",
                 if *suppressed {
                     "suppressed"
                 } else {
                     "answered"
                 },
                 text.chars().count(),
+                widgets.len(),
                 denied.len()
             );
             tracing::debug!("answer {id}: {text:?}");
@@ -2806,6 +3196,18 @@ async fn sleep_until(at: Option<Instant>) {
     }
 }
 
+fn parse_mcp_ui_widget(
+    tool_name: &str,
+    args: &Value,
+    fallback_idx: usize,
+) -> std::result::Result<WidgetSpec, String> {
+    match tool_name {
+        "show_widget" => crate::mcp::parse_show_widget_args(args, fallback_idx),
+        "propose_widget_template" => crate::mcp::parse_propose_template_args(args, fallback_idx),
+        other => Err(format!("unsupported mcp-ui tool `{other}`")),
+    }
+}
+
 /// One prompt, from `session/prompt` to its stop reason, isolated to one
 /// session via its [`SessionSubscription`].
 async fn turn(
@@ -2820,6 +3222,9 @@ async fn turn(
     let budgets = ctx.budgets;
     let id = ctx.id;
     let started = Instant::now();
+    if let Some(sp) = ctx.speech {
+        sp.present(Presentation::SpeechStart { id });
+    }
     let mut response = client.start_call(
         "session/prompt",
         json!({"sessionId": session, "prompt": prompt_blocks}),
@@ -2827,6 +3232,11 @@ async fn turn(
     let mut answer = String::new();
     let mut denied: Vec<String> = Vec::new();
     let mut tools: Vec<String> = Vec::new();
+    let mut ui_calls: HashMap<String, (String, bool)> = HashMap::new();
+    let mut pending_widgets: HashMap<String, WidgetSpec> = HashMap::new();
+    let mut committed_widgets: HashSet<String> = HashSet::new();
+    let mut widgets: Vec<WidgetSpec> = Vec::new();
+    let mut widget_seq: usize = 0;
     let mut tracker = ToolTracker::new(ctx.agent_dir.map(Path::to_path_buf));
     let mut last_progress: Option<String> = None;
     let mut first_text: Option<Duration> = None;
@@ -2836,14 +3246,71 @@ async fn turn(
     tokio::pin!(turn_sleep);
     let at = || started.elapsed().as_secs_f64();
     let emit_progress = |last: &mut Option<String>, status: Option<String>| {
-        let (Some(presenter), Some(status)) = (ctx.progress, status) else {
+        if ctx.progress.is_none() && ctx.stream_tx.is_none() {
+            return;
+        }
+        let Some(status) = status else {
             return;
         };
         if last.as_deref() == Some(status.as_str()) {
             return;
         }
         *last = Some(status.clone());
-        presenter.present(Presentation::ProgressUpdate { id, status });
+        if let Some(presenter) = ctx.progress {
+            presenter.present(Presentation::ProgressUpdate {
+                id,
+                status: status.clone(),
+            });
+        }
+        if let Some(tx) = ctx.stream_tx {
+            let _ = tx.send(Reply::Progress { id, status });
+        }
+    };
+    let stage_widget = |call: &Value,
+                        ui_calls: &mut HashMap<String, (String, bool)>,
+                        pending_widgets: &mut HashMap<String, WidgetSpec>,
+                        widget_seq: &mut usize| {
+        if let Some(ui) = acp::extract_mcp_ui_call(call) {
+            let is_lazy = call.get("name").and_then(Value::as_str) == Some("call_mcp_tool");
+            if let Some(ref tc_id) = ui.tool_call_id {
+                ui_calls.insert(tc_id.clone(), (ui.tool_name.clone(), is_lazy));
+            }
+            if let Some(ref args) = ui.arguments {
+                *widget_seq += 1;
+                if let Ok(spec) = parse_mcp_ui_widget(&ui.tool_name, args, *widget_seq)
+                    && let Some(tc_id) = ui.tool_call_id
+                {
+                    pending_widgets.insert(tc_id, spec);
+                }
+            }
+        } else if let Some(tc_id) = acp::tool_call_id(call)
+            && let Some((tool_name, is_lazy)) = ui_calls.get(tc_id).cloned()
+            && let Some(args) = acp::extract_mcp_ui_arguments(call, is_lazy)
+        {
+            *widget_seq += 1;
+            if let Ok(spec) = parse_mcp_ui_widget(&tool_name, &args, *widget_seq) {
+                pending_widgets.insert(tc_id.to_string(), spec);
+            }
+        }
+    };
+    let commit_widget = |tc_id: &str,
+                         pending_widgets: &mut HashMap<String, WidgetSpec>,
+                         committed_widgets: &mut HashSet<String>,
+                         widgets: &mut Vec<WidgetSpec>| {
+        if let Some(widget) = pending_widgets.remove(tc_id)
+            && committed_widgets.insert(tc_id.to_string())
+        {
+            if let Some(vp) = ctx.voice_stop {
+                vp.stop_speech(Some(id));
+            }
+            if let Some(tx) = ctx.stream_tx {
+                let _ = tx.send(Reply::Widget {
+                    id,
+                    widget: widget.clone(),
+                });
+            }
+            widgets.push(widget);
+        }
     };
 
     let ended = loop {
@@ -2879,8 +3346,22 @@ async fn turn(
                 }
                 deadline = Instant::now() + budgets.inactivity;
                 if let Some(chunk) = acp::chunk_text(&update) {
-                    first_text.get_or_insert_with(|| started.elapsed());
-                    answer.push_str(chunk);
+                    if !chunk.is_empty() {
+                        first_text.get_or_insert_with(|| started.elapsed());
+                        answer.push_str(chunk);
+                        if let Some(sp) = ctx.speech {
+                            sp.present(Presentation::SpeechChunk {
+                                id,
+                                delta: chunk.to_string(),
+                            });
+                        }
+                        if let Some(tx) = ctx.stream_tx {
+                            let _ = tx.send(Reply::Chunk {
+                                id,
+                                text: chunk.to_string(),
+                            });
+                        }
+                    }
                 } else {
                     match update.get("sessionUpdate").and_then(Value::as_str) {
                         Some("tool_call") => {
@@ -2909,9 +3390,26 @@ async fn turn(
                                     tool: tracker.last_tool_name(),
                                 });
                             }
-                            if !policy.will_deny_update(&update) && !tracker.is_exempt_call(&update)
-                            {
-                                emit_progress(&mut last_progress, acp::tool_progress(&update));
+                            if !policy.will_deny_update(&update) {
+                                stage_widget(
+                                    &update,
+                                    &mut ui_calls,
+                                    &mut pending_widgets,
+                                    &mut widget_seq,
+                                );
+                                if update.get("status").and_then(Value::as_str) == Some("completed")
+                                    && let Some(tc_id) = acp::tool_call_id(&update)
+                                {
+                                    commit_widget(
+                                        tc_id,
+                                        &mut pending_widgets,
+                                        &mut committed_widgets,
+                                        &mut widgets,
+                                    );
+                                }
+                                if !tracker.is_exempt_call(&update) {
+                                    emit_progress(&mut last_progress, acp::tool_progress(&update));
+                                }
                             }
                         }
                         Some("tool_call_update") => {
@@ -2928,6 +3426,30 @@ async fn turn(
                                     count: tracker.repeat_streak(),
                                     tool: tracker.last_tool_name(),
                                 });
+                            }
+                            stage_widget(
+                                &update,
+                                &mut ui_calls,
+                                &mut pending_widgets,
+                                &mut widget_seq,
+                            );
+                            match update.get("status").and_then(Value::as_str) {
+                                Some("completed") => {
+                                    if let Some(tc_id) = acp::tool_call_id(&update) {
+                                        commit_widget(
+                                            tc_id,
+                                            &mut pending_widgets,
+                                            &mut committed_widgets,
+                                            &mut widgets,
+                                        );
+                                    }
+                                }
+                                Some("failed" | "cancelled") => {
+                                    if let Some(tc_id) = acp::tool_call_id(&update) {
+                                        pending_widgets.remove(tc_id);
+                                    }
+                                }
+                                _ => {}
                             }
                             if !tracker.is_exempt_call(&update) {
                                 emit_progress(&mut last_progress, acp::tool_progress(&update));
@@ -2971,6 +3493,10 @@ async fn turn(
                 let outcome = match policy.evaluate_permission(&params) {
                     PermissionDecision::Deny { tag, detail } => {
                         tracing::info!("request {id}: +{:.2} s refused a {tag} call", at());
+                        if let Some(tc_id) = params.get("toolCall").and_then(acp::tool_call_id) {
+                            pending_widgets.remove(tc_id);
+                            ui_calls.remove(tc_id);
+                        }
                         denied.push(detail);
                         acp::permission_outcome(&params, &["reject_once", "reject_always"])
                     }
@@ -2978,6 +3504,9 @@ async fn turn(
                         tracing::info!("request {id}: +{:.2} s allowed a {kind} call", at());
                         if let Some(command) = acp::permission_command(&params) {
                             tracing::debug!("request {id}: allowed {command:?}");
+                        }
+                        if let Some(tc) = params.get("toolCall") {
+                            stage_widget(tc, &mut ui_calls, &mut pending_widgets, &mut widget_seq);
                         }
                         emit_progress(
                             &mut last_progress,
@@ -3120,10 +3649,13 @@ async fn turn(
     let answer = answer.trim().to_string();
     let outcome = match stop.as_str() {
         "cancelled" => cancelled(FailReason::Cancelled),
-        _ if !answer.is_empty() => Outcome::Answer {
+        _ if !answer.is_empty() || !widgets.is_empty() => Outcome::Answer {
             text: answer,
             denied,
             suppressed: false,
+            widgets,
+            conversation_id: None,
+            profile: None,
         },
         _ if !denied.is_empty() => {
             let verb = if denied.len() == 1 { "is" } else { "are" };
@@ -3217,6 +3749,10 @@ pub async fn ask_once(
                 suppress_token: None,
                 attachments: loaded,
                 source: InputSource::Cli,
+                reply_to: None,
+                distill: false,
+                schedule_id: None,
+                schedule_has_script: false,
             },
             Sink::Client(tx),
         )
@@ -3229,11 +3765,17 @@ pub async fn ask_once(
             text,
             denied,
             suppressed,
+            widgets,
+            conversation_id,
+            profile,
             ..
         } => Outcome::Answer {
             text,
             denied,
             suppressed,
+            widgets,
+            conversation_id,
+            profile,
         },
         Reply::Failed {
             reason, message, ..
@@ -3437,5 +3979,263 @@ mod tests {
             "rawInput": {"Path": "/tmp/hc-state/agent/mcp/../../etc/passwd"}
         }));
         assert_eq!(tracker.budget_count(), 3);
+
+        // 5. Internal `mcp-ui` schema reads are also exempted from budget.
+        tracker.record_update(&json!({
+            "toolCallId": "ui_s1",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": "/tmp/hc-state/agent/.gemini/antigravity-cli/mcp/mcp-ui/show_widget.json"}
+        }));
+        assert_eq!(tracker.budget_count(), 3);
+    }
+
+    struct MockSpeechPresenter {
+        enabled: std::sync::atomic::AtomicBool,
+        speaking: std::sync::atomic::AtomicBool,
+        active_id: std::sync::atomic::AtomicU64,
+        stops: Mutex<Vec<Option<u64>>>,
+        events: Mutex<Vec<Presentation>>,
+    }
+
+    impl MockSpeechPresenter {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                enabled: std::sync::atomic::AtomicBool::new(false),
+                speaking: std::sync::atomic::AtomicBool::new(false),
+                active_id: std::sync::atomic::AtomicU64::new(0),
+                stops: Mutex::new(Vec::new()),
+                events: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl Presenter for MockSpeechPresenter {
+        fn present(&self, item: Presentation) {
+            if let Presentation::SpeechStart { id } = &item
+                && self.enabled.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.speaking
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.active_id
+                    .store(*id, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.events.lock().unwrap().push(item);
+        }
+
+        fn stop_speech(&self, id: Option<u64>) -> Option<u64> {
+            self.stops.lock().unwrap().push(id);
+            let was_speaking = self
+                .speaking
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            if was_speaking {
+                let cur = self.active_id.load(std::sync::atomic::Ordering::SeqCst);
+                if id.is_none_or(|only| only == cur) {
+                    return Some(cur);
+                }
+            }
+            None
+        }
+
+        fn set_speak_enabled(&self, enabled: bool) {
+            self.enabled
+                .store(enabled, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn speak_status(&self) -> (bool, bool) {
+            (
+                self.enabled.load(std::sync::atomic::Ordering::SeqCst),
+                self.speaking.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn speak_control_persists_state_barges_in_and_cancels_post_turn_tts() {
+        let dir = std::env::temp_dir().join(format!("hc-cond-speak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut cfg = Config {
+            state_dir: dir.clone(),
+            ..Config::default()
+        };
+        cfg.agent.warm_start = false;
+        cfg.present.speak.enabled = true;
+
+        let mock_pres = MockSpeechPresenter::new();
+        let presenter: Arc<dyn Presenter> = mock_pres.clone();
+        let (handle, task) =
+            spawn_with_store(Arc::new(cfg), presenter, Arc::new(SystemContext), None);
+
+        // Initialized from config (no state file yet).
+        assert_eq!(handle.control_speak(SpeakAction::Status), (true, false));
+        assert!(handle.status().speak);
+
+        // Toggle off -> persists `off` and stops speech.
+        assert_eq!(handle.control_speak(SpeakAction::Toggle), (false, false));
+        assert!(!store::load_speak_state(&dir, true));
+        assert!(!handle.status().speak);
+
+        // Turn back on -> simulate active post-turn TTS playback for turn #7 -> cancel stops it!
+        assert_eq!(handle.control_speak(SpeakAction::On), (true, false));
+        assert!(store::load_speak_state(&dir, false));
+        mock_pres
+            .speaking
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        mock_pres
+            .active_id
+            .store(7, std::sync::atomic::Ordering::SeqCst);
+        assert!(handle.status().speaking);
+        assert_eq!(handle.cancel(None, FailReason::Cancelled), Some(7));
+        assert!(!handle.status().speaking);
+
+        handle.shutdown();
+        let _ = task.await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_to_validates_target_and_records_accurate_turn_origins() {
+        let dir = std::env::temp_dir().join(format!("hc-cond-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut cfg = Config {
+            state_dir: dir.clone(),
+            ..Config::default()
+        };
+        cfg.agent.warm_start = false;
+        cfg.profiles.insert(
+            "deep".to_string(),
+            crate::config::Profile {
+                thought_level: Some("high".to_string()),
+                ..crate::config::Profile::default()
+            },
+        );
+        let (store, last_id) = Store::open(&dir, &cfg.history).unwrap();
+        store.create_turn(NewTurn {
+            id: 1,
+            lane: Lane::Interactive,
+            status: TurnStatus::Queued,
+            profile: "deep".to_string(),
+            created_at_ms: 1000,
+            request: "root question".to_string(),
+            attachments: vec![],
+            origin: store::TurnOrigin::Typed,
+            schedule_id: None,
+        });
+        store.mark_running(
+            1,
+            Lane::Interactive,
+            "s1".to_string(),
+            Some(1),
+            "deep".to_string(),
+            1000,
+        );
+        store.finish_completed(1, "root answer".to_string(), vec![], 1100);
+        store.flush().await;
+
+        let presenter: Arc<dyn Presenter> = crate::present::Recorder::new();
+        let (handle, task) = spawn_with_store(
+            Arc::new(cfg),
+            presenter,
+            Arc::new(SystemContext),
+            Some((store.clone(), last_id.max(1))),
+        );
+
+        // Missing reply_to target is rejected immediately.
+        let err = handle
+            .ask(
+                AskParams {
+                    text: "followup".to_string(),
+                    new: false,
+                    profile: None,
+                    background: false,
+                    suppress_token: None,
+                    attachments: vec![],
+                    source: InputSource::Typed,
+                    reply_to: Some(999),
+                    distill: false,
+                    schedule_id: None,
+                    schedule_has_script: false,
+                },
+                Sink::Present,
+            )
+            .unwrap_err();
+        assert!(err.contains("999"), "{err}");
+
+        // Valid reply_to inherits `deep` profile; scheduled & distill asks record exact TurnOrigin.
+        let r_id = handle
+            .ask(
+                AskParams {
+                    text: "followup".to_string(),
+                    new: false,
+                    profile: None,
+                    background: true,
+                    suppress_token: None,
+                    attachments: vec![],
+                    source: InputSource::Typed,
+                    reply_to: Some(1),
+                    distill: false,
+                    schedule_id: None,
+                    schedule_has_script: false,
+                },
+                Sink::Present,
+            )
+            .unwrap();
+        let d_id = handle
+            .ask(
+                AskParams {
+                    text: "distill review".to_string(),
+                    new: true,
+                    profile: None,
+                    background: true,
+                    suppress_token: None,
+                    attachments: vec![],
+                    source: InputSource::Cli,
+                    reply_to: None,
+                    distill: true,
+                    schedule_id: None,
+                    schedule_has_script: false,
+                },
+                Sink::Present,
+            )
+            .unwrap();
+        let s_id = handle
+            .ask(
+                AskParams {
+                    text: "collector summary".to_string(),
+                    new: true,
+                    profile: None,
+                    background: true,
+                    suppress_token: None,
+                    attachments: vec![],
+                    source: InputSource::Cli,
+                    reply_to: None,
+                    distill: false,
+                    schedule_id: Some(42),
+                    schedule_has_script: true,
+                },
+                Sink::Present,
+            )
+            .unwrap();
+        store.flush().await;
+
+        let r_turn = store::get_turn(&dir, r_id).unwrap().unwrap();
+        assert_eq!(r_turn.profile, "deep");
+        assert_eq!(r_turn.origin, store::TurnOrigin::Typed);
+
+        let d_turn = store::get_turn(&dir, d_id).unwrap().unwrap();
+        assert_eq!(d_turn.origin, store::TurnOrigin::Distill);
+
+        let s_turn = store::get_turn(&dir, s_id).unwrap().unwrap();
+        assert_eq!(s_turn.origin, store::TurnOrigin::ScheduleScript);
+        assert_eq!(s_turn.schedule_id, Some(42));
+
+        handle.shutdown();
+        let _ = task.await;
+        store.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

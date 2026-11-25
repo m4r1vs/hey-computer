@@ -415,6 +415,66 @@ impl Context {
     }
 }
 
+/// Media volume behavior while spoken TTS audio is playing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaDuck {
+    #[default]
+    None,
+    Pause,
+    Lower,
+}
+
+/// Optional spoken-answer and earcon settings (`[present.speak]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Speak {
+    /// Default enabled state when no runtime `<state_dir>/speak_enabled`
+    /// toggle file has been written yet.
+    pub enabled: bool,
+    /// Speak only when the request arrived via voice (`source == "voice"`),
+    /// keeping typed/CLI requests text-only.
+    #[serde(default = "default_true")]
+    pub voice_only: bool,
+    /// Default TTS command fed one sentence on stdin (`{lang}` replaced by
+    /// `"en"` or `"de"`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// Optional English-specific TTS command override (fed sentence on stdin).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_en: Vec<String>,
+    /// Optional German-specific TTS command override (fed sentence on stdin).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_de: Vec<String>,
+    /// Optional subtle audio cue played when a voice turn starts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earcon_start: Vec<String>,
+    /// Optional subtle audio cue played when a voice turn finishes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earcon_done: Vec<String>,
+    /// Optional subtle audio cue played when a turn or TTS playback is cancelled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earcon_cancel: Vec<String>,
+    /// Optional media ducking (`"none"`, `"pause"`, or `"lower"`) while speaking.
+    pub media_duck: MediaDuck,
+}
+
+impl Default for Speak {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            voice_only: true,
+            command: Vec::new(),
+            command_en: Vec::new(),
+            command_de: Vec::new(),
+            earcon_start: Vec::new(),
+            earcon_done: Vec::new(),
+            earcon_cancel: Vec::new(),
+            media_duck: MediaDuck::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Present {
@@ -430,14 +490,22 @@ pub struct Present {
     /// The notification program, called with notify-send's options.
     pub notifier: Vec<String>,
     /// Opens a long answer: program and arguments, `{file}` is the Markdown
-    /// file (appended when no argument mentions it). Empty shows the file's
-    /// path in a notification instead.
+    /// file (appended when no argument mentions it) and `{id}` is the turn ID.
+    /// Empty shows the file's path in a notification instead.
     pub viewer: Vec<String>,
+    /// Optional command launched when the user clicks `Reply` on a short-answer
+    /// notification (`{id}` replaced by turn ID). When empty, opens the viewer
+    /// with the follow-up composer focused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reply_command: Vec<String>,
     /// Copies an answer to the clipboard (`hey-computer last --copy`): program
     /// and arguments, fed the raw answer on stdin.
     pub clipboard: Vec<String>,
     /// How many answer files to keep.
     pub keep_answers: usize,
+    /// Optional spoken answers and earcon hooks.
+    #[serde(default)]
+    pub speak: Speak,
 }
 
 impl Default for Agent {
@@ -490,8 +558,10 @@ impl Default for Present {
             max_lines: 4,
             notifier: vec!["notify-send".to_string()],
             viewer: Vec::new(),
+            reply_command: Vec::new(),
             clipboard: vec!["wl-copy".to_string()],
             keep_answers: 20,
+            speak: Speak::default(),
         }
     }
 }
@@ -589,6 +659,27 @@ impl Config {
         }
         if !self.present.clipboard.is_empty() && self.present.clipboard[0].is_empty() {
             bail!("present.clipboard must name a program");
+        }
+        if !self.present.reply_command.is_empty() && self.present.reply_command[0].is_empty() {
+            bail!("present.reply_command must name a program");
+        }
+        for (key, cmd) in [
+            ("present.speak.command", &self.present.speak.command),
+            ("present.speak.command_en", &self.present.speak.command_en),
+            ("present.speak.command_de", &self.present.speak.command_de),
+            (
+                "present.speak.earcon_start",
+                &self.present.speak.earcon_start,
+            ),
+            ("present.speak.earcon_done", &self.present.speak.earcon_done),
+            (
+                "present.speak.earcon_cancel",
+                &self.present.speak.earcon_cancel,
+            ),
+        ] {
+            if !cmd.is_empty() && cmd[0].is_empty() {
+                bail!("{key} must name a program");
+            }
         }
         if self.present.max_lines == 0 || self.present.max_chars == 0 {
             bail!("present.max_lines and present.max_chars must be positive");
@@ -699,6 +790,9 @@ impl Config {
                 bail!(
                     "mcp.{name}: server names must be 1..={MAX_PROFILE_NAME_LEN} ASCII letters, digits, '-' or '_'"
                 );
+            }
+            if name.eq_ignore_ascii_case("mcp-ui") {
+                bail!("mcp.{name}: \"mcp-ui\" is reserved for hey-computer's internal UI server");
             }
             let has_cmd = !server.command.is_empty();
             let has_url = !server.url.is_empty();
@@ -950,6 +1044,22 @@ impl Config {
         dirs::state_dir()
             .map(|d| d.join("hey-computer"))
             .context("no state directory: set state_dir, HEY_COMPUTER_STATE_DIR or XDG_STATE_HOME")
+    }
+
+    /// Directory where user-saved widget templates and approved distilled
+    /// `SKILL.md` skills live (`$HEY_COMPUTER_SKILLS_DIR`, or
+    /// `$XDG_CONFIG_HOME/hey-computer/skills` when `state_dir` is not overridden
+    /// to a scratch test directory).
+    pub fn user_skills_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = std::env::var_os("HEY_COMPUTER_SKILLS_DIR").filter(|d| !d.is_empty()) {
+            return Some(PathBuf::from(dir));
+        }
+        if !self.state_dir.as_os_str().is_empty() {
+            // Keep isolated/test configs with an explicit `state_dir` inside
+            // `<state_dir>/user-skills` rather than touching `~/.config`.
+            return Some(self.state_dir.join("user-skills"));
+        }
+        dirs::config_dir().map(|d| d.join("hey-computer").join("skills"))
     }
 }
 
@@ -1324,6 +1434,42 @@ mod tests {
         ] {
             let cfg: Config = toml::from_str(&format!("[mcp.t]\nurl = {bad_url:?}\n")).unwrap();
             assert!(cfg.validate().is_err(), "{bad_url} should be rejected");
+        }
+    }
+
+    #[test]
+    fn speak_reply_command_and_reserved_mcp_ui_validate() {
+        let cfg = Config::default();
+        assert!(!cfg.present.speak.enabled);
+        assert!(cfg.present.speak.voice_only);
+        assert_eq!(cfg.present.speak.media_duck, MediaDuck::None);
+        cfg.validate().unwrap();
+
+        let parsed: Config = toml::from_str(
+            r#"
+            [present]
+            reply_command = ["rofi-ask", "--reply-to", "{id}"]
+            [present.speak]
+            enabled = true
+            voice_only = true
+            command_en = ["piper-speak", "en"]
+            command_de = ["piper-speak", "de"]
+            earcon_start = ["pw-play", "/tmp/start.oga"]
+            media_duck = "pause"
+            "#,
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.present.speak.media_duck, MediaDuck::Pause);
+
+        for bad in [
+            "[mcp.mcp-ui]\ncommand = \"/bin/true\"\n",
+            "[present]\nreply_command = [\"\"]\n",
+            "[present.speak]\ncommand = [\"\"]\n",
+            "[present.speak]\nearcon_cancel = [\"\"]\n",
+        ] {
+            let cfg: Config = toml::from_str(bad).unwrap();
+            assert!(cfg.validate().is_err(), "{bad} should fail validation");
         }
     }
 }

@@ -83,6 +83,9 @@ pub enum Step {
         /// this MCP server (`command` becomes `ToolName`).
         #[serde(default)]
         server: Option<String>,
+        /// Optional JSON arguments passed inside `Arguments` for MCP permissions.
+        #[serde(default)]
+        arguments: Option<Value>,
     },
     /// A non-permission tool call (`tool_call` followed by completed `tool_call_update`).
     ToolCall {
@@ -532,13 +535,15 @@ impl Mock {
                     summary,
                     kind,
                     server,
+                    arguments,
                 } => {
                     let call = format!("call_{}", self.next_request.load(Ordering::Relaxed));
                     let (tool_name, title, mut input) = if let Some(server) = server {
+                        let args_obj = arguments.unwrap_or_else(|| json!({}));
                         (
                             "call_mcp_tool",
                             format!("MCP Tool {command}"),
-                            json!({"ServerName": server, "ToolName": command, "Arguments": {}}),
+                            json!({"ServerName": server, "ToolName": command, "Arguments": args_obj}),
                         )
                     } else if kind == "execute" {
                         (

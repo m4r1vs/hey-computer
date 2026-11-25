@@ -1056,6 +1056,10 @@ async fn run_agent_job(
             suppress_token: job.suppress_token.clone(),
             attachments: Vec::new(),
             source: InputSource::Cli,
+            reply_to: None,
+            distill: false,
+            schedule_id: Some(job.id),
+            schedule_has_script: !job.script.trim().is_empty(),
         },
         Sink::Client(tx),
     ) {
@@ -1067,13 +1071,19 @@ async fn run_agent_job(
         Ok(Reply::Answer {
             suppressed: true, ..
         }) => AgentJobResult::Suppressed,
-        Ok(Reply::Answer { text, denied, .. }) => {
+        Ok(Reply::Answer {
+            text,
+            denied,
+            widgets,
+            ..
+        }) => {
             presenter.present(Presentation::TaskComplete {
                 id,
                 request: job.name.clone(),
                 text,
                 denied,
                 profile,
+                widgets,
             });
             AgentJobResult::Ok
         }

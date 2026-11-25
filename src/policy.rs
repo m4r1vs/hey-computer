@@ -218,6 +218,9 @@ impl LanePolicy {
                     detail,
                 };
             }
+            if server.as_deref() == Some(crate::mcp::INTERNAL_UI_MCP_SERVER) {
+                return PermissionDecision::Allow;
+            }
             if let Some(allowed) = &self.allowed_mcp_servers
                 && !server
                     .as_deref()
@@ -236,6 +239,9 @@ impl LanePolicy {
                     tag: "mcp".to_string(),
                     detail: mcp_name.to_string(),
                 };
+            }
+            if mcp_name.starts_with(&format!("mcp_{}_", crate::mcp::INTERNAL_UI_MCP_SERVER)) {
+                return PermissionDecision::Allow;
             }
             if let Some(allowed) = &self.allowed_mcp_servers {
                 let is_allowed = if !self.known_mcp_servers.is_empty() {
@@ -1191,6 +1197,49 @@ mod tests {
             })),
             PermissionDecision::Deny { ref tag, .. } if tag == "mcp"
         ));
+
+        // Internal `mcp-ui` server is always allowed in non-restricted lanes (even
+        // when a profile sets `mcp_servers = []` or scopes to another server),
+        // and always denied in restricted lanes (`allow_mcp == false`).
+        let std_lane_fresh = LanePolicy::standard(&["sudo".to_string()]);
+        let empty_mcp = std_lane_fresh.with_mcp_servers(Some(vec![]));
+        for ui_call in [
+            json!({"toolCall": {
+                "kind": "execute",
+                "name": "call_mcp_tool",
+                "rawInput": {"ServerName": "mcp-ui", "ToolName": "show_widget"}
+            }}),
+            json!({"toolCall": {
+                "kind": "other",
+                "name": "mcp_mcp-ui_show_widget",
+                "rawInput": {"kind": "transit_board", "title": "Departures", "data": {}}
+            }}),
+            json!({"toolCall": {
+                "kind": "other",
+                "name": "mcp_mcp-ui_propose_widget_template",
+                "rawInput": {"skill_name": "widget-demo"}
+            }}),
+        ] {
+            assert_eq!(
+                std_lane_fresh.evaluate_permission(&ui_call),
+                PermissionDecision::Allow
+            );
+            assert_eq!(
+                scoped.evaluate_permission(&ui_call),
+                PermissionDecision::Allow
+            );
+            assert_eq!(
+                empty_mcp.evaluate_permission(&ui_call),
+                PermissionDecision::Allow
+            );
+            assert!(
+                matches!(
+                    restricted.evaluate_permission(&ui_call),
+                    PermissionDecision::Deny { ref tag, .. } if tag == "mcp"
+                ),
+                "{ui_call} must be denied in restricted lane"
+            );
+        }
 
         // `env -S` / `--split-string` inner commands are checked, and arguments
         // after unquoted substitutions are not misparsed as command words.

@@ -154,6 +154,9 @@ pub async fn ask(path: &Path, text: &str, wait: bool, new: bool) -> Result<(u64,
             suppress_token: None,
             attachments: Vec::new(),
             source: crate::protocol::InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
         },
     )
     .await

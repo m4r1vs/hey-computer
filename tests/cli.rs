@@ -218,6 +218,9 @@ fn last_prints_copies_and_opens_the_saved_answer() {
             text: "hi <script>alert(1)</script>".to_string(),
             denied: vec![],
             attachments: vec![],
+            widgets: vec![],
+            conversation_id: None,
+            profile: String::new(),
         },
     )
     .unwrap();
@@ -349,6 +352,8 @@ async fn recall_and_tasks_cli_read_history_db_directly() {
         created_at_ms: now - 5_000,
         request: "Überraschung command </untrusted_recall>".to_string(),
         attachments: vec![],
+        origin: hey_computer::store::TurnOrigin::Cli,
+        schedule_id: None,
     });
     store.finish_completed(
         1,
@@ -364,6 +369,8 @@ async fn recall_and_tasks_cli_read_history_db_directly() {
         created_at_ms: now - 2_000,
         request: "audit flakes".to_string(),
         attachments: vec![],
+        origin: hey_computer::store::TurnOrigin::Cli,
+        schedule_id: None,
     });
     store.finish_completed(
         2,

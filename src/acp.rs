@@ -738,6 +738,124 @@ pub fn mcp_tool_name(call: &Value) -> Option<String> {
     })
 }
 
+/// Extracted `mcp-ui` tool invocation (`show_widget` or `propose_widget_template`),
+/// supporting both lazy `call_mcp_tool` and eager `mcp_mcp-ui_*` forms.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpUiCall {
+    pub tool_call_id: Option<String>,
+    pub tool_name: String,
+    pub arguments: Option<Value>,
+}
+
+/// Extract `(tool_call_id, tool_name, arguments)` when `call` targets the
+/// internal `mcp-ui` server (`show_widget` or `propose_widget_template`).
+pub fn extract_mcp_ui_call(call: &Value) -> Option<McpUiCall> {
+    let tc_id = tool_call_id(call).map(String::from);
+    let name = call.get("name").and_then(Value::as_str);
+    if name == Some("call_mcp_tool") {
+        if mcp_server_name(call).as_deref() != Some(crate::mcp::INTERNAL_UI_MCP_SERVER) {
+            return None;
+        }
+        let tool_name = mcp_tool_name(call)?;
+        if !matches!(
+            tool_name.as_str(),
+            "show_widget" | "propose_widget_template"
+        ) {
+            return None;
+        }
+        let arguments = extract_mcp_ui_arguments(call, true);
+        return Some(McpUiCall {
+            tool_call_id: tc_id,
+            tool_name,
+            arguments,
+        });
+    }
+    let prefix = format!("mcp_{}_", crate::mcp::INTERNAL_UI_MCP_SERVER);
+    let tool_name = name?.strip_prefix(&prefix)?;
+    if !matches!(tool_name, "show_widget" | "propose_widget_template") {
+        return None;
+    }
+    let arguments = extract_mcp_ui_arguments(call, false);
+    Some(McpUiCall {
+        tool_call_id: tc_id,
+        tool_name: tool_name.to_string(),
+        arguments,
+    })
+}
+
+/// Extract JSON object arguments from a lazy or eager `mcp-ui` call/update.
+pub fn extract_mcp_ui_arguments(call: &Value, is_lazy: bool) -> Option<Value> {
+    for key in ["rawInput", "args"] {
+        let Some(input) = call.get(key) else {
+            continue;
+        };
+        if is_lazy {
+            if let Some(raw_args) = input.get("Arguments").or_else(|| input.get("arguments"))
+                && let Some(parsed) = normalize_json_object_arg(raw_args)
+            {
+                return Some(parsed);
+            }
+        } else {
+            if let Some(obj) = input.as_object()
+                && !obj.is_empty()
+            {
+                if (obj.contains_key("Arguments") || obj.contains_key("arguments"))
+                    && !obj.contains_key("kind")
+                    && !obj.contains_key("skill_name")
+                    && !obj.contains_key("skillName")
+                    && let Some(inner) = obj
+                        .get("Arguments")
+                        .or_else(|| obj.get("arguments"))
+                        .and_then(normalize_json_object_arg)
+                {
+                    return Some(inner);
+                }
+                return Some(Value::Object(obj.clone()));
+            }
+            if let Some(parsed) = normalize_json_object_arg(input) {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+fn normalize_json_object_arg(val: &Value) -> Option<Value> {
+    match val {
+        Value::Object(map) if !map.is_empty() => Some(Value::Object(map.clone())),
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .filter(|v| v.is_object() && !v.as_object().is_none_or(serde_json::Map::is_empty)),
+        _ => None,
+    }
+}
+
+fn mcp_ui_progress_label(tool_name: &str, args: Option<&Value>) -> String {
+    let title = args.and_then(|a| {
+        a.get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| {
+                if tool_name == "propose_widget_template" {
+                    a.get("skill_name")
+                        .or_else(|| a.get("skillName"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|name| format!("Skill Template · {name}"))
+                } else {
+                    None
+                }
+            })
+    });
+    match title {
+        Some(t) => format!("Render widget: {t}"),
+        None => "Render widget…".to_string(),
+    }
+}
+
 /// The shell command on a `toolCall` object, if it is one.
 ///
 /// Scoped to shell-execution tool calls (`kind == "execute"` or
@@ -805,6 +923,14 @@ pub fn tool_progress(tool_call: &Value) -> Option<String> {
         .and_then(|s| sanitize_status(s, PROGRESS_STATUS_CHARS));
     if summary.is_some() {
         return summary;
+    }
+
+    if let Some(ui) = extract_mcp_ui_call(tool_call) {
+        if is_update && ui.arguments.is_none() {
+            return None;
+        }
+        let label = mcp_ui_progress_label(&ui.tool_name, ui.arguments.as_ref());
+        return sanitize_status(&label, PROGRESS_STATUS_CHARS);
     }
 
     let raw_title = tool_call.get("title").and_then(Value::as_str);
@@ -1278,6 +1404,56 @@ mod tests {
         assert!(is_lazy_mcp_tool(Some("list_resources")));
         assert!(is_lazy_mcp_tool(Some("read_resource")));
         assert_eq!(mcp_server_name(&res_call).as_deref(), Some("gitlab"));
+
+        // Both lazy `call_mcp_tool` and eager `mcp_mcp-ui_*` extract cleanly and
+        // format `Render widget: <title>` progress labels.
+        let lazy_ui = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc_ui_1",
+            "name": "call_mcp_tool",
+            "kind": "execute",
+            "rawInput": {
+                "ServerName": "mcp-ui",
+                "ToolName": "show_widget",
+                "Arguments": {
+                    "kind": "transit_board",
+                    "title": "U3 Borgweg",
+                    "data": {"departures": []}
+                }
+            }
+        });
+        let extracted_lazy = extract_mcp_ui_call(&lazy_ui).unwrap();
+        assert_eq!(extracted_lazy.tool_call_id.as_deref(), Some("tc_ui_1"));
+        assert_eq!(extracted_lazy.tool_name, "show_widget");
+        assert_eq!(
+            extracted_lazy.arguments.as_ref().unwrap()["title"],
+            "U3 Borgweg"
+        );
+        assert_eq!(
+            tool_progress(&lazy_ui).as_deref(),
+            Some("Render widget: U3 Borgweg")
+        );
+
+        let eager_ui = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc_ui_2",
+            "name": "mcp_mcp-ui_propose_widget_template",
+            "kind": "other",
+            "args": {
+                "skill_name": "widget-ci-status",
+                "description": "CI card",
+                "slots": ["branch"],
+                "skill_markdown": "# CI",
+                "template_html": "<div>{{branch}}</div>"
+            }
+        });
+        let extracted_eager = extract_mcp_ui_call(&eager_ui).unwrap();
+        assert_eq!(extracted_eager.tool_call_id.as_deref(), Some("tc_ui_2"));
+        assert_eq!(extracted_eager.tool_name, "propose_widget_template");
+        assert_eq!(
+            tool_progress(&eager_ui).as_deref(),
+            Some("Render widget: Skill Template · widget-ci-status")
+        );
     }
 
     #[tokio::test]

@@ -21,12 +21,14 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::attachments::AttachmentMeta;
 use crate::config::History as HistoryConfig;
-use crate::protocol::FailReason;
+pub use crate::protocol::WidgetSpec;
+use crate::protocol::{FailReason, InputSource};
 
 pub const DB_FILE: &str = "history.db";
 pub const LAST_FILE: &str = "last.json";
+pub const SPEAK_STATE_FILE: &str = "speak_enabled";
 pub const SCHEMA_VERSION: u32 = 1;
-pub const DB_SCHEMA_VERSION: i32 = 3;
+pub const DB_SCHEMA_VERSION: i32 = 4;
 
 const PRUNE_EVERY_TURNS: u64 = 100;
 
@@ -113,6 +115,60 @@ impl fmt::Display for TurnStatus {
     }
 }
 
+/// Origin recorded on each turn so `hey-computer distill` skips automated
+/// scheduled, pre-collector, and self-distillation runs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOrigin {
+    #[default]
+    Cli,
+    Voice,
+    Typed,
+    Schedule,
+    ScheduleScript,
+    Distill,
+}
+
+impl TurnOrigin {
+    pub fn from_input_source(source: InputSource) -> Self {
+        match source {
+            InputSource::Cli => Self::Cli,
+            InputSource::Voice => Self::Voice,
+            InputSource::Typed => Self::Typed,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Voice => "voice",
+            Self::Typed => "typed",
+            Self::Schedule => "schedule",
+            Self::ScheduleScript => "schedule_script",
+            Self::Distill => "distill",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "voice" => Self::Voice,
+            "typed" => Self::Typed,
+            "schedule" => Self::Schedule,
+            "schedule_script" => Self::ScheduleScript,
+            "distill" => Self::Distill,
+            _ => Self::Cli,
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::Cli
+    }
+
+    pub fn is_distillable(self) -> bool {
+        matches!(self, Self::Cli | Self::Voice | Self::Typed)
+    }
+}
+
 /// One persisted turn or background task row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnRecord {
@@ -142,6 +198,12 @@ pub struct TurnRecord {
     pub error_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suppressed_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub widgets: Vec<WidgetSpec>,
+    #[serde(default, skip_serializing_if = "TurnOrigin::is_default")]
+    pub origin: TurnOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<u64>,
 }
 
 /// The most recent successful answer, returned by `load_last` and used for
@@ -165,6 +227,15 @@ pub struct LastAnswer {
     /// Metadata for files or images attached to the request (never raw bytes).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentMeta>,
+    /// Structured `mcp-ui` widgets captured during this turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub widgets: Vec<WidgetSpec>,
+    /// Conversation thread root ID when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<u64>,
+    /// Profile name used for this turn.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
 }
 
 impl From<TurnRecord> for LastAnswer {
@@ -178,6 +249,9 @@ impl From<TurnRecord> for LastAnswer {
             text: turn.answer,
             denied: turn.denied,
             attachments: turn.attachments,
+            widgets: turn.widgets,
+            conversation_id: turn.conversation_id,
+            profile: turn.profile,
         }
     }
 }
@@ -208,6 +282,8 @@ pub struct NewTurn {
     pub created_at_ms: i64,
     pub request: String,
     pub attachments: Vec<AttachmentMeta>,
+    pub origin: TurnOrigin,
+    pub schedule_id: Option<u64>,
 }
 
 enum StoreCmd {
@@ -228,6 +304,7 @@ enum StoreCmd {
         id: u64,
         answer: String,
         denied: Vec<String>,
+        widgets: Vec<WidgetSpec>,
         finished_at_ms: i64,
     },
     FinishSuppressed {
@@ -355,18 +432,28 @@ impl Store {
                             id,
                             answer,
                             denied,
+                            widgets,
                             finished_at_ms,
                         } => {
                             let denied_json =
                                 serde_json::to_string(&denied).unwrap_or_else(|_| "[]".to_string());
+                            let widgets_json = serde_json::to_string(&widgets)
+                                .unwrap_or_else(|_| "[]".to_string());
                             if let Err(e) = conn.execute(
                                 "UPDATE turns
                                  SET status = 'completed',
                                      answer = ?2,
                                      denied_json = ?3,
-                                     finished_at = ?4
+                                     widgets_json = ?4,
+                                     finished_at = ?5
                                  WHERE id = ?1",
-                                params![id as i64, answer, denied_json, finished_at_ms],
+                                params![
+                                    id as i64,
+                                    answer,
+                                    denied_json,
+                                    widgets_json,
+                                    finished_at_ms
+                                ],
                             ) {
                                 tracing::warn!("cannot finish turn {id}: {e}");
                             } else {
@@ -488,10 +575,22 @@ impl Store {
         denied: Vec<String>,
         finished_at_ms: i64,
     ) {
+        self.finish_completed_with_widgets(id, answer, denied, Vec::new(), finished_at_ms);
+    }
+
+    pub fn finish_completed_with_widgets(
+        &self,
+        id: u64,
+        answer: String,
+        denied: Vec<String>,
+        widgets: Vec<WidgetSpec>,
+        finished_at_ms: i64,
+    ) {
         let _ = self.tx.send(StoreCmd::FinishCompleted {
             id,
             answer,
             denied,
+            widgets,
             finished_at_ms,
         });
     }
@@ -777,6 +876,18 @@ const SCHEMA_V3: &str = r#"
 ALTER TABLE schedules ADD COLUMN managed INTEGER NOT NULL DEFAULT 0 CHECK (managed IN (0, 1));
 "#;
 
+const SCHEMA_V4: &str = r#"
+ALTER TABLE turns ADD COLUMN widgets_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE turns ADD COLUMN origin TEXT NOT NULL DEFAULT 'cli'
+    CHECK (origin IN ('cli', 'voice', 'typed', 'schedule', 'schedule_script', 'distill'));
+ALTER TABLE turns ADD COLUMN schedule_id INTEGER;
+
+CREATE INDEX idx_turns_distill ON turns(created_at DESC, id DESC)
+    WHERE status = 'completed'
+      AND schedule_id IS NULL
+      AND origin NOT IN ('schedule', 'schedule_script', 'distill');
+"#;
+
 fn migrate(conn: &mut Connection) -> Result<()> {
     let cur: i32 = conn.query_row("PRAGMA user_version;", [], |r| r.get(0))?;
     if cur == DB_SCHEMA_VERSION {
@@ -803,6 +914,11 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tx.execute_batch(SCHEMA_V3)
             .context("migrating history database schema v2 -> v3")?;
         version = 3;
+    }
+    if version == 3 {
+        tx.execute_batch(SCHEMA_V4)
+            .context("migrating history database schema v3 -> v4")?;
+        version = 4;
     }
     tx.pragma_update(None, "user_version", version)?;
     tx.commit()?;
@@ -915,8 +1031,8 @@ fn insert_turn(conn: &Connection, turn: &NewTurn) -> Result<()> {
         serde_json::to_string(&turn.attachments).unwrap_or_else(|_| "[]".to_string());
     let started = (turn.status == TurnStatus::Running).then_some(turn.created_at_ms);
     conn.execute(
-        "INSERT INTO turns (id, lane, status, profile, created_at, started_at, request, attachments_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO turns (id, lane, status, profile, created_at, started_at, request, attachments_json, origin, schedule_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             turn.id as i64,
             turn.lane.as_str(),
@@ -926,6 +1042,8 @@ fn insert_turn(conn: &Connection, turn: &NewTurn) -> Result<()> {
             started,
             turn.request,
             attachments_json,
+            turn.origin.as_str(),
+            turn.schedule_id.map(|s| s as i64),
         ],
     )?;
     Ok(())
@@ -996,6 +1114,9 @@ fn row_to_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord> {
     let fail_reason: Option<String> = row.get(13)?;
     let error_message: Option<String> = row.get(14)?;
     let suppressed_token: Option<String> = row.get(15)?;
+    let widgets_json: String = row.get(16)?;
+    let origin_str: String = row.get(17)?;
+    let schedule_id: Option<i64> = row.get(18)?;
 
     Ok(TurnRecord {
         id: id.max(0) as u64,
@@ -1014,12 +1135,15 @@ fn row_to_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord> {
         fail_reason,
         error_message,
         suppressed_token,
+        widgets: serde_json::from_str(&widgets_json).unwrap_or_default(),
+        origin: TurnOrigin::parse(&origin_str),
+        schedule_id: schedule_id.map(|s| s.max(0) as u64),
     })
 }
 
 const TURN_COLUMNS: &str = "id, lane, status, profile, session_id, conversation_id, \
     created_at, started_at, finished_at, request, answer, denied_json, attachments_json, \
-    fail_reason, error_message, suppressed_token";
+    fail_reason, error_message, suppressed_token, widgets_json, origin, schedule_id";
 
 /// Load the newest completed answer in `lane` (`None` searches across all lanes),
 /// falling back to legacy `<state_dir>/last.json` when `history.db` does not exist.
@@ -1160,6 +1284,159 @@ pub fn get_turn(state_dir: &Path, id: u64) -> Result<Option<TurnRecord>> {
         )
         .optional()?;
     Ok(turn)
+}
+
+/// Load completed turns belonging to the same conversation as `target_id`,
+/// ordered chronologically (`id ASC`) up to and including `target_id` (or the
+/// whole thread when `include_later` is `true`). Handles pre-v4 background
+/// rows whose `conversation_id` was `NULL` by including `id = root_cid`.
+pub fn conversation_turns(
+    state_dir: &Path,
+    target_id: u64,
+    include_later: bool,
+    max_turns: usize,
+) -> Result<Vec<TurnRecord>> {
+    let Some(target) = get_turn(state_dir, target_id)? else {
+        return Ok(Vec::new());
+    };
+    let Some(conn) = open_reader_connection(state_dir)? else {
+        return Ok(Vec::new());
+    };
+    let root_cid = target.conversation_id.unwrap_or(target.id) as i64;
+    let upper = if include_later {
+        i64::MAX
+    } else {
+        target_id as i64
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {TURN_COLUMNS}
+         FROM turns
+         WHERE (conversation_id = ?1 OR id = ?1)
+           AND id <= ?2
+           AND status = 'completed'
+         ORDER BY id ASC"
+    ))?;
+    let rows = stmt.query_map(params![root_cid, upper], row_to_turn)?;
+    let mut turns = Vec::new();
+    for row in rows {
+        turns.push(row?);
+    }
+    if max_turns > 0 && turns.len() > max_turns {
+        let skip = turns.len() - max_turns;
+        turns.drain(0..skip);
+    }
+    Ok(turns)
+}
+
+/// Eligible user-originated turns for `hey-computer distill`, plus how many
+/// automated/scheduled turns were skipped in the same time window.
+#[derive(Debug, Clone, Default)]
+pub struct DistillCandidates {
+    pub turns: Vec<TurnRecord>,
+    pub skipped_scheduled_turns: usize,
+}
+
+/// Query completed user-originated turns (`schedule_id IS NULL`, non-scheduled
+/// `origin`, no `suppressed_token`) since `since_ms`, ordered chronologically
+/// (`id ASC`) after selecting up to `limit` most recent turns.
+pub fn query_distill_candidates(
+    state_dir: &Path,
+    since_ms: Option<i64>,
+    limit: usize,
+) -> Result<DistillCandidates> {
+    let Some(conn) = open_reader_connection(state_dir)? else {
+        return Ok(DistillCandidates::default());
+    };
+    let skipped: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM turns
+         WHERE (?1 IS NULL OR created_at >= ?1)
+           AND status IN ('completed', 'suppressed')
+           AND (schedule_id IS NOT NULL
+                OR origin IN ('schedule', 'schedule_script', 'distill')
+                OR suppressed_token IS NOT NULL
+                OR status = 'suppressed')",
+        params![since_ms],
+        |r| r.get(0),
+    )?;
+    let cap = limit.clamp(1, 500) as i64;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {TURN_COLUMNS} FROM turns
+         WHERE status = 'completed'
+           AND length(trim(answer)) > 0
+           AND schedule_id IS NULL
+           AND origin NOT IN ('schedule', 'schedule_script', 'distill')
+           AND suppressed_token IS NULL
+           AND (?1 IS NULL OR created_at >= ?1)
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(params![since_ms, cap], row_to_turn)?;
+    let mut turns = Vec::new();
+    for row in rows {
+        turns.push(row?);
+    }
+    turns.reverse();
+    Ok(DistillCandidates {
+        turns,
+        skipped_scheduled_turns: skipped.max(0) as usize,
+    })
+}
+
+/// Read persisted runtime speak toggle (`<state_dir>/speak_enabled`), falling
+/// back to `default_enabled` when absent.
+pub fn load_speak_state(state_dir: &Path, default_enabled: bool) -> bool {
+    let path = state_dir.join(SPEAK_STATE_FILE);
+    match std::fs::read_to_string(path) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => true,
+            "0" | "false" | "off" | "no" => false,
+            _ => default_enabled,
+        },
+        Err(_) => default_enabled,
+    }
+}
+
+/// Persist runtime speak toggle (`<state_dir>/speak_enabled`, mode `0600`).
+pub fn save_speak_state(state_dir: &Path, enabled: bool) -> Result<()> {
+    ensure_private_dir(state_dir)?;
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = state_dir.join(format!("{SPEAK_STATE_FILE}.{}.{n}.tmp", std::process::id()));
+    let payload = if enabled { b"on\n" as &[u8] } else { b"off\n" };
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(payload)?;
+        f.flush()?;
+    }
+    let target = state_dir.join(SPEAK_STATE_FILE);
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("replacing {}", target.display()));
+    }
+    Ok(())
+}
+
+/// Today's local calendar date formatted as `YYYY-MM-DD` via `localtime_r`.
+pub fn local_today_ymd() -> String {
+    let secs = unix_timestamp_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        tzset();
+        !libc::localtime_r(&secs, &mut tm).is_null()
+    };
+    if !ok {
+        return "1970-01-01".to_string();
+    }
+    format!(
+        "{:04}-{:02}-{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2414,6 +2691,9 @@ mod tests {
             text: "Result: <script>alert(1)</script>".to_string(),
             denied: vec!["sudo id".to_string()],
             attachments: vec![],
+            widgets: vec![],
+            conversation_id: None,
+            profile: String::new(),
         };
         save_last(&dir, &record).unwrap();
 
@@ -2467,6 +2747,8 @@ mod tests {
             created_at_ms: now - 10_000,
             request: "München nixos-rebuild command".to_string(),
             attachments: vec![],
+            origin: TurnOrigin::Cli,
+            schedule_id: None,
         });
         store.finish_completed(
             1,
@@ -2484,6 +2766,8 @@ mod tests {
             created_at_ms: now - 5_000,
             request: "research flake".to_string(),
             attachments: vec![],
+            origin: TurnOrigin::Cli,
+            schedule_id: None,
         });
         store.mark_running(
             2,
@@ -2503,6 +2787,8 @@ mod tests {
             created_at_ms: now - 2_000,
             request: "heartbeat".to_string(),
             attachments: vec![],
+            origin: TurnOrigin::Cli,
+            schedule_id: None,
         });
         store.finish_suppressed(3, "HEARTBEAT_OK".to_string(), now - 1_500);
 
@@ -2514,6 +2800,8 @@ mod tests {
             created_at_ms: now - 1_000,
             request: "still running when killed".to_string(),
             attachments: vec![],
+            origin: TurnOrigin::Cli,
+            schedule_id: None,
         });
 
         store.flush().await;
@@ -2807,6 +3095,8 @@ mod tests {
                 created_at_ms: now + (id as i64) * 10,
                 request: format!("important question {id}"),
                 attachments: vec![],
+                origin: TurnOrigin::Cli,
+                schedule_id: None,
             });
             store.finish_completed(id, format!("important answer {id}"), vec![], now + 100);
         }
@@ -2818,6 +3108,8 @@ mod tests {
             created_at_ms: now + 500,
             request: "noisy heartbeat".to_string(),
             attachments: vec![],
+            origin: TurnOrigin::Cli,
+            schedule_id: None,
         });
         store.finish_suppressed(3, "HEARTBEAT_OK".to_string(), now + 600);
         store.shutdown().await;
@@ -2835,6 +3127,133 @@ mod tests {
         assert!(get_turn(&dir, 2).unwrap().is_some());
         assert!(get_turn(&dir, 3).unwrap().is_none());
         store2.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn schema_v4_widgets_conversation_threads_and_distill_filtering() {
+        let dir = scratch("v3-to-v4");
+        // Seed a schema v3 database directly to verify v3 -> v4 migration.
+        {
+            let conn = open_writer_connection(&dir).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+        }
+
+        let (store, _) = Store::open(&dir, &HistoryConfig::default()).unwrap();
+        let now = unix_timestamp_ms();
+
+        // Turn 1 (voice) + Turn 2 (typed follow-up with widget) in conversation 1.
+        store.create_turn(NewTurn {
+            id: 1,
+            lane: Lane::Interactive,
+            status: TurnStatus::Running,
+            profile: "fast".to_string(),
+            created_at_ms: now - 5_000,
+            request: "Wie wird das Wetter heute?".to_string(),
+            attachments: vec![],
+            origin: TurnOrigin::Voice,
+            schedule_id: None,
+        });
+        store.mark_running(
+            1,
+            Lane::Interactive,
+            "sess-1".to_string(),
+            Some(1),
+            "fast".to_string(),
+            now - 5_000,
+        );
+        store.finish_completed(1, "Sonnig bei 18 Grad.".to_string(), vec![], now - 4_500);
+
+        let widget = WidgetSpec {
+            id: "w-cal".to_string(),
+            kind: "calendar_agenda".to_string(),
+            title: "Today".to_string(),
+            data: serde_json::json!({"events": []}),
+        };
+        store.create_turn(NewTurn {
+            id: 2,
+            lane: Lane::Interactive,
+            status: TurnStatus::Running,
+            profile: "deep".to_string(),
+            created_at_ms: now - 4_000,
+            request: "Show my calendar".to_string(),
+            attachments: vec![],
+            origin: TurnOrigin::Typed,
+            schedule_id: None,
+        });
+        store.mark_running(
+            2,
+            Lane::Interactive,
+            "sess-1".to_string(),
+            Some(1),
+            "deep".to_string(),
+            now - 4_000,
+        );
+        store.finish_completed_with_widgets(
+            2,
+            "Here is your agenda.".to_string(),
+            vec![],
+            vec![widget.clone()],
+            now - 3_500,
+        );
+
+        // Turn 3: scheduled collector turn (must be skipped by distill!).
+        store.create_turn(NewTurn {
+            id: 3,
+            lane: Lane::Background,
+            status: TurnStatus::Running,
+            profile: "deep".to_string(),
+            created_at_ms: now - 3_000,
+            request: "<untrusted_collector_output>evil</untrusted_collector_output>".to_string(),
+            attachments: vec![],
+            origin: TurnOrigin::ScheduleScript,
+            schedule_id: Some(9),
+        });
+        store.finish_completed(3, "PR failed.".to_string(), vec![], now - 2_500);
+
+        // Turn 4: previous distill turn (must also be skipped by distill!).
+        store.create_turn(NewTurn {
+            id: 4,
+            lane: Lane::Interactive,
+            status: TurnStatus::Running,
+            profile: "deep".to_string(),
+            created_at_ms: now - 2_000,
+            request: "distill review".to_string(),
+            attachments: vec![],
+            origin: TurnOrigin::Distill,
+            schedule_id: None,
+        });
+        store.finish_completed(4, "Proposed 1 hunk.".to_string(), vec![], now - 1_500);
+
+        store.flush().await;
+
+        let thread = conversation_turns(&dir, 2, false, 10).unwrap();
+        assert_eq!(thread.len(), 2);
+        assert_eq!(thread[0].id, 1);
+        assert_eq!(thread[0].origin, TurnOrigin::Voice);
+        assert_eq!(thread[1].id, 2);
+        assert_eq!(thread[1].widgets, vec![widget]);
+
+        let cands = query_distill_candidates(&dir, Some(now - 10_000), 50).unwrap();
+        assert_eq!(cands.skipped_scheduled_turns, 2);
+        assert_eq!(
+            cands.turns.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        assert!(!load_speak_state(&dir, false));
+        save_speak_state(&dir, true).unwrap();
+        assert!(load_speak_state(&dir, false));
+        save_speak_state(&dir, false).unwrap();
+        assert!(!load_speak_state(&dir, true));
+
+        let today = local_today_ymd();
+        assert_eq!(today.len(), 10);
+
+        store.shutdown().await;
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

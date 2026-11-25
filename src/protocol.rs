@@ -10,10 +10,14 @@
 //!   connection before that cancels the request, and so does shutting down
 //!   only the writing side (as `socat` and `nc -N` do at the end of input):
 //!   a waiting client keeps its side open until the answer arrives.
+//! - `{"type":"ask","text":"…","wait":true,"stream":true,"reply_to":7}` →
+//!   `accepted`, zero or more `progress` / `chunk` / `widget` / `reset` lines,
+//!   and a terminal `answer` or `failed` line.
 //! - `"new": true` on an ask starts a fresh conversation.
 //! - `{"type":"cancel"}` (or `{"type":"cancel","id":7}`) →
 //!   `{"type":"cancelled","id":1}` (`null` when nothing matched).
 //! - `{"type":"status"}` → `{"type":"status",…}`.
+//! - `{"type":"speak","action":"toggle"}` → `{"type":"speak_status",…}`.
 //! - `{"type":"schedule_reload"}` → `{"type":"ok","message":"…"}` (wakes the
 //!   daemon scheduler after a CLI schedule edit).
 //! - `{"type":"schedule_run","target":"…"}` → `{"type":"ok","message":"…"}`
@@ -43,8 +47,19 @@ pub struct Attachment {
     pub path: PathBuf,
 }
 
-/// Where an `ask` request originated; used by automatic routing so voice inputs
-/// never pay for LLM triage overhead.
+/// Structured widget card or custom interactive HTML/SVG surface captured from
+/// `hey-computer mcp-ui` (`show_widget` / `propose_widget_template`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WidgetSpec {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub data: serde_json::Value,
+}
+
+/// Where an `ask` request originated; used by automatic routing and voice-only
+/// spoken TTS responses.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputSource {
@@ -58,6 +73,16 @@ impl InputSource {
     fn is_default(&self) -> bool {
         *self == Self::Cli
     }
+}
+
+/// Control action for runtime spoken-answer (`present.speak`) state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakAction {
+    On,
+    Off,
+    Toggle,
+    Status,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -91,14 +116,31 @@ pub enum Request {
         /// Origin of the request (`cli`, `voice`, or `typed`).
         #[serde(default, skip_serializing_if = "InputSource::is_default")]
         source: InputSource,
+        /// Continue the conversation of an earlier turn ID (reusing the live
+        /// ACP session when still open, or seeding a fresh session from
+        /// `history.db` when closed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<u64>,
+        /// Stream incremental `progress`, `chunk`, `widget`, and `reset` lines
+        /// before the final `answer` / `failed` line (implies `wait = true`).
+        #[serde(default, skip_serializing_if = "is_false")]
+        stream: bool,
+        /// Tag the turn with `origin = "distill"` so `hey-computer distill`
+        /// never re-distills its own review runs.
+        #[serde(default, skip_serializing_if = "is_false")]
+        distill: bool,
     },
     Cancel {
-        /// When omitted, cancels the active interactive request; when set,
-        /// cancels the matching request/task id (including background tasks).
+        /// When omitted, cancels the active interactive request (or ongoing TTS
+        /// speech); when set, cancels the matching request/task id.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<u64>,
     },
     Status,
+    /// Query or toggle spoken answers (`present.speak`) in the running daemon.
+    Speak {
+        action: SpeakAction,
+    },
     /// Wake the daemon's scheduler after a CLI mutation to `schedules`.
     ScheduleReload,
     /// Trigger an immediate test run of a scheduled job by numeric id or name.
@@ -114,6 +156,25 @@ pub enum Reply {
     Accepted {
         id: u64,
     },
+    /// Streamed text delta (`stream: true` connections only).
+    Chunk {
+        id: u64,
+        text: String,
+    },
+    /// Streamed tool/progress summary (`stream: true` connections only).
+    Progress {
+        id: u64,
+        status: String,
+    },
+    /// Streamed widget payload captured from `mcp-ui` (`stream: true` only).
+    Widget {
+        id: u64,
+        widget: WidgetSpec,
+    },
+    /// Discard previously streamed chunks/widgets for `id` (e.g. Tier 2 retry).
+    Reset {
+        id: u64,
+    },
     Answer {
         id: u64,
         text: String,
@@ -123,17 +184,31 @@ pub enum Reply {
         /// True when the answer matched `suppress_token`.
         #[serde(default, skip_serializing_if = "is_false")]
         suppressed: bool,
+        /// Structured widgets captured from `mcp-ui` during this turn.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        widgets: Vec<WidgetSpec>,
+        /// Root conversation ID for follow-up linkage.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<u64>,
+        /// Effective profile name (when non-default).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
     },
     Failed {
         id: u64,
         reason: FailReason,
         message: String,
     },
-    /// The request that was cancelled, if one was running or waiting.
+    /// The request that was cancelled, if one was running, waiting, or speaking.
     Cancelled {
         id: Option<u64>,
     },
     Status(Status),
+    SpeakStatus {
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        speaking: bool,
+    },
     /// Generic acknowledgement for control requests (`schedule_reload`, `schedule_run`).
     Ok {
         message: String,
@@ -203,6 +278,12 @@ pub struct Status {
     /// Background tasks waiting in the FIFO queue.
     #[serde(default)]
     pub background_queued: usize,
+    /// Whether spoken voice answers (`present.speak`) are currently enabled.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub speak: bool,
+    /// Whether TTS audio is actively playing right now.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub speaking: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +327,11 @@ impl std::fmt::Display for Status {
         if self.background_queued > 0 {
             write!(f, ", {} queued", self.background_queued)?;
         }
+        if self.speaking {
+            f.write_str(", speaking")?;
+        } else if self.speak {
+            f.write_str(", speak on")?;
+        }
         write!(f, ", {} handled", self.handled)
     }
 }
@@ -279,6 +365,9 @@ mod tests {
                 suppress_token: None,
                 attachments: vec![],
                 source: InputSource::Cli,
+                reply_to: None,
+                stream: false,
+                distill: false,
             }
         );
         let cancel: Request = serde_json::from_str(r#"{"type":"cancel"}"#).unwrap();
@@ -303,10 +392,16 @@ mod tests {
                     path: PathBuf::from("/tmp/shot.png"),
                 }],
                 source: InputSource::Voice,
+                reply_to: Some(42),
+                stream: true,
+                distill: false,
             },
             Request::Cancel { id: None },
             Request::Cancel { id: Some(9) },
             Request::Status,
+            Request::Speak {
+                action: SpeakAction::Toggle,
+            },
             Request::ScheduleReload,
             Request::ScheduleRun {
                 target: "ci-watch".to_string(),
@@ -322,17 +417,41 @@ mod tests {
     fn replies_round_trip() {
         for reply in [
             Reply::Accepted { id: 3 },
+            Reply::Chunk {
+                id: 3,
+                text: "delta".to_string(),
+            },
+            Reply::Progress {
+                id: 3,
+                status: "Reading file".to_string(),
+            },
+            Reply::Widget {
+                id: 3,
+                widget: WidgetSpec {
+                    id: "w1".to_string(),
+                    kind: "custom_html".to_string(),
+                    title: "Demo".to_string(),
+                    data: serde_json::json!({"html": "<p>hi</p>"}),
+                },
+            },
+            Reply::Reset { id: 3 },
             Reply::Answer {
                 id: 3,
                 text: "line one\nline two".to_string(),
                 denied: vec![],
                 suppressed: false,
+                widgets: vec![],
+                conversation_id: Some(3),
+                profile: None,
             },
             Reply::Answer {
                 id: 4,
                 text: String::new(),
                 denied: vec!["sudo true".to_string()],
                 suppressed: true,
+                widgets: vec![],
+                conversation_id: None,
+                profile: Some("deep".to_string()),
             },
             Reply::Failed {
                 id: 5,
@@ -354,7 +473,13 @@ mod tests {
                 handled: 1,
                 background_running: 1,
                 background_queued: 2,
+                speak: true,
+                speaking: false,
             }),
+            Reply::SpeakStatus {
+                enabled: true,
+                speaking: true,
+            },
             Reply::Error {
                 message: "bad".to_string(),
             },
