@@ -464,6 +464,13 @@
     const quickInput = el("input", "journal-input");
     quickInput.type = "text";
     quickInput.placeholder = "+ Quick Add to Journal…";
+    quickInput.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        quickInput.blur();
+      }
+    });
     const quickBtn = el("button", "w-btn w-btn-primary", "Add");
     quickBtn.type = "submit";
 

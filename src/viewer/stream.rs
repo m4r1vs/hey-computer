@@ -1,8 +1,12 @@
-//! Background streaming client over `$XDG_RUNTIME_DIR/hey-computer.sock`.
+//! Background streaming, TTS, and schedule control IPC clients over
+//! `$XDG_RUNTIME_DIR/hey-computer.sock`.
 
-use std::path::PathBuf;
-use std::time::Instant;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use anyhow::{Result, bail};
+use hey_computer::config::Speak as SpeakConfig;
 use hey_computer::ipc;
 use hey_computer::protocol::{InputSource, Reply, Request, WidgetSpec};
 use hey_computer::render::render_markdown;
@@ -45,6 +49,13 @@ pub enum StreamUiEvent {
         id: Option<u64>,
         message: String,
     },
+}
+
+#[derive(Debug)]
+pub enum TtsUiEvent {
+    Started,
+    Finished,
+    Error(String),
 }
 
 /// Normalize a UI profile string into `Option<String>` for `Request::Ask`.
@@ -95,6 +106,7 @@ pub fn spawn_ask_stream(
                     reply_to,
                     stream: true,
                     distill: false,
+                    schedule_id: None,
                 };
 
                 let started = Instant::now();
@@ -225,4 +237,169 @@ pub fn spawn_ask_stream(
                 }
             });
         });
+}
+
+/// Stream TTS playback over `hey-computer.sock` (`Request::ReadAloud`) with
+/// automatic offline fallback to `present::speak_text_local`.
+pub fn spawn_tts_stream(
+    socket: Option<PathBuf>,
+    speak_config: SpeakConfig,
+    text: String,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    tx: UnboundedSender<TtsUiEvent>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("hc-viewer-tts".to_string())
+        .spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                let _ = tx.send(TtsUiEvent::Error(
+                    "cannot start viewer TTS runtime".to_string(),
+                ));
+                return;
+            };
+            rt.block_on(async move {
+                if *cancel_rx.borrow() {
+                    let _ = tx.send(TtsUiEvent::Finished);
+                    return;
+                }
+
+                let mut fallback_offline = socket.is_none();
+                if let Some(ref sock_path) = socket {
+                    let req = Request::ReadAloud { text: text.clone() };
+                    match ipc::Client::send(sock_path, &req).await {
+                        Ok(mut client) => {
+                            let mut started = false;
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    res = cancel_rx.changed() => {
+                                        if res.is_err() || *cancel_rx.borrow() {
+                                            // Dropping `client` closes the socket so the daemon
+                                            // stops `piper | pw-play` and unpauses ducked media.
+                                            drop(client);
+                                            let _ = tx.send(TtsUiEvent::Finished);
+                                            return;
+                                        }
+                                    }
+                                    reply = client.next(None) => {
+                                        match reply {
+                                            Ok(Reply::SpeakStarted { .. }) => {
+                                                if !started {
+                                                    started = true;
+                                                    let _ = tx.send(TtsUiEvent::Started);
+                                                }
+                                            }
+                                            Ok(Reply::SpeakFinished { .. }) => {
+                                                let _ = tx.send(TtsUiEvent::Finished);
+                                                return;
+                                            }
+                                            Ok(Reply::Error { message }) => {
+                                                let _ = tx.send(TtsUiEvent::Error(message));
+                                                return;
+                                            }
+                                            Ok(_) => {}
+                                            Err(err) => {
+                                                if started {
+                                                    let _ = tx.send(TtsUiEvent::Finished);
+                                                } else {
+                                                    let _ = tx.send(TtsUiEvent::Error(format!("{err:#}")));
+                                                }
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if err.downcast_ref::<ipc::NotRunning>().is_some() {
+                                fallback_offline = true;
+                            } else {
+                                let _ = tx.send(TtsUiEvent::Error(format!("{err:#}")));
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                if fallback_offline {
+                    let _ = tx.send(TtsUiEvent::Started);
+                    match hey_computer::present::speak_text_local(&speak_config, text, cancel_rx)
+                        .await
+                    {
+                        Ok(_) => {
+                            let _ = tx.send(TtsUiEvent::Finished);
+                        }
+                        Err(err) => {
+                            let _ = tx.send(TtsUiEvent::Error(format!("{err:#}")));
+                        }
+                    }
+                }
+            });
+        });
+}
+
+/// Query currently running schedule IDs from the daemon (gracefully returning
+/// an empty set when the daemon is offline or slow).
+pub fn query_running_schedule_ids(socket: Option<&Path>) -> HashSet<u64> {
+    let Some(path) = socket else {
+        return HashSet::new();
+    };
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return HashSet::new();
+    };
+    rt.block_on(async move {
+        let req_fut = ipc::request(path, &Request::Status);
+        let Ok(Ok(Reply::Status(status))) =
+            tokio::time::timeout(Duration::from_millis(250), req_fut).await
+        else {
+            return HashSet::new();
+        };
+        status.running_schedules.into_iter().collect()
+    })
+}
+
+/// Send `Request::ScheduleRun` to the daemon.
+pub fn send_schedule_run(socket: Option<&Path>, target: &str) -> Result<String> {
+    let Some(path) = socket else {
+        bail!("No daemon socket path configured");
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let target = target.to_string();
+    rt.block_on(async move {
+        match ipc::request(path, &Request::ScheduleRun { target }).await? {
+            Reply::Ok { message } => Ok(message),
+            Reply::Error { message } => bail!("{message}"),
+            other => bail!("unexpected daemon reply: {other:?}"),
+        }
+    })
+}
+
+/// Best-effort `Request::ScheduleReload` to wake the daemon scheduler after
+/// pausing, resuming, or removing a schedule in `history.db`.
+pub fn send_schedule_reload_best_effort(socket: Option<&Path>) {
+    let Some(path) = socket else {
+        return;
+    };
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    rt.block_on(async move {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(400),
+            ipc::request(path, &Request::ScheduleReload),
+        )
+        .await;
+    });
 }

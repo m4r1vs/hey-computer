@@ -2,12 +2,13 @@
 //!
 //! Serves the viewer shell and assets over a custom `hc://app/…` URI scheme,
 //! injects the `window.heyComputer` / `window.sendPrompt` bridge and uncaught
-//! widget error boundary at document start, syncs `$HOME/.theme/mode`, GTK
-//! `prefer-dark-theme`, and `$HOME/.theme/palette.json` via GIO `FileMonitor`,
-//! streams live follow-up turns over `hey-computer.sock`, and executes host
-//! actions (clipboard, snippet runner, FTS5 history recall + full thread load,
-//! local-date Vault Journal appends/task-toggles, `0700`/`0600` skill saves,
-//! `distill_diff` application, and `openhue` lighting control).
+//! widget error boundary at document start, enforces GTK4 + JS 5-step `Escape`
+//! precedence and VIM navigation, provides hybrid `webkit6::FindController`
+//! smartcase in-page search, streams on-demand TTS (`ReadAloud` + offline local
+//! fallback), syncs `$HOME/.theme/mode`, GTK `prefer-dark-theme`, and
+//! `$HOME/.theme/palette.json` via GIO `FileMonitor`, renders Scheduled Actions
+//! overview/inspector views, streams live follow-up turns over
+//! `hey-computer.sock`, and executes host actions.
 
 pub mod actions;
 pub mod loader;
@@ -34,7 +35,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use webkit6::prelude::*;
 use webkit6::{
-    LoadEvent, NavigationPolicyDecision, NavigationType, PolicyDecisionType,
+    FindOptions, LoadEvent, NavigationPolicyDecision, NavigationType, PolicyDecisionType,
     Settings as WebSettings, SnapshotOptions, SnapshotRegion, URISchemeRequest,
     UserContentInjectedFrames, UserContentManager, UserScript, UserScriptInjectionTime, WebContext,
     WebView,
@@ -45,19 +46,26 @@ use self::actions::{
     run_openhue_plan, save_skill_files, save_to_vault, toggle_vault_journal_task,
 };
 use self::loader::{
-    ViewerThread, load_thread_for_turn, query_history_entries, resolve_initial_thread,
+    ViewerThread, load_schedule_detail, load_schedule_summaries, load_thread_for_turn,
+    query_history_entries, resolve_initial_thread,
 };
 use self::palette::{WallpaperPalette, detect_system_dark, load_wallpaper_palette};
-use self::stream::{StreamUiEvent, normalize_ask_profile, spawn_ask_stream};
+use self::stream::{
+    StreamUiEvent, TtsUiEvent, normalize_ask_profile, query_running_schedule_ids,
+    send_schedule_reload_best_effort, send_schedule_run, spawn_ask_stream, spawn_tts_stream,
+};
 
 const DEFAULT_APP_ID: &str = "hey-computer.answer";
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 type StreamHandler = Box<dyn FnMut(StreamUiEvent)>;
+type TtsHandler = Box<dyn FnMut(TtsUiEvent)>;
 
 thread_local! {
     static STREAM_HANDLERS: RefCell<HashMap<u64, StreamHandler>> =
+        RefCell::new(HashMap::new());
+    static TTS_HANDLERS: RefCell<HashMap<u64, TtsHandler>> =
         RefCell::new(HashMap::new());
 }
 
@@ -99,6 +107,38 @@ fn deliver_stream_event(seq: u64, event: StreamUiEvent) {
     }
 }
 
+fn register_tts_handler(handler: impl FnMut(TtsUiEvent) + 'static) -> u64 {
+    let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    TTS_HANDLERS.with(|map| {
+        map.borrow_mut().insert(seq, Box::new(handler));
+    });
+    seq
+}
+
+fn deliver_tts_event(seq: u64, event: TtsUiEvent) {
+    let is_terminal = matches!(event, TtsUiEvent::Finished | TtsUiEvent::Error(_));
+    let mut maybe_cb = TTS_HANDLERS.with(|map| {
+        if is_terminal {
+            map.borrow_mut().remove(&seq)
+        } else {
+            None
+        }
+    });
+    if let Some(ref mut cb) = maybe_cb {
+        cb(event);
+        return;
+    }
+    let mut taken = TTS_HANDLERS.with(|map| map.borrow_mut().remove(&seq));
+    if let Some(ref mut cb) = taken {
+        cb(event);
+    }
+    if !is_terminal && let Some(cb) = taken {
+        TTS_HANDLERS.with(|map| {
+            map.borrow_mut().insert(seq, cb);
+        });
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ForceTheme {
     Light,
@@ -121,7 +161,8 @@ impl ForceTheme {
     about = "Editorial GTK4 + WebKitGTK 6.0 answer viewer for hey-computer"
 )]
 pub struct Cli {
-    /// Optional Markdown file to render directly (or `answer-<ms>-<id>.md`).
+    /// Optional Markdown file to render directly (`answer-<ms>-<id>.md`), or a
+    /// numeric turn ID (`42` / `#42`) when no matching file exists.
     pub file: Option<PathBuf>,
 
     /// Path to `config.toml` (defaults to `~/.config/hey-computer/config.toml`).
@@ -140,7 +181,23 @@ pub struct Cli {
     #[arg(long, value_name = "ID")]
     pub turn_id: Option<u64>,
 
-    /// Enable editorial drop caps initially (`d` toggles interactively).
+    /// Open the Scheduled Actions overview.
+    #[arg(long)]
+    pub schedules: bool,
+
+    /// Open the Schedule Inspector for a schedule ID or name (plus latest output).
+    #[arg(long, value_name = "TARGET")]
+    pub schedule: Option<String>,
+
+    /// Open the History & FTS5 Recall drawer on startup.
+    #[arg(long)]
+    pub history: bool,
+
+    /// Open the History & FTS5 Recall drawer pre-filtered with this query.
+    #[arg(long, value_name = "QUERY")]
+    pub recall: Option<String>,
+
+    /// Enable editorial drop caps initially (`D` toggles interactively).
     #[arg(long)]
     pub drop_cap: bool,
 
@@ -151,6 +208,10 @@ pub struct Cli {
     /// Hidden theme override used strictly for deterministic headless `--snapshot` runs.
     #[arg(long, hide = true, value_enum, value_name = "MODE")]
     pub force_theme: Option<ForceTheme>,
+
+    /// Hidden search query pre-opened on load strictly for deterministic `--snapshot` runs.
+    #[arg(long, hide = true, value_name = "QUERY")]
+    pub initial_find: Option<String>,
 
     /// Headless screenshot mode: wait for load + 350ms settle, save PNG, and exit 0.
     #[arg(long, value_name = "OUT.png")]
@@ -179,9 +240,12 @@ struct AppState {
     assets_dir: PathBuf,
     active_thread: RefCell<ViewerThread>,
     latest_turn_id: Cell<Option<u64>>,
+    active_schedule_target: RefCell<Option<String>>,
     boot_json: String,
     initial_palette: Option<WallpaperPalette>,
     theme_monitors: RefCell<Vec<gio::FileMonitor>>,
+    tts_cancel: RefCell<Option<tokio::sync::watch::Sender<bool>>>,
+    tts_gen: Cell<u64>,
 }
 
 const START_BRIDGE_JS: &str = r#"
@@ -309,6 +373,18 @@ const START_BRIDGE_JS: &str = r#"
         post({ type: "open_history_turn", turnId: turnIdOrOpts });
       }
     },
+    speakText(text) {
+      post({ type: "speak_text", text: String(text ?? "") });
+    },
+    stopTts() {
+      post({ type: "stop_tts" });
+    },
+    loadSchedules() {
+      post({ type: "load_schedules" });
+    },
+    openSchedule(target) {
+      post({ type: "open_schedule", target: String(target ?? "") });
+    },
     widgetAction(widget, actionOrPayload, payload) {
       if (widget && typeof widget === "object") {
         post({ type: "widget_action", ...widget });
@@ -383,6 +459,8 @@ struct IncomingMessage {
     id: Option<Value>,
     #[serde(default, alias = "turn_id")]
     turn_id: Option<Value>,
+    #[serde(default, alias = "latest_turn_id")]
+    latest_turn_id: Option<Value>,
     #[serde(default, alias = "reply_to")]
     reply_to: Option<Value>,
     #[serde(default)]
@@ -415,6 +493,10 @@ struct IncomingMessage {
     title: Option<String>,
     #[serde(default)]
     query: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    thread: Option<Value>,
     #[serde(default)]
     skill_name: Option<String>,
     #[serde(default)]
@@ -454,6 +536,26 @@ fn parse_optional_u64(val: Option<&Value>) -> Option<u64> {
     None
 }
 
+/// Compute Vim `smartcase` `webkit6::FindOptions`: case-insensitive + wrap
+/// around unless `query` contains any uppercase character.
+pub fn smartcase_find_options(query: &str) -> FindOptions {
+    let has_upper = query.chars().any(char::is_uppercase);
+    let mut opts = FindOptions::WRAP_AROUND;
+    if !has_upper {
+        opts |= FindOptions::CASE_INSENSITIVE;
+    }
+    opts
+}
+
+fn format_window_title(subtitle: &str) -> String {
+    let trimmed = subtitle.trim();
+    if trimmed.is_empty() || trimmed == "Ask Computer" {
+        "Ask Computer".to_string()
+    } else {
+        format!("Ask Computer — {trimmed}")
+    }
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -476,13 +578,49 @@ pub fn run() -> Result<()> {
     let skills_dir = config.user_skills_dir();
     let assets_dir = resolve_assets_dir();
 
-    let (initial_thread, latest_turn_id) = resolve_initial_thread(
+    let (initial_thread, mut latest_turn_id) = resolve_initial_thread(
         state_dir.as_deref(),
         cli.turn_id,
         cli.file.as_deref(),
         cli.drop_cap,
     )?;
-    let history_entries = query_history_entries(state_dir.as_deref(), "", 30);
+    let initial_recall_query = cli.recall.as_deref().unwrap_or("");
+    let history_entries = query_history_entries(state_dir.as_deref(), initial_recall_query, 30);
+
+    let running_ids = if cli.schedules || cli.schedule.is_some() {
+        query_running_schedule_ids(socket.as_deref())
+    } else {
+        Default::default()
+    };
+    let schedules = load_schedule_summaries(state_dir.as_deref(), &running_ids);
+
+    let mut initial_view = "thread";
+    let mut schedule_detail = None;
+    let mut initial_schedule_target = None;
+    if let Some(ref target) = cli.schedule {
+        match load_schedule_detail(state_dir.as_deref(), target, &running_ids, cli.drop_cap) {
+            Ok(Some(detail)) => {
+                if let Some(lt_id) = detail.latest_turn.as_ref().and_then(|t| t.turn_id) {
+                    latest_turn_id = Some(lt_id);
+                }
+                initial_schedule_target = Some(detail.summary.name.clone());
+                schedule_detail = Some(detail);
+                initial_view = "schedule_inspector";
+            }
+            Ok(None) => {
+                eprintln!(
+                    "hey-computer-viewer: schedule `{target}` not found; opening schedules overview"
+                );
+                initial_view = "schedules_overview";
+            }
+            Err(err) => {
+                tracing::warn!("cannot load schedule `{target}`: {err:#}");
+                initial_view = "schedules_overview";
+            }
+        }
+    } else if cli.schedules {
+        initial_view = "schedules_overview";
+    }
 
     let system_dark = detect_system_dark();
     let resolved_dark = resolve_is_dark(cli.force_theme, system_dark);
@@ -497,6 +635,13 @@ pub fn run() -> Result<()> {
         "palette": initial_palette,
         "dropCap": cli.drop_cap,
         "focusComposer": cli.focus_composer,
+        "openHistory": cli.history || cli.recall.is_some(),
+        "recallQuery": initial_recall_query,
+        "initialFindQuery": cli.initial_find.as_deref().unwrap_or(""),
+        "initialView": initial_view,
+        "scheduleTarget": initial_schedule_target,
+        "schedules": schedules,
+        "scheduleDetail": schedule_detail,
         "vaultConfigured": vault.is_some(),
         "skillsDirConfigured": skills_dir.is_some(),
         "stateDirConfigured": state_dir.is_some(),
@@ -529,9 +674,12 @@ pub fn run() -> Result<()> {
         assets_dir,
         active_thread: RefCell::new(initial_thread),
         latest_turn_id: Cell::new(latest_turn_id),
+        active_schedule_target: RefCell::new(initial_schedule_target),
         boot_json,
         initial_palette,
         theme_monitors: RefCell::new(Vec::new()),
+        tts_cancel: RefCell::new(None),
+        tts_gen: Cell::new(0),
     });
 
     let app = gtk4::Application::builder()
@@ -595,13 +743,13 @@ fn build_ui(app: &gtk4::Application, state: &Rc<AppState>) {
     let initial_dark = resolve_is_dark(state.cli.force_theme, detect_system_dark());
     apply_webview_bg(&webview, state.cli.force_theme, initial_dark);
 
-    let window_title = {
+    let window_title = if let Some(ref target) = *state.active_schedule_target.borrow() {
+        format_window_title(target)
+    } else if state.cli.schedules {
+        format_window_title("Scheduled Actions")
+    } else {
         let t = state.active_thread.borrow();
-        if t.title.is_empty() || t.title == "Ask Computer" {
-            "Ask Computer".to_string()
-        } else {
-            format!("Ask Computer — {}", t.title)
-        }
+        format_window_title(&t.title)
     };
 
     let window = gtk4::ApplicationWindow::builder()
@@ -611,6 +759,89 @@ fn build_ui(app: &gtk4::Application, state: &Rc<AppState>) {
         .default_height(state.cli.height)
         .child(&webview)
         .build();
+
+    // Stop any active TTS stream cleanly if the window is closed via WM or shortcut.
+    let state_for_close = Rc::clone(state);
+    let wv_for_close = webview.clone();
+    window.connect_close_request(move |_| {
+        stop_active_tts(&state_for_close, &wv_for_close);
+        glib::Propagation::Proceed
+    });
+
+    // GTK4 defense-in-depth keyboard controllers:
+    // 1. Capture: handles `Escape` before `page_ready` and `Ctrl+q`/`Ctrl+w` always.
+    // 2. Bubble: fallback on unhandled `Escape` so the window always closes cleanly.
+    let page_ready = Rc::new(Cell::new(false));
+    {
+        let capture = gtk4::EventControllerKey::new();
+        capture.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let win_cap = window.clone();
+        let ready_cap = Rc::clone(&page_ready);
+        capture.connect_key_pressed(move |_ctrl, key, _keycode, mods| {
+            let ctrl_only = mods.contains(gdk::ModifierType::CONTROL_MASK)
+                && !mods.contains(gdk::ModifierType::ALT_MASK)
+                && !mods.contains(gdk::ModifierType::SUPER_MASK);
+            if ctrl_only && matches!(key, gdk::Key::q | gdk::Key::Q | gdk::Key::w | gdk::Key::W) {
+                win_cap.close();
+                return glib::Propagation::Stop;
+            }
+            if key == gdk::Key::Escape && !ready_cap.get() {
+                win_cap.close();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        window.add_controller(capture);
+
+        let bubble = gtk4::EventControllerKey::new();
+        bubble.set_propagation_phase(gtk4::PropagationPhase::Bubble);
+        let win_bub = window.clone();
+        bubble.connect_key_pressed(move |_ctrl, key, _keycode, _mods| {
+            if key == gdk::Key::Escape {
+                win_bub.close();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        window.add_controller(bubble);
+    }
+
+    // Wire WebKitGTK FindController signals (`/` hybrid search pill).
+    if let Some(find_ctrl) = webview.find_controller() {
+        let wv_found = webview.clone();
+        find_ctrl.connect_found_text(move |_fc, match_count| {
+            dispatch_to_js(
+                &wv_found,
+                &json!({
+                    "type": "find_status",
+                    "found": true,
+                    "count": match_count,
+                }),
+            );
+        });
+        let wv_counted = webview.clone();
+        find_ctrl.connect_counted_matches(move |_fc, match_count| {
+            dispatch_to_js(
+                &wv_counted,
+                &json!({
+                    "type": "find_status",
+                    "found": match_count > 0,
+                    "count": match_count,
+                }),
+            );
+        });
+        let wv_failed = webview.clone();
+        find_ctrl.connect_failed_to_find_text(move |_fc| {
+            dispatch_to_js(
+                &wv_failed,
+                &json!({
+                    "type": "find_status",
+                    "found": false,
+                    "count": 0,
+                }),
+            );
+        });
+    }
 
     // Disarm external navigations: keep `hc://app/…` inside WebView, open clicked links externally.
     let is_headless = state.cli.snapshot.is_some();
@@ -667,14 +898,18 @@ fn build_ui(app: &gtk4::Application, state: &Rc<AppState>) {
 
     setup_live_theme_watcher(&webview, state);
 
-    if state.cli.focus_composer {
-        webview.connect_load_changed(|wv, event| {
-            if event == LoadEvent::Finished {
-                wv.grab_focus();
+    // Always grab focus on LoadEvent::Finished and mark page_ready for Escape precedence.
+    let focus_composer = state.cli.focus_composer;
+    let ready_for_load = Rc::clone(&page_ready);
+    webview.connect_load_changed(move |wv, event| {
+        if event == LoadEvent::Finished {
+            ready_for_load.set(true);
+            wv.grab_focus();
+            if focus_composer {
                 dispatch_to_js(wv, &json!({ "type": "focus_composer" }));
             }
-        });
-    }
+        }
+    });
 
     if let Some(snapshot_out) = state.cli.snapshot.clone() {
         let app_clone = app.clone();
@@ -696,6 +931,162 @@ fn build_ui(app: &gtk4::Application, state: &Rc<AppState>) {
 
     webview.load_uri("hc://app/index.html");
     window.present();
+}
+
+fn stop_active_tts(state: &AppState, webview: &WebView) {
+    let next_gen = state.tts_gen.get().wrapping_add(1);
+    state.tts_gen.set(next_gen);
+    if let Some(tx) = state.tts_cancel.borrow_mut().take() {
+        let _ = tx.send(true);
+    }
+    dispatch_to_js(webview, &json!({ "type": "tts_state", "speaking": false }));
+}
+
+fn start_tts(state: &Rc<AppState>, webview: &WebView, text: String) {
+    stop_active_tts(state, webview);
+    if text.trim().is_empty() {
+        return;
+    }
+
+    let generation = state.tts_gen.get().wrapping_add(1);
+    state.tts_gen.set(generation);
+
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    *state.tts_cancel.borrow_mut() = Some(cancel_tx);
+
+    dispatch_to_js(webview, &json!({ "type": "tts_state", "speaking": true }));
+
+    let wv = webview.clone();
+    let state_clone = Rc::clone(state);
+    let seq = register_tts_handler(move |ev| {
+        if state_clone.tts_gen.get() != generation {
+            return;
+        }
+        match ev {
+            TtsUiEvent::Started => {
+                dispatch_to_js(&wv, &json!({ "type": "tts_state", "speaking": true }));
+            }
+            TtsUiEvent::Finished => {
+                let _ = state_clone.tts_cancel.borrow_mut().take();
+                dispatch_to_js(&wv, &json!({ "type": "tts_state", "speaking": false }));
+            }
+            TtsUiEvent::Error(err_msg) => {
+                let _ = state_clone.tts_cancel.borrow_mut().take();
+                dispatch_to_js(&wv, &json!({ "type": "tts_state", "speaking": false }));
+                dispatch_to_js(
+                    &wv,
+                    &json!({
+                        "type": "toast",
+                        "kind": "warn",
+                        "message": err_msg,
+                    }),
+                );
+            }
+        }
+    });
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TtsUiEvent>();
+    spawn_tts_stream(
+        state.socket.clone(),
+        state.config.present.speak.clone(),
+        text,
+        cancel_rx,
+        tx,
+    );
+
+    let _ = std::thread::Builder::new()
+        .name("hc-viewer-tts-bridge".to_string())
+        .spawn(move || {
+            while let Some(ev) = rx.blocking_recv() {
+                glib::idle_add_once(move || {
+                    deliver_tts_event(seq, ev);
+                });
+            }
+        });
+}
+
+fn dispatch_schedules_refresh(state: &Rc<AppState>, webview: &WebView) {
+    let state_dir = state.state_dir.clone();
+    let socket = state.socket.clone();
+    let wv = webview.clone();
+    glib::spawn_future_local(async move {
+        let schedules = gio::spawn_blocking(move || {
+            let running = query_running_schedule_ids(socket.as_deref());
+            load_schedule_summaries(state_dir.as_deref(), &running)
+        })
+        .await
+        .unwrap_or_default();
+        dispatch_to_js(
+            &wv,
+            &json!({
+                "type": "schedules_loaded",
+                "schedules": schedules,
+            }),
+        );
+    });
+}
+
+fn dispatch_open_schedule(
+    state: &Rc<AppState>,
+    webview: &WebView,
+    window: &gtk4::ApplicationWindow,
+    target: String,
+) {
+    let state_dir = state.state_dir.clone();
+    let socket = state.socket.clone();
+    let drop_cap = state.cli.drop_cap;
+    let wv = webview.clone();
+    let win = window.clone();
+    let state_clone = Rc::clone(state);
+    let target_for_err = target.clone();
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || {
+            let running = query_running_schedule_ids(socket.as_deref());
+            load_schedule_detail(state_dir.as_deref(), &target, &running, drop_cap)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(Some(detail))) => {
+                if let Some(lt_id) = detail.latest_turn.as_ref().and_then(|t| t.turn_id) {
+                    state_clone.latest_turn_id.set(Some(lt_id));
+                }
+                *state_clone.active_schedule_target.borrow_mut() =
+                    Some(detail.summary.name.clone());
+                win.set_title(Some(&format_window_title(&detail.summary.title)));
+                dispatch_to_js(
+                    &wv,
+                    &json!({
+                        "type": "schedule_loaded",
+                        "target": detail.summary.name,
+                        "detail": detail,
+                    }),
+                );
+            }
+            Ok(Ok(None)) => {
+                dispatch_to_js(
+                    &wv,
+                    &json!({
+                        "type": "toast",
+                        "kind": "warn",
+                        "message": format!("Schedule `{target_for_err}` not found"),
+                    }),
+                );
+                dispatch_schedules_refresh(&state_clone, &wv);
+            }
+            Ok(Err(err)) => {
+                dispatch_to_js(
+                    &wv,
+                    &json!({
+                        "type": "toast",
+                        "kind": "error",
+                        "message": format!("Failed loading schedule `{target_for_err}`: {err:#}"),
+                    }),
+                );
+            }
+            Err(_) => {}
+        }
+    });
 }
 
 fn handle_ipc_message(
@@ -723,6 +1114,169 @@ fn handle_ipc_message(
                     "kind": "ok"
                 }),
             );
+        }
+        "find_search" => {
+            if let Some(fc) = webview.find_controller() {
+                let query = msg.query.as_deref().unwrap_or("");
+                if query.is_empty() {
+                    fc.search_finish();
+                } else {
+                    let opts = smartcase_find_options(query).bits();
+                    fc.search(query, opts, 1000);
+                    fc.count_matches(query, opts, 1000);
+                }
+            }
+        }
+        "find_next" => {
+            if let Some(fc) = webview.find_controller() {
+                fc.search_next();
+            }
+        }
+        "find_prev" => {
+            if let Some(fc) = webview.find_controller() {
+                fc.search_previous();
+            }
+        }
+        "find_close" => {
+            if let Some(fc) = webview.find_controller() {
+                fc.search_finish();
+            }
+        }
+        "speak_text" => {
+            let text = msg.text.clone().unwrap_or_default();
+            start_tts(state, webview, text);
+        }
+        "stop_tts" => {
+            stop_active_tts(state, webview);
+        }
+        "sync_active_thread" => {
+            if let Some(ref th_val) = msg.thread
+                && let Ok(parsed) = serde_json::from_value::<ViewerThread>(th_val.clone())
+            {
+                *state.active_thread.borrow_mut() = parsed;
+            }
+            if let Some(latest) = parse_optional_u64(msg.latest_turn_id.as_ref()) {
+                state.latest_turn_id.set(Some(latest));
+            }
+            if let Some(ref title) = msg.title {
+                window.set_title(Some(&format_window_title(title)));
+            }
+        }
+        "load_schedules" => {
+            stop_active_tts(state, webview);
+            dispatch_schedules_refresh(state, webview);
+        }
+        "open_schedule" => {
+            stop_active_tts(state, webview);
+            if let Some(target) = msg.target.as_deref().filter(|s| !s.trim().is_empty()) {
+                dispatch_open_schedule(state, webview, window, target.to_string());
+            }
+        }
+        "schedule_action" => {
+            let action = msg.action.as_deref().unwrap_or("").to_string();
+            let target = msg.target.as_deref().unwrap_or("").trim().to_string();
+            if target.is_empty() {
+                return;
+            }
+            let state_dir = state.state_dir.clone();
+            let socket = state.socket.clone();
+            let wv = webview.clone();
+            let win = window.clone();
+            let state_clone = Rc::clone(state);
+            glib::spawn_future_local(async move {
+                let target_clone = target.clone();
+                let action_clone = action.clone();
+                let outcome = gio::spawn_blocking(move || -> Result<(String, bool)> {
+                    match action_clone.as_str() {
+                        "run" => {
+                            let message = send_schedule_run(socket.as_deref(), &target_clone)?;
+                            Ok((message, false))
+                        }
+                        "pause" | "resume" => {
+                            let Some(dir) = state_dir.as_deref() else {
+                                anyhow::bail!("No state directory configured");
+                            };
+                            let enable = action_clone == "resume";
+                            let next_run_at = if enable {
+                                let Some(existing) = store::get_schedule(dir, &target_clone)?
+                                else {
+                                    anyhow::bail!("Schedule `{target_clone}` not found");
+                                };
+                                let spec = hey_computer::scheduler::ScheduleSpec::parse(
+                                    &existing.schedule_spec,
+                                )?;
+                                Some(spec.first_run_after(store::unix_timestamp_ms())?)
+                            } else {
+                                None
+                            };
+                            let job = store::set_schedule_enabled(
+                                dir,
+                                &target_clone,
+                                enable,
+                                next_run_at,
+                            )?;
+                            send_schedule_reload_best_effort(socket.as_deref());
+                            Ok((
+                                format!(
+                                    "{} schedule `{}`",
+                                    if enable { "Resumed" } else { "Paused" },
+                                    job.name
+                                ),
+                                false,
+                            ))
+                        }
+                        "remove" => {
+                            let Some(dir) = state_dir.as_deref() else {
+                                anyhow::bail!("No state directory configured");
+                            };
+                            let Some(job) = store::get_schedule(dir, &target_clone)? else {
+                                anyhow::bail!("Schedule `{target_clone}` not found");
+                            };
+                            if job.managed {
+                                anyhow::bail!("Managed in config.toml — pause instead of removing");
+                            }
+                            let _ = store::delete_schedule(dir, &target_clone)?;
+                            send_schedule_reload_best_effort(socket.as_deref());
+                            Ok((format!("Removed schedule `{}`", job.name), true))
+                        }
+                        other => anyhow::bail!("Unknown schedule action `{other}`"),
+                    }
+                })
+                .await;
+
+                match outcome {
+                    Ok(Ok((message, removed))) => {
+                        dispatch_to_js(
+                            &wv,
+                            &json!({
+                                "type": "toast",
+                                "kind": "ok",
+                                "message": message,
+                            }),
+                        );
+                        dispatch_schedules_refresh(&state_clone, &wv);
+                        let inspecting = state_clone.active_schedule_target.borrow().clone();
+                        if removed && inspecting.as_deref() == Some(target.as_str()) {
+                            *state_clone.active_schedule_target.borrow_mut() = None;
+                            win.set_title(Some(&format_window_title("Scheduled Actions")));
+                        } else if !removed && inspecting.as_deref() == Some(target.as_str()) {
+                            dispatch_open_schedule(&state_clone, &wv, &win, target);
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        dispatch_to_js(
+                            &wv,
+                            &json!({
+                                "type": "toast",
+                                "kind": "warn",
+                                "message": format!("{err:#}"),
+                            }),
+                        );
+                        dispatch_schedules_refresh(&state_clone, &wv);
+                    }
+                    Err(_) => {}
+                }
+            });
         }
         "run_code" => {
             let code = msg.code.clone().unwrap_or_default();
@@ -918,6 +1472,7 @@ fn handle_ipc_message(
             );
         }
         "open_history_turn" => {
+            stop_active_tts(state, webview);
             let Some(turn_id) = parse_optional_u64(msg.turn_id.as_ref().or(msg.id.as_ref())) else {
                 return;
             };
@@ -927,7 +1482,8 @@ fn handle_ipc_message(
             match load_thread_for_turn(dir, turn_id, state.cli.drop_cap) {
                 Ok(Some((thread, latest_id))) => {
                     state.latest_turn_id.set(Some(latest_id));
-                    window.set_title(Some(&format!("Ask Computer — {}", thread.title)));
+                    *state.active_schedule_target.borrow_mut() = None;
+                    window.set_title(Some(&format_window_title(&thread.title)));
                     dispatch_to_js(
                         webview,
                         &json!({
@@ -972,6 +1528,7 @@ fn handle_ipc_message(
             tracing::warn!("isolated widget JS error: {err_msg}");
         }
         "close" => {
+            stop_active_tts(state, webview);
             window.close();
         }
         _ => {}
@@ -1375,7 +1932,12 @@ fn start_live_stream(
                     profile: prof_str,
                     lane: "interactive".to_string(),
                     origin: "typed".to_string(),
+                    status: "completed".to_string(),
+                    error_message: None,
+                    fail_reason: None,
+                    suppressed_token: None,
                     schedule_id: None,
+                    schedule_name: None,
                     created_at: created_at.clone(),
                     duration_ms: Some(duration_ms),
                     reading_time,
@@ -1731,7 +2293,7 @@ fn capture_snapshot_and_quit(webview: &WebView, out_path: &Path, app: &gtk4::App
     let wv_fallback = webview.clone();
 
     webview.snapshot(
-        SnapshotRegion::FullDocument,
+        SnapshotRegion::Visible,
         SnapshotOptions::NONE,
         gio::Cancellable::NONE,
         move |res| match res {
@@ -1742,7 +2304,7 @@ fn capture_snapshot_and_quit(webview: &WebView, out_path: &Path, app: &gtk4::App
                 let out2 = out.clone();
                 let app2 = app_clone.clone();
                 wv_fallback.snapshot(
-                    SnapshotRegion::Visible,
+                    SnapshotRegion::FullDocument,
                     SnapshotOptions::NONE,
                     gio::Cancellable::NONE,
                     move |res2| match res2 {
@@ -1798,24 +2360,29 @@ mod tests {
         save_to_vault, toggle_journal_task_line,
     };
     use super::loader::{
-        is_morning_brief_turn, parse_answer_filename_turn_id, query_history_entries,
+        is_morning_brief_turn, load_schedule_detail, load_schedule_summaries,
+        parse_answer_filename_turn_id, parse_numeric_turn_arg, query_history_entries,
         resolve_initial_thread,
     };
     use super::palette::parse_palette_json;
     use super::stream::normalize_ask_profile;
     use super::{
         Cli, ForceTheme, build_shell_html, escape_json_for_inline_script, parse_optional_u64,
-        safe_join_asset,
+        safe_join_asset, smartcase_find_options,
     };
     use clap::Parser;
     use hey_computer::config::{Config, History as HistoryConfig};
-    use hey_computer::protocol::WidgetSpec;
-    use hey_computer::store::{Lane, NewTurn, Store, TurnOrigin, TurnStatus};
+    use hey_computer::protocol::{FailReason, WidgetSpec};
+    use hey_computer::store::{
+        FailureDeliver, Lane, NewSchedule, NewTurn, Store, TurnOrigin, TurnStatus,
+    };
     use serde_json::json;
+    use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+    use webkit6::FindOptions;
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1841,6 +2408,12 @@ mod tests {
             "/tmp/state",
             "--turn-id",
             "42",
+            "--schedules",
+            "--schedule",
+            "morning-digest",
+            "--history",
+            "--recall",
+            "transit",
             "--drop-cap",
             "--focus-composer",
             "--force-theme",
@@ -1861,12 +2434,35 @@ mod tests {
             Some(Path::new("/tmp/answer-1764060000000-42.md"))
         );
         assert_eq!(cli.turn_id, Some(42));
+        assert!(cli.schedules);
+        assert_eq!(cli.schedule.as_deref(), Some("morning-digest"));
+        assert!(cli.history);
+        assert_eq!(cli.recall.as_deref(), Some("transit"));
         assert!(cli.drop_cap);
         assert!(cli.focus_composer);
         assert_eq!(cli.force_theme, Some(ForceTheme::Dark));
         assert_eq!(cli.width, 1200);
         assert_eq!(cli.height, 900);
         assert_eq!(cli.name, "hey-computer.custom");
+    }
+
+    #[test]
+    fn smartcase_find_options_respects_uppercase() {
+        let lower = smartcase_find_options("morning brief");
+        assert!(lower.contains(FindOptions::WRAP_AROUND));
+        assert!(lower.contains(FindOptions::CASE_INSENSITIVE));
+
+        let mixed = smartcase_find_options("Morning");
+        assert!(mixed.contains(FindOptions::WRAP_AROUND));
+        assert!(!mixed.contains(FindOptions::CASE_INSENSITIVE));
+    }
+
+    #[test]
+    fn numeric_turn_arg_parses_nonexistent_ids() {
+        assert_eq!(parse_numeric_turn_arg(Path::new("42")), Some(42));
+        assert_eq!(parse_numeric_turn_arg(Path::new("#42")), Some(42));
+        assert_eq!(parse_numeric_turn_arg(Path::new("0")), None);
+        assert_eq!(parse_numeric_turn_arg(Path::new("notes.md")), None);
     }
 
     #[test]
@@ -1971,7 +2567,6 @@ mod tests {
 
     #[test]
     fn prepends_and_toggles_journal_tasks_in_place() {
-        // 1. Existing task list: inserts at top of the first `- [` list instead of EOF.
         let existing_with_tasks = "# 2026-11-25\n\n## Tasks\n- [x] Done item\n- [ ] Second item\n\n## Notes\nMet at noon.\n";
         let updated = insert_journal_task_prepend(existing_with_tasks, "New top task");
         assert_eq!(
@@ -1979,7 +2574,6 @@ mod tests {
             "# 2026-11-25\n\n## Tasks\n- [ ] New top task\n- [x] Done item\n- [ ] Second item\n\n## Notes\nMet at noon.\n"
         );
 
-        // 2. Heading only (no tasks yet): inserts right after `# ...` heading.
         let heading_only = "# 2026-11-25\n\nQuiet morning notes.\n";
         let after_heading = insert_journal_task_prepend(heading_only, "- [ ] First task");
         assert_eq!(
@@ -1987,12 +2581,10 @@ mod tests {
             "# 2026-11-25\n\n- [ ] First task\n\nQuiet morning notes.\n"
         );
 
-        // 3. Plain body without heading: inserts at top of file.
         let no_heading = "Plain note paragraph.\n";
         let at_top = insert_journal_task_prepend(no_heading, "Top task");
         assert_eq!(at_top, "- [ ] Top task\n\nPlain note paragraph.\n");
 
-        // 4. Toggle task checkbox `- [ ]` <-> `- [x]` (including trailing `#tag`).
         let with_tag = "# Journal\n\n- [ ] Send summary #studio\n";
         let (checked, is_done) =
             toggle_journal_task_line(with_tag, "Send summary", None).expect("toggle on");
@@ -2004,7 +2596,6 @@ mod tests {
         assert!(!is_done2);
         assert_eq!(unchecked, "# Journal\n\n- [ ] Send summary #studio\n");
 
-        // 5. Real local-date Journal write on disk.
         let dir = temp_test_dir("vault");
         let out = save_to_vault(Some(&dir), "prepend_task", "Journal", "Review MR")
             .expect("save task to vault");
@@ -2143,7 +2734,6 @@ mod tests {
         assert_eq!(mem_mode, 0o600);
         assert!(skills_dir.join("ci-log-triage/SKILL.md").is_file());
 
-        // Reject target paths inside `instructions.vault` (both direct and via symlink).
         let vault_target = vault_dir.join("memory.md");
         let bad_vault = approve_distill_changes(
             &cfg,
@@ -2171,7 +2761,6 @@ mod tests {
         );
         assert!(symlink_escape.is_err());
 
-        // Enforce `instructions.memory_max_chars` across `memory_file` + `target_file`.
         cfg.instructions.memory_max_chars = 60;
         let over_budget = approve_distill_changes(
             &cfg,
@@ -2256,9 +2845,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loads_threads_widgets_and_recall_from_store_v4() {
+    async fn loads_threads_schedules_and_recall_from_store_v4() {
         let dir = temp_test_dir("store");
         let (store, _) = Store::open(&dir, &HistoryConfig::default()).expect("open store");
+        let sched = hey_computer::store::create_schedule(
+            &dir,
+            &NewSchedule {
+                name: "morning-digest".to_string(),
+                schedule_spec: "daily 07:30".to_string(),
+                prompt: "Write the editorial morning brief.".to_string(),
+                profile: "deep".to_string(),
+                script: "hey-computer-proactive collect-morning-digest".to_string(),
+                no_agent: false,
+                suppress_token: Some("HEARTBEAT_OK".to_string()),
+                failure_deliver: FailureDeliver::Notify,
+                max_runs: None,
+                expires_at: None,
+                next_run_at: 1_764_140_000_000,
+            },
+            32,
+        )
+        .expect("create morning-digest schedule");
+
         store.create_turn(NewTurn {
             id: 1,
             lane: Lane::Interactive,
@@ -2268,7 +2876,7 @@ mod tests {
             request: "Morning brief for Harbor Quay".to_string(),
             attachments: Vec::new(),
             origin: TurnOrigin::Schedule,
-            schedule_id: Some(2),
+            schedule_id: Some(sched.id),
         });
         store.mark_running(
             1,
@@ -2280,7 +2888,7 @@ mod tests {
         );
         store.finish_completed_with_widgets(
             1,
-            "Take the **U3** at `11:26`.".to_string(),
+            "# Morning Brief — Wednesday\n\nTake the **U3** at `11:26`.".to_string(),
             vec!["sudo reboot".to_string()],
             vec![WidgetSpec {
                 id: "w-transit".to_string(),
@@ -2290,6 +2898,38 @@ mod tests {
             }],
             1_764_060_001_600,
         );
+
+        store.create_turn(NewTurn {
+            id: 2,
+            lane: Lane::Background,
+            status: TurnStatus::Queued,
+            profile: "fast".to_string(),
+            created_at_ms: 1_764_070_000_000,
+            request: "Scheduled silent check".to_string(),
+            attachments: Vec::new(),
+            origin: TurnOrigin::Schedule,
+            schedule_id: Some(sched.id),
+        });
+        store.finish_suppressed(2, "HEARTBEAT_OK".to_string(), 1_764_070_000_500);
+
+        store.create_turn(NewTurn {
+            id: 3,
+            lane: Lane::Background,
+            status: TurnStatus::Queued,
+            profile: "deep".to_string(),
+            created_at_ms: 1_764_080_000_000,
+            request: "Scheduled failing check".to_string(),
+            attachments: Vec::new(),
+            origin: TurnOrigin::Schedule,
+            schedule_id: Some(sched.id),
+        });
+        store.finish_failed(
+            3,
+            FailReason::Timeout,
+            "Agent timed out after 120s".to_string(),
+            1_764_080_010_000,
+        );
+
         store.flush().await;
         store.shutdown().await;
 
@@ -2301,10 +2941,39 @@ mod tests {
         assert_eq!(latest, Some(1));
         assert_eq!(thread.turns.len(), 1);
         assert!(thread.turns[0].is_morning_brief);
+        assert_eq!(
+            thread.turns[0].schedule_name.as_deref(),
+            Some("morning-digest")
+        );
+        assert_eq!(thread.turns[0].status, "completed");
         assert_eq!(thread.turns[0].duration_ms, Some(1500));
         assert_eq!(thread.turns[0].denied, vec!["sudo reboot"]);
         assert_eq!(thread.turns[0].widgets.len(), 1);
         assert!(thread.turns[0].html.contains("<strong>U3</strong>"));
+
+        // Numeric turn ID fallback (`#3` -> failed turn with error metadata).
+        let (failed_thread, failed_latest) =
+            resolve_initial_thread(Some(&dir), None, Some(Path::new("#3")), false)
+                .expect("resolve numeric #3 from DB");
+        assert_eq!(failed_latest, Some(3));
+        assert_eq!(failed_thread.turns[0].status, "failed");
+        assert_eq!(
+            failed_thread.turns[0].error_message.as_deref(),
+            Some("Agent timed out after 120s")
+        );
+
+        // Schedule overview + inspector loading.
+        let summaries = load_schedule_summaries(Some(&dir), &HashSet::new());
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].title, "Morning Brief");
+        assert_eq!(summaries[0].latest_turn_id, Some(1));
+
+        let detail = load_schedule_detail(Some(&dir), "morning-digest", &HashSet::new(), false)
+            .expect("load schedule detail")
+            .expect("morning-digest detail present");
+        assert_eq!(detail.recent_runs.len(), 3);
+        assert_eq!(detail.latest_turn.as_ref().and_then(|t| t.turn_id), Some(1));
+        assert!(detail.latest_turn.as_ref().unwrap().is_morning_brief);
 
         let hits = query_history_entries(Some(&dir), "Harbor U3", 10);
         assert_eq!(hits.len(), 1);

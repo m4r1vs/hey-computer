@@ -1,17 +1,22 @@
 //! Startup conversation resolution, `answer-<ms>-<id>.md` filename parsing,
-//! Morning Brief drop-cap detection, and FTS5 recall history mapping.
+//! Morning Brief drop-cap detection, FTS5 recall history mapping, and
+//! Scheduled Actions overview/inspector loading.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use hey_computer::protocol::WidgetSpec;
 use hey_computer::render::render_markdown;
+use hey_computer::scheduler::{humanize_schedule_name, humanize_schedule_spec};
 use hey_computer::store::{
-    self, ListFilter, RecallHit, RecallOptions, RecallSort, TurnOrigin, TurnRecord, TurnStatus,
+    self, ListFilter, RecallHit, RecallOptions, RecallSort, ScheduleRecord, TurnOrigin, TurnRecord,
+    TurnStatus,
 };
 use serde::{Deserialize, Serialize};
 
 const MAX_THREAD_TURNS: usize = 50;
+const MAX_SCHEDULE_RECENT_RUNS: usize = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,19 +31,37 @@ pub struct ViewerTurn {
     pub profile: String,
     pub lane: String,
     pub origin: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_turn_status")]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_name: Option<String>,
     pub created_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     pub reading_time: String,
     pub word_count: usize,
+    #[serde(default)]
     pub denied: Vec<String>,
+    #[serde(default)]
     pub widgets: Vec<WidgetSpec>,
     pub markdown: String,
     pub html: String,
+    #[serde(default)]
     pub is_morning_brief: bool,
+    #[serde(default)]
     pub drop_cap_hint: bool,
+}
+
+fn default_turn_status() -> String {
+    "completed".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +71,9 @@ pub struct ViewerThread {
     pub title: String,
     pub badge: String,
     pub created_at: String,
+    #[serde(default)]
     pub drop_cap_hint: bool,
+    #[serde(default)]
     pub turns: Vec<ViewerTurn>,
 }
 
@@ -66,6 +91,71 @@ pub struct HistoryEntry {
     pub profile: String,
     pub lane: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewerScheduleSummary {
+    pub id: u64,
+    pub name: String,
+    pub title: String,
+    pub enabled: bool,
+    pub managed: bool,
+    pub running: bool,
+    pub status: String,
+    pub mode: String,
+    pub schedule_spec: String,
+    pub human_schedule: String,
+    pub profile: String,
+    pub run_count: u64,
+    pub consecutive_failures: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run_local: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_local: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_turn_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewerScheduleRun {
+    pub turn_id: u64,
+    pub status: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    pub headline: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppressed_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    pub widget_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewerScheduleDetail {
+    pub summary: ViewerScheduleSummary,
+    pub prompt: String,
+    pub script: String,
+    pub no_agent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppress_token: Option<String>,
+    pub failure_deliver: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_runs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_local: Option<String>,
+    pub recent_runs: Vec<ViewerScheduleRun>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_turn: Option<ViewerTurn>,
 }
 
 /// Extract `<id>` from answer filenames generated by `present.rs`
@@ -86,9 +176,24 @@ pub fn parse_answer_filename_turn_id(path: &Path) -> Option<u64> {
     (id > 0).then_some(id)
 }
 
+/// Parse a numeric turn target (`"42"` or `"#42"`) when the positional `file`
+/// argument does not exist on disk.
+pub fn parse_numeric_turn_arg(path: &Path) -> Option<u64> {
+    if path.exists() {
+        return None;
+    }
+    let raw = path.to_str()?.trim();
+    let digits = raw.strip_prefix('#').unwrap_or(raw);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let id: u64 = digits.parse().ok()?;
+    (id > 0).then_some(id)
+}
+
 /// Detect whether an opening turn is a Morning Brief (scheduled job turn or a
 /// request/title naming `"morning brief"` / `"morning-digest"`), which receives
-/// an automatic editorial drop cap regardless of the global `d` toggle.
+/// an automatic editorial drop cap regardless of the global `D` toggle.
 pub fn is_morning_brief_turn(
     origin: TurnOrigin,
     schedule_id: Option<u64>,
@@ -136,11 +241,22 @@ pub fn headline(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn schedule_name_map(state_dir: Option<&Path>) -> HashMap<u64, String> {
+    let Some(dir) = state_dir else {
+        return HashMap::new();
+    };
+    match store::list_schedules(dir, true) {
+        Ok(jobs) => jobs.into_iter().map(|j| (j.id, j.name)).collect(),
+        Err(_) => HashMap::new(),
+    }
+}
+
 pub fn turn_record_to_viewer_turn(
     turn: TurnRecord,
     is_opening: bool,
     thread_title: &str,
     drop_cap_flag: bool,
+    schedule_name: Option<String>,
 ) -> ViewerTurn {
     let word_count = turn.answer.split_whitespace().count();
     let reading_time = if word_count > 0 {
@@ -171,7 +287,12 @@ pub fn turn_record_to_viewer_turn(
         profile: turn.profile,
         lane: turn.lane.as_str().to_string(),
         origin: turn.origin.as_str().to_string(),
+        status: turn.status.as_str().to_string(),
+        error_message: turn.error_message,
+        fail_reason: turn.fail_reason,
+        suppressed_token: turn.suppressed_token,
         schedule_id: turn.schedule_id,
+        schedule_name,
         created_at,
         duration_ms,
         reading_time,
@@ -185,7 +306,11 @@ pub fn turn_record_to_viewer_turn(
     }
 }
 
-fn build_thread_from_turns(turns: Vec<TurnRecord>, drop_cap_flag: bool) -> (ViewerThread, u64) {
+fn build_thread_from_turns(
+    turns: Vec<TurnRecord>,
+    drop_cap_flag: bool,
+    sched_names: &HashMap<u64, String>,
+) -> (ViewerThread, u64) {
     let first = &turns[0];
     let last_id = turns.last().map(|t| t.id).unwrap_or(first.id);
     let root_id = first.conversation_id.unwrap_or(first.id);
@@ -201,7 +326,10 @@ fn build_thread_from_turns(turns: Vec<TurnRecord>, drop_cap_flag: bool) -> (View
     let viewer_turns: Vec<ViewerTurn> = turns
         .into_iter()
         .enumerate()
-        .map(|(idx, t)| turn_record_to_viewer_turn(t, idx == 0, &title, drop_cap_flag))
+        .map(|(idx, t)| {
+            let sname = t.schedule_id.and_then(|sid| sched_names.get(&sid).cloned());
+            turn_record_to_viewer_turn(t, idx == 0, &title, drop_cap_flag, sname)
+        })
         .collect();
 
     (
@@ -235,7 +363,12 @@ pub fn load_thread_for_turn(
     if turns.is_empty() {
         return Ok(None);
     }
-    Ok(Some(build_thread_from_turns(turns, drop_cap_flag)))
+    let sched_names = schedule_name_map(Some(state_dir));
+    Ok(Some(build_thread_from_turns(
+        turns,
+        drop_cap_flag,
+        &sched_names,
+    )))
 }
 
 fn build_thread_from_file(md_path: &Path, drop_cap_flag: bool) -> Result<ViewerThread> {
@@ -264,7 +397,12 @@ fn build_thread_from_file(md_path: &Path, drop_cap_flag: bool) -> Result<ViewerT
         profile: String::new(),
         lane: "interactive".to_string(),
         origin: "cli".to_string(),
+        status: "completed".to_string(),
+        error_message: None,
+        fail_reason: None,
+        suppressed_token: None,
         schedule_id: None,
+        schedule_name: None,
         created_at: file_name.to_string(),
         duration_ms: None,
         reading_time,
@@ -287,7 +425,7 @@ fn build_thread_from_file(md_path: &Path, drop_cap_flag: bool) -> Result<ViewerT
     })
 }
 
-fn empty_thread(drop_cap_flag: bool) -> ViewerThread {
+pub fn empty_thread(drop_cap_flag: bool) -> ViewerThread {
     ViewerThread {
         id: "empty".to_string(),
         title: "Ask Computer".to_string(),
@@ -300,7 +438,8 @@ fn empty_thread(drop_cap_flag: bool) -> ViewerThread {
 
 /// Resolve startup thread according to CLI priority:
 /// 1. `--turn-id <ID>` (`ID > 0`) -> DB conversation thread (fallback to `[FILE]` or empty).
-/// 2. `[FILE]` -> if `answer-<ms>-<id>.md`, try DB turn `<id>` first; else render Markdown file.
+/// 2. `[FILE]` -> if numeric (`"42"` / `"#42"`) and `!path.exists()`, treat as turn ID;
+///    if `answer-<ms>-<id>.md`, try DB turn `<id>` first; else render Markdown file.
 /// 3. Latest completed turn's thread in `history.db`, or clean empty `"Ask Computer"` view.
 pub fn resolve_initial_thread(
     state_dir: Option<&Path>,
@@ -308,7 +447,12 @@ pub fn resolve_initial_thread(
     file: Option<&Path>,
     drop_cap_flag: bool,
 ) -> Result<(ViewerThread, Option<u64>)> {
-    if let Some(id) = turn_id.filter(|&id| id > 0) {
+    let effective_turn_id = turn_id
+        .filter(|&id| id > 0)
+        .or_else(|| file.and_then(parse_numeric_turn_arg));
+    let file_is_numeric_id = turn_id.is_none() && file.and_then(parse_numeric_turn_arg).is_some();
+
+    if let Some(id) = effective_turn_id {
         if let Some(dir) = state_dir {
             match load_thread_for_turn(dir, id, drop_cap_flag) {
                 Ok(Some((thread, latest))) => return Ok((thread, Some(latest))),
@@ -316,7 +460,10 @@ pub fn resolve_initial_thread(
                 Err(err) => tracing::warn!("cannot load turn {id} from history.db: {err:#}"),
             }
         }
-        if let Some(md_path) = file {
+        if !file_is_numeric_id
+            && let Some(md_path) = file
+            && md_path.exists()
+        {
             return Ok((build_thread_from_file(md_path, drop_cap_flag)?, None));
         }
         return Ok((empty_thread(drop_cap_flag), None));
@@ -355,8 +502,9 @@ pub fn resolve_initial_thread(
                     {
                         return Ok((thread, Some(latest_id)));
                     }
+                    let sched_names = schedule_name_map(Some(dir));
                     let (thread, latest_id) =
-                        build_thread_from_turns(vec![latest_turn], drop_cap_flag);
+                        build_thread_from_turns(vec![latest_turn], drop_cap_flag, &sched_names);
                     return Ok((thread, Some(latest_id)));
                 }
             }
@@ -388,7 +536,7 @@ pub fn resolve_initial_thread(
                 schedule_id: None,
             };
             let latest_id = (rec.id > 0).then_some(rec.id);
-            let (thread, _) = build_thread_from_turns(vec![rec], drop_cap_flag);
+            let (thread, _) = build_thread_from_turns(vec![rec], drop_cap_flag, &HashMap::new());
             return Ok((thread, latest_id));
         }
     }
@@ -421,6 +569,7 @@ pub fn query_history_entries(
         },
         match_any: false,
         raw_fts: false,
+        user_only: false,
     };
     match store::recall(dir, &opts) {
         Ok(hits) => hits.into_iter().map(recall_hit_to_entry).collect(),
@@ -456,4 +605,167 @@ fn recall_hit_to_entry(hit: RecallHit) -> HistoryEntry {
         lane: hit.lane.as_str().to_string(),
         created_at: hit.created_local,
     }
+}
+
+/* --------------------------------------------------------------------------
+Scheduled Actions Loading (Overview + Inspector)
+-------------------------------------------------------------------------- */
+
+fn schedule_mode(job: &ScheduleRecord) -> &'static str {
+    if job.no_agent {
+        "no-agent"
+    } else if job.script.contains("distill") || job.name.contains("distill") {
+        "distill"
+    } else if !job.script.trim().is_empty() {
+        "collector + agent"
+    } else {
+        "agent"
+    }
+}
+
+fn schedule_status(job: &ScheduleRecord, running: bool) -> &'static str {
+    if running {
+        "running"
+    } else if !job.enabled {
+        "paused"
+    } else if job.consecutive_failures > 0 {
+        "failing"
+    } else {
+        "active"
+    }
+}
+
+fn build_schedule_summary(
+    job: &ScheduleRecord,
+    running: bool,
+    latest_turn_id: Option<u64>,
+) -> ViewerScheduleSummary {
+    ViewerScheduleSummary {
+        id: job.id,
+        name: job.name.clone(),
+        title: humanize_schedule_name(&job.name),
+        enabled: job.enabled,
+        managed: job.managed,
+        running,
+        status: schedule_status(job, running).to_string(),
+        mode: schedule_mode(job).to_string(),
+        schedule_spec: job.schedule_spec.clone(),
+        human_schedule: humanize_schedule_spec(&job.schedule_spec),
+        profile: job.profile.clone(),
+        run_count: job.run_count,
+        consecutive_failures: job.consecutive_failures,
+        next_run_local: job.next_run_at.map(store::format_local_timestamp),
+        last_run_local: job.last_run_at.map(store::format_local_timestamp),
+        last_status: job.last_status.clone(),
+        last_error: job.last_error.clone(),
+        latest_turn_id,
+    }
+}
+
+pub fn load_schedule_summaries(
+    state_dir: Option<&Path>,
+    running_ids: &HashSet<u64>,
+) -> Vec<ViewerScheduleSummary> {
+    let Some(dir) = state_dir else {
+        return Vec::new();
+    };
+    let jobs = match store::list_schedules(dir, true) {
+        Ok(jobs) => jobs,
+        Err(err) => {
+            tracing::warn!("cannot list schedules from history.db: {err:#}");
+            return Vec::new();
+        }
+    };
+    jobs.into_iter()
+        .map(|job| {
+            let latest_turn_id = store::list_turns_for_schedule_job(dir, &job, 5)
+                .ok()
+                .and_then(|turns| {
+                    turns
+                        .iter()
+                        .find(|t| {
+                            t.status == TurnStatus::Completed
+                                && (!t.answer.trim().is_empty() || !t.widgets.is_empty())
+                        })
+                        .or_else(|| turns.first())
+                        .map(|t| t.id)
+                });
+            let running = running_ids.contains(&job.id);
+            build_schedule_summary(&job, running, latest_turn_id)
+        })
+        .collect()
+}
+
+pub fn load_schedule_detail(
+    state_dir: Option<&Path>,
+    target: &str,
+    running_ids: &HashSet<u64>,
+    drop_cap_flag: bool,
+) -> Result<Option<ViewerScheduleDetail>> {
+    let Some(dir) = state_dir else {
+        return Ok(None);
+    };
+    let Some(job) = store::get_schedule(dir, target)? else {
+        return Ok(None);
+    };
+
+    let turns = store::list_turns_for_schedule_job(dir, &job, MAX_SCHEDULE_RECENT_RUNS)?;
+    let latest_completed = turns
+        .iter()
+        .find(|t| {
+            t.status == TurnStatus::Completed
+                && (!t.answer.trim().is_empty() || !t.widgets.is_empty())
+        })
+        .or_else(|| turns.first())
+        .cloned();
+
+    let latest_turn_id = latest_completed.as_ref().map(|t| t.id);
+    let running = running_ids.contains(&job.id);
+    let summary = build_schedule_summary(&job, running, latest_turn_id);
+
+    let recent_runs: Vec<ViewerScheduleRun> = turns
+        .iter()
+        .map(|t| {
+            let duration_ms = match (t.started_at_ms, t.finished_at_ms) {
+                (Some(start), Some(end)) if end >= start => Some((end - start) as u64),
+                _ => None,
+            };
+            let run_headline = extract_markdown_title(&t.answer).unwrap_or_else(|| {
+                if !t.answer.trim().is_empty() {
+                    headline(&t.answer, 80)
+                } else {
+                    headline(&t.request, 80)
+                }
+            });
+            ViewerScheduleRun {
+                turn_id: t.id,
+                status: t.status.as_str().to_string(),
+                created_at: store::format_local_timestamp(t.created_at_ms),
+                duration_ms,
+                headline: run_headline,
+                suppressed_token: t.suppressed_token.clone(),
+                fail_reason: t.fail_reason.clone(),
+                error_message: t.error_message.clone(),
+                widget_count: t.widgets.len(),
+            }
+        })
+        .collect();
+
+    let latest_turn = latest_completed.map(|t| {
+        let title = summary.title.clone();
+        turn_record_to_viewer_turn(t, true, &title, drop_cap_flag, Some(job.name.clone()))
+    });
+
+    Ok(Some(ViewerScheduleDetail {
+        summary,
+        prompt: job.prompt,
+        script: job.script,
+        no_agent: job.no_agent,
+        suppress_token: job.suppress_token,
+        failure_deliver: job.failure_deliver.as_str().to_string(),
+        max_runs: job.max_runs,
+        expires_at_local: job.expires_at.map(store::format_local_timestamp),
+        recent_runs,
+        latest_turn,
+    }))
 }

@@ -242,21 +242,25 @@ workflows on top of the single daemon.
 
 ## Done
 
-- `[Important]` `[Upstream + Config]` `[Done: pending]` **Post-Phase-5
-  refinements: on-demand `ReadAloud` TTS, `history` feed, schedule linkage &
-  enrichment, enhanced `recall` + detached `view`, and `recall` skill upgrade.**
-  Added `Request::ReadAloud` / `Reply::SpeakStarted` / `Reply::SpeakFinished`,
-  rich Markdown `prepare_document_for_speech` + `speak_text_local` offline
-  fallback, and disconnect-safe socket cancellation; added `store::history_feed`
-  + `hey-computer history --json` (thread-collapsed SQLite feed + active tasks);
-  added `HEY_COMPUTER_SCHEDULE_{ID,MANUAL}`, `Status.running_schedules`,
-  `list_turns_for_schedule`, `humanize_schedule_{spec,name}`, enriched
-  `schedule list/show --json`, and `schedule open`; extended `recall` with
-  `--on`, `--user-only`, `--id`, `--thread`, widget-only turns, and enriched
-  `RecallHit` metadata; added `HEY_COMPUTER_AGENT_TURN=1` + `hey-computer view
-  --detach` (auto-detached in agent turns with 300 ms startup check and zero
-  duplicate notifications), `--schedule`/`--schedules`/`--history`/`--recall`,
-  numeric targets, and upgraded `skills/recall/SKILL.md`.
+- `[Important]` `[Upstream + Config]` `[Done]` **Post-Phase-5 UX, launcher,
+  recall & Morning Brief refinements.** Added 5-step `Escape` precedence and
+  out-of-the-box VIM motions (`j`/`k`, `Ctrl-e`/`y`, `Ctrl-d`/`u`, `Ctrl-o`/`i`
+  jump list, `gg`/`G`, `webkit6::FindController` `/` smartcase search + `n`/`N`,
+  focus composer `i`, `Info` `I`, `Drop Cap` `D`, Recall drawer keyboard nav),
+  on-demand viewer TTS (`Speak` `s` via disconnect-safe `Request::ReadAloud` +
+  `prepare_document_for_speech` + `speak_text_local` offline fallback), and
+  viewer Scheduled Actions (`Schedules` `S`, `--schedules` overview,
+  `--schedule` inspector with recent runs & latest output, `⟳` provenance
+  chips); added `store::history_feed` (`hey-computer history --json`),
+  `HEY_COMPUTER_SCHEDULE_{ID,MANUAL}`, `Status.running_schedules`, enriched
+  `schedule list/show --json` + `schedule open`, `recall --on/--user-only/--id/--thread`,
+  `HEY_COMPUTER_AGENT_TURN=1` auto-detached `view`, and upgraded
+  `skills/recall/SKILL.md`; and in the consuming configuration added
+  `rofi-hey-computer-history` (`Ask Computer History`, `SUPER + SHIFT + a`,
+  superseding `rofi-hey-computer-tasks`), `rofi-hey-computer-schedules`
+  (`Ask Computer Schedules`), an Open-Meteo `weather-history.json` day-over-day
+  delta pre-collector, and a Reforma 1969 drop-cap-safe poetic editorial Morning
+  Brief prompt.
 - `[Important]` `[Upstream + Config]` `[Done: e5decb7, 69fd4ea, 0cb1a36, aeb64fc, 3761c65, NixConfig b8b4d27, 4a170cd]`
   **GTK4 + WebKitGTK 6.0 answer viewer (`hey-computer-viewer`), `mcp-ui` widgets
   & template skills, `hey-computer distill`, & voice-matched DE/EN streaming TTS
