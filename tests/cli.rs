@@ -606,8 +606,10 @@ async fn history_recall_schedule_json_and_detached_view_cli() {
         format!(
             "state_dir = {state:?}\n\
              [present]\n\
-             notifier = [\"/bin/sh\", \"-c\", \"echo \\\"$*\\\" >> {notify_log:?}; echo 7\", \"sh\"]\n\
-             viewer = [\"/bin/sh\", \"-c\", \"printf 'agent=%s args=%s\\n' \\\"$HEY_COMPUTER_AGENT_TURN\\\" \\\"$*\\\" >> {viewer_log:?}\", \"sh\", \"--turn-id\", \"{{id}}\", \"{{file}}\"]\n",
+             notifier = [\"/bin/sh\", \"-c\", \"echo \\\"$*\\\" >> '{}'; echo 7\", \"sh\"]\n\
+             viewer = [\"/bin/sh\", \"-c\", \"printf 'agent=%s args=%s\\\\n' \\\"$HEY_COMPUTER_AGENT_TURN\\\" \\\"$*\\\" >> '{}'\", \"sh\", \"--turn-id\", \"{{id}}\", \"{{file}}\"]\n",
+            notify_log.display(),
+            viewer_log.display(),
         ),
     )
     .unwrap();
