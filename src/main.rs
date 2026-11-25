@@ -3,22 +3,26 @@
 //! One binary, two roles: `daemon` owns the agent and the socket, every other
 //! subcommand is a client that talks to it over the socket and exits.
 
+use std::ffi::OsString;
 use std::io::IsTerminal;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use serde_json::json;
 use tokio::io::AsyncReadExt;
 
 use hey_computer::attachments;
 use hey_computer::config::Config;
+use hey_computer::distill::{self, DistillOptions};
 use hey_computer::ipc::{self, NotRunning};
 use hey_computer::present::{self, Urgency};
 use hey_computer::protocol::{
-    self, Attachment, AttachmentKind, InputSource, MAX_REQUEST_LINE, Reply, Request,
+    self, Attachment, AttachmentKind, InputSource, MAX_REQUEST_LINE, Reply, Request, SpeakAction,
 };
-use hey_computer::{daemon, debug, mock, scheduler, store};
+use hey_computer::{daemon, debug, mcp, mock, scheduler, store};
 
 #[derive(Debug, Parser)]
 #[command(name = "hey-computer", version, about, long_about = None)]
@@ -52,6 +56,9 @@ enum Command {
         /// Start a new conversation, even right after the last answer.
         #[arg(long)]
         new: bool,
+        /// Continue the conversation of an earlier turn ID.
+        #[arg(long, value_name = "ID", conflicts_with = "new")]
+        reply_to: Option<u64>,
         /// Run in the background lane (not superseded by newer asks); prints
         /// the task ID to stdout when not using `--print`.
         #[arg(short = 'b', long)]
@@ -136,6 +143,49 @@ enum Command {
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         query: Vec<String>,
     },
+    /// Review recent user turns and propose durable memory updates or draft skills.
+    Distill {
+        /// Only review user turns created at or after this time (`7d`, `2w`, `24h`,
+        /// `today`, `yesterday`, `YYYY-MM-DD`, or `all`).
+        #[arg(long, value_name = "SPEC", default_value = distill::DEFAULT_DISTILL_SINCE)]
+        since: String,
+        /// Maximum number of recent user turns to inspect (1..=500).
+        #[arg(short = 'n', long, default_value_t = distill::DEFAULT_DISTILL_LIMIT)]
+        limit: usize,
+        /// Named profile from `[profiles.<name>]` (defaults to `deep` when configured).
+        #[arg(short = 'p', long, value_name = "NAME")]
+        profile: Option<String>,
+        /// Queue distillation in the background lane and print its task ID.
+        #[arg(short = 'b', long, conflicts_with_all = ["print", "json"])]
+        background: bool,
+        /// Wait and print the prose summary and plain-text diff instead of opening the viewer.
+        #[arg(long, conflicts_with = "json")]
+        print: bool,
+        /// Wait and print the full `Reply::Answer` (`text` + `widgets`) as JSON.
+        #[arg(long, conflicts_with = "print")]
+        json: bool,
+    },
+    /// Query or toggle spoken answers (`present.speak`).
+    Speak {
+        /// Control action (`on`, `off`, `toggle`, or `status`; defaults to `status`).
+        #[arg(value_enum)]
+        action: Option<SpeakCliAction>,
+        /// Emit speak status as JSON (`{"enabled":true,"speaking":false}`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open the native answer viewer (`hey-computer-viewer`).
+    View {
+        /// Optional Markdown file to render.
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// Conversation turn ID to load from `history.db`.
+        #[arg(long, value_name = "ID")]
+        turn_id: Option<u64>,
+        /// Focus the bottom follow-up composer on startup.
+        #[arg(long)]
+        focus_composer: bool,
+    },
     /// Print what the daemon is doing.
     Status {
         /// Print the status as JSON.
@@ -157,12 +207,34 @@ enum Command {
         #[arg(long, conflicts_with_all = ["copy", "open"])]
         json: bool,
     },
+    /// Internal stdio MCP server exposing structured UI widget tools.
+    #[command(hide = true, name = "mcp-ui")]
+    McpUi,
     /// Check one part of the program on its own.
     #[command(hide = true)]
     Debug {
         #[command(subcommand)]
         what: DebugCommand,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SpeakCliAction {
+    On,
+    Off,
+    Toggle,
+    Status,
+}
+
+impl SpeakCliAction {
+    fn into_action(self) -> SpeakAction {
+        match self {
+            Self::On => SpeakAction::On,
+            Self::Off => SpeakAction::Off,
+            Self::Toggle => SpeakAction::Toggle,
+            Self::Status => SpeakAction::Status,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -291,10 +363,11 @@ enum ScheduleCommand {
     Run { target: String },
 }
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum LaneFilter {
     Interactive,
     Background,
+    Restricted,
     All,
 }
 
@@ -303,6 +376,7 @@ impl LaneFilter {
         match self {
             Self::Interactive => Some(store::Lane::Interactive),
             Self::Background => Some(store::Lane::Background),
+            Self::Restricted => Some(store::Lane::Restricted),
             Self::All => None,
         }
     }
@@ -413,7 +487,17 @@ fn init_tracing(verbose: u8) {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    // The mock agent's stderr ends up in the daemon's log; keep it quiet.
+    // Internal MCP server and mock ACP agent own stdio; never initialize tracing
+    // before handling `mcp-ui` or `mock-agent`.
+    if matches!(cli.command, Command::McpUi) {
+        return match tokio::task::block_in_place(mcp::run_stdio_ui_server) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("hey-computer mcp-ui: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if !matches!(
         cli.command,
         Command::Debug {
@@ -432,6 +516,10 @@ async fn main() -> ExitCode {
 }
 
 async fn dispatch(cli: Cli) -> Result<ExitCode> {
+    if matches!(cli.command, Command::McpUi) {
+        tokio::task::block_in_place(mcp::run_stdio_ui_server)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     if let Command::Debug {
         what: DebugCommand::MockAgent { script, log },
     } = &cli.command
@@ -440,8 +528,9 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Pure socket client subcommands do not read config.toml so a long-running
-    // front end or Waybar watcher survives config additions across rebuilds.
+    // Pure socket client subcommands (and `view` exec) do not read config.toml
+    // first so a long-running front end or Waybar watcher survives config
+    // additions across rebuilds.
     match &cli.command {
         Command::Cancel { id } => {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
@@ -461,9 +550,28 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
                 other => unexpected(other),
             };
         }
+        Command::Speak { action, json } => {
+            let socket = ipc::socket_path(cli.socket.as_deref())?;
+            let action = action.unwrap_or(SpeakCliAction::Status).into_action();
+            return speak_cmd(cli.config.as_deref(), &socket, action, *json).await;
+        }
+        Command::View {
+            file,
+            turn_id,
+            focus_composer,
+        } => {
+            return exec_viewer(
+                cli.config.as_deref(),
+                cli.socket.as_deref(),
+                file.as_deref(),
+                *turn_id,
+                *focus_composer,
+            );
+        }
         _ => {}
     }
 
+    let config_path = cli.config.clone();
     let config = match (&cli.command, cli.config.as_deref()) {
         (Command::Ask { .. }, None) => match Config::load(None) {
             Ok(cfg) => cfg,
@@ -484,6 +592,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Ask {
             print,
             new,
+            reply_to,
             background,
             suppress_token,
             profile,
@@ -507,6 +616,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
                 text,
                 print,
                 new,
+                reply_to,
                 background,
                 suppress_token,
                 profile,
@@ -556,6 +666,33 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             plain,
             query,
         ),
+        Command::Distill {
+            since,
+            limit,
+            profile,
+            background,
+            print,
+            json,
+        } => {
+            let socket = ipc::socket_path(cli.socket.as_deref())?;
+            distill::run(
+                &config,
+                &socket,
+                &DistillOptions {
+                    since,
+                    limit,
+                    profile,
+                    background,
+                    print,
+                    json,
+                    config_path,
+                },
+            )
+            .await
+        }
+        Command::Speak { .. } | Command::View { .. } | Command::McpUi => {
+            unreachable!("handled above")
+        }
         Command::Status { json } => {
             let socket = ipc::socket_path(cli.socket.as_deref())?;
             match ipc::request(&socket, &Request::Status).await? {
@@ -638,6 +775,118 @@ fn unexpected(reply: Reply) -> Result<ExitCode> {
     Ok(ExitCode::FAILURE)
 }
 
+fn print_speak_status(enabled: bool, speaking: bool, as_json: bool) -> Result<()> {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "enabled": enabled,
+                "speaking": speaking,
+            }))?
+        );
+    } else {
+        println!("{}", if enabled { "on" } else { "off" });
+    }
+    Ok(())
+}
+
+/// Apply a `SpeakAction` offline directly against `<state_dir>/speak_enabled`.
+fn apply_offline_speak_action(
+    state_dir: &Path,
+    default_enabled: bool,
+    action: SpeakAction,
+) -> Result<bool> {
+    let current = store::load_speak_state(state_dir, default_enabled);
+    match action {
+        SpeakAction::Status => Ok(current),
+        SpeakAction::On => {
+            store::save_speak_state(state_dir, true)?;
+            Ok(true)
+        }
+        SpeakAction::Off => {
+            store::save_speak_state(state_dir, false)?;
+            Ok(false)
+        }
+        SpeakAction::Toggle => {
+            let next = !current;
+            store::save_speak_state(state_dir, next)?;
+            Ok(next)
+        }
+    }
+}
+
+async fn speak_cmd(
+    config_path: Option<&Path>,
+    socket: &Path,
+    action: SpeakAction,
+    as_json: bool,
+) -> Result<ExitCode> {
+    match ipc::request(socket, &Request::Speak { action }).await {
+        Ok(Reply::SpeakStatus { enabled, speaking }) => {
+            print_speak_status(enabled, speaking, as_json)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(other) => unexpected(other),
+        Err(e) if e.downcast_ref::<NotRunning>().is_some() => {
+            let config = match config_path {
+                Some(path) => Config::load(Some(path))?,
+                None => Config::load(None).unwrap_or_default(),
+            };
+            let state_dir = config.state_dir()?;
+            let enabled =
+                apply_offline_speak_action(&state_dir, config.present.speak.enabled, action)?;
+            print_speak_status(enabled, false, as_json)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn build_viewer_args(
+    config_path: Option<&Path>,
+    socket_path: Option<&Path>,
+    file: Option<&Path>,
+    turn_id: Option<u64>,
+    focus_composer: bool,
+) -> Vec<OsString> {
+    let mut args = Vec::new();
+    if let Some(cfg) = config_path {
+        args.push(OsString::from("--config"));
+        args.push(cfg.as_os_str().to_os_string());
+    }
+    if let Some(sock) = socket_path {
+        args.push(OsString::from("--socket"));
+        args.push(sock.as_os_str().to_os_string());
+    }
+    if let Some(id) = turn_id {
+        args.push(OsString::from("--turn-id"));
+        args.push(OsString::from(id.to_string()));
+    }
+    if focus_composer {
+        args.push(OsString::from("--focus-composer"));
+    }
+    if let Some(file) = file {
+        if file.to_string_lossy().starts_with('-') {
+            args.push(OsString::from("--"));
+        }
+        args.push(file.as_os_str().to_os_string());
+    }
+    args
+}
+
+fn exec_viewer(
+    config_path: Option<&Path>,
+    socket_path: Option<&Path>,
+    file: Option<&Path>,
+    turn_id: Option<u64>,
+    focus_composer: bool,
+) -> Result<ExitCode> {
+    let viewer_bin = distill::resolve_viewer_binary();
+    let args = build_viewer_args(config_path, socket_path, file, turn_id, focus_composer);
+    let err = std::process::Command::new(&viewer_bin).args(&args).exec();
+    Err(err).with_context(|| format!("launching {}", viewer_bin.display()))
+}
+
 async fn last(
     config: &Config,
     copy: bool,
@@ -666,8 +915,9 @@ async fn last(
         present::copy_to_clipboard(&config.present, &answer.text).await?;
     } else if open {
         let answers = ipc::runtime_dir()?.join("hey-computer");
+        let viewer_cfg = distill::present_config_for_turn(&config.present, answer.id);
         present::open_answer(
-            &config.present,
+            &viewer_cfg,
             &answers,
             answer.id,
             &answer.text,
@@ -870,13 +1120,13 @@ async fn tasks(config: &Config, socket: &Path, action: Option<TasksCommand>) -> 
                 eprintln!("hey-computer: task {id} not found");
                 return Ok(ExitCode::FAILURE);
             };
-            if row.answer.trim().is_empty() {
+            if row.answer.trim().is_empty() && row.widgets.is_empty() {
                 eprintln!("hey-computer: task {id} has no answer to open");
                 return Ok(ExitCode::FAILURE);
             }
             let answers = ipc::runtime_dir()?.join("hey-computer");
-            present::open_answer(&config.present, &answers, row.id, &row.answer, &row.denied)
-                .await?;
+            let viewer_cfg = distill::present_config_for_turn(&config.present, row.id);
+            present::open_answer(&viewer_cfg, &answers, row.id, &row.answer, &row.denied).await?;
             Ok(ExitCode::SUCCESS)
         }
         TasksCommand::Copy { id } => {
@@ -1206,6 +1456,7 @@ async fn ask(
     words: Vec<String>,
     print: bool,
     new: bool,
+    reply_to: Option<u64>,
     background: bool,
     suppress_token: Option<String>,
     profile: Option<String>,
@@ -1245,7 +1496,7 @@ async fn ask(
                 suppress_token,
                 attachments,
                 source,
-                reply_to: None,
+                reply_to,
                 stream: false,
                 distill: false,
             };
@@ -1357,6 +1608,7 @@ mod tests {
             vec!["hey-computer", "daemon"],
             vec!["hey-computer", "ask", "what", "time", "is", "it"],
             vec!["hey-computer", "ask", "--print", "--new", "--", "-5 plus 3"],
+            vec!["hey-computer", "ask", "--reply-to", "42", "follow", "up"],
             vec!["hey-computer", "ask", "-p", "deep", "derive", "this"],
             vec![
                 "hey-computer",
@@ -1390,6 +1642,7 @@ mod tests {
                 "--all",
                 "--json",
             ],
+            vec!["hey-computer", "tasks", "list", "--lane", "restricted"],
             vec!["hey-computer", "tasks", "show", "3", "--json"],
             vec!["hey-computer", "tasks", "open", "3"],
             vec!["hey-computer", "tasks", "copy", "3"],
@@ -1413,10 +1666,51 @@ mod tests {
                 "nixos",
                 "rebuild",
             ],
-            vec!["hey-computer", "recall", "--json", "--any", "--full", "foo"],
+            vec![
+                "hey-computer",
+                "recall",
+                "--lane",
+                "restricted",
+                "--json",
+                "--any",
+                "--full",
+                "foo",
+            ],
+            vec!["hey-computer", "distill"],
+            vec![
+                "hey-computer",
+                "distill",
+                "--since",
+                "14d",
+                "--limit",
+                "80",
+                "--profile",
+                "deep",
+                "--print",
+            ],
+            vec!["hey-computer", "distill", "-b"],
+            vec!["hey-computer", "distill", "--json"],
+            vec!["hey-computer", "speak"],
+            vec!["hey-computer", "speak", "--json"],
+            vec!["hey-computer", "speak", "on"],
+            vec!["hey-computer", "speak", "off"],
+            vec!["hey-computer", "speak", "toggle", "--json"],
+            vec!["hey-computer", "speak", "status", "--json"],
+            vec!["hey-computer", "view"],
+            vec!["hey-computer", "view", "/tmp/answer.md"],
+            vec![
+                "hey-computer",
+                "view",
+                "--turn-id",
+                "42",
+                "--focus-composer",
+                "/tmp/answer.md",
+            ],
+            vec!["hey-computer", "mcp-ui"],
             vec!["hey-computer", "status", "--json"],
             vec!["hey-computer", "last"],
             vec!["hey-computer", "last", "--lane", "all", "--json"],
+            vec!["hey-computer", "last", "--lane", "restricted"],
             vec!["hey-computer", "last", "--copy"],
             vec!["hey-computer", "last", "--open"],
             vec!["hey-computer", "debug", "config"],
@@ -1449,7 +1743,119 @@ mod tests {
     }
 
     #[test]
+    fn ask_rejects_reply_to_with_new_and_distill_rejects_conflicting_modes() {
+        assert!(
+            Cli::try_parse_from(["hey-computer", "ask", "--new", "--reply-to", "7", "hi"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["hey-computer", "distill", "-b", "--print"]).is_err());
+        assert!(Cli::try_parse_from(["hey-computer", "distill", "-b", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["hey-computer", "distill", "--print", "--json"]).is_err());
+    }
+
+    #[test]
     fn last_rejects_copy_and_open_together() {
         assert!(Cli::try_parse_from(["hey-computer", "last", "--copy", "--open"]).is_err());
+    }
+
+    #[test]
+    fn lane_filter_maps_restricted_lane() {
+        assert_eq!(
+            LaneFilter::Restricted.into_lane(),
+            Some(store::Lane::Restricted)
+        );
+        assert_eq!(LaneFilter::All.into_lane(), None);
+    }
+
+    #[tokio::test]
+    async fn speak_works_offline_and_via_live_socket() {
+        use hey_computer::lines::{self, Line};
+        use tokio::io::{AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("hc-main-speak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_dir = dir.join("state");
+        let cfg_path = dir.join("config.toml");
+        std::fs::write(&cfg_path, format!("state_dir = {:?}\n", state_dir)).unwrap();
+        let offline_sock = dir.join("offline.sock");
+
+        // Offline toggle: false -> true -> false -> on -> status.
+        assert!(!apply_offline_speak_action(&state_dir, false, SpeakAction::Status).unwrap());
+        assert_eq!(
+            speak_cmd(Some(&cfg_path), &offline_sock, SpeakAction::Toggle, false)
+                .await
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert!(store::load_speak_state(&state_dir, false));
+        assert_eq!(
+            speak_cmd(Some(&cfg_path), &offline_sock, SpeakAction::Toggle, true)
+                .await
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert!(!store::load_speak_state(&state_dir, true));
+
+        // Live daemon socket takes precedence when running.
+        let live_sock = dir.join("live.sock");
+        let listener = UnixListener::bind(&live_sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let Line::Text(line) = lines::read(&mut reader, MAX_REQUEST_LINE).await.unwrap() else {
+                panic!("expected speak request");
+            };
+            let req: Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                req,
+                Request::Speak {
+                    action: SpeakAction::On
+                }
+            );
+            let mut reply = protocol::encode(&Reply::SpeakStatus {
+                enabled: true,
+                speaking: true,
+            });
+            reply.push('\n');
+            write.write_all(reply.as_bytes()).await.unwrap();
+        });
+
+        let code = speak_cmd(Some(&cfg_path), &live_sock, SpeakAction::On, true)
+            .await
+            .unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+        server.await.unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn viewer_args_forward_config_socket_turn_id_focus_and_file() {
+        let args = build_viewer_args(
+            Some(Path::new("/tmp/cfg.toml")),
+            Some(Path::new("/tmp/hc.sock")),
+            Some(Path::new("/tmp/ans.md")),
+            Some(19),
+            true,
+        );
+        let strings: Vec<String> = args
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            strings,
+            vec![
+                "--config",
+                "/tmp/cfg.toml",
+                "--socket",
+                "/tmp/hc.sock",
+                "--turn-id",
+                "19",
+                "--focus-composer",
+                "/tmp/ans.md"
+            ]
+        );
     }
 }

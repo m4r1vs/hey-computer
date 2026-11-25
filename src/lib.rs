@@ -15,6 +15,7 @@ pub mod config;
 pub mod context;
 pub mod daemon;
 pub mod debug;
+pub mod distill;
 pub mod environment;
 pub mod ipc;
 pub mod lines;

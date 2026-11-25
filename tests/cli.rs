@@ -502,3 +502,87 @@ async fn recall_and_tasks_cli_read_history_db_directly() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn mcp_ui_stdio_speak_and_distill_cli_round_trip() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = scratch("phase5-cli");
+    let state = dir.join("state");
+    let config = dir.join("config.toml");
+    std::fs::write(&config, format!("state_dir = {:?}\n", state)).unwrap();
+
+    // 1. `hey-computer mcp-ui` speaks clean JSON-RPC 2.0 MCP over stdio.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("mcp-ui")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05"}}}}"#
+        )
+        .unwrap();
+        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list"}}"#).unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"show_widget","arguments":{{"kind":"custom_html","title":"Chart","data":{{"html":"<div>ok</div>"}}}}}}}}"#
+        )
+        .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let replies: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON-RPC line on mcp-ui stdout"))
+        .collect();
+    assert_eq!(replies.len(), 3);
+    assert!(replies[1].to_string().contains("show_widget"));
+    assert!(replies[1].to_string().contains("propose_widget_template"));
+    assert!(
+        replies[2]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"ok\":true")
+    );
+
+    // 2. `hey-computer speak` toggles offline `<state_dir>/speak_enabled` and emits JSON.
+    let speak_toggle = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--socket")
+        .arg(dir.join("offline.sock"))
+        .args(["speak", "toggle", "--json"])
+        .output()
+        .unwrap();
+    assert!(speak_toggle.status.success());
+    let speak_json: serde_json::Value = serde_json::from_slice(&speak_toggle.stdout).unwrap();
+    assert_eq!(speak_json["enabled"], true);
+
+    // 3. `hey-computer distill` exits 0 cleanly when no user candidate turns exist.
+    let distill_empty = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--socket")
+        .arg(dir.join("offline.sock"))
+        .args(["distill", "--since", "7d", "--print"])
+        .output()
+        .unwrap();
+    assert!(
+        distill_empty.status.success(),
+        "{}",
+        String::from_utf8_lossy(&distill_empty.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
