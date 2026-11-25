@@ -127,15 +127,45 @@ pub enum PermissionDecision {
     },
 }
 
+/// Tool kinds unconditionally denied in [`LanePolicy::restricted`].
+///
+/// Only `"read"` and `"think"` remain permitted by kind (further gated by
+/// [`RESTRICTED_DENY_NAMES`] and per-turn `max_tool_calls`).
+pub const RESTRICTED_DENY_KINDS: &[&str] = &[
+    "execute", "edit", "delete", "move", "fetch", "search", "other",
+];
+
+/// Built-in tool names unconditionally denied in [`LanePolicy::restricted`],
+/// even if a future agent release ever reports their `kind` as `"read"`.
+pub const RESTRICTED_DENY_NAMES: &[&str] = &[
+    "read_url_content",
+    "search_web",
+    "open_browser_url",
+    "browser_subagent",
+    "invoke_subagent",
+    "define_subagent",
+    "manage_subagents",
+    "run_workflow",
+    "swarm",
+    "schedule",
+    "send_message",
+    "manage_task",
+    "run_command",
+    "write_file",
+    "edit_file",
+];
+
 /// Per-lane permission profile hook.
 ///
 /// Interactive and background lanes enforce the configured shell deny list and
 /// allow configured MCP servers; restricted lanes (for Phase 6 reactive tasks)
-/// additionally refuse every mutating/executing tool kind and disable MCP.
+/// additionally refuse every mutating, network, search, subagent, workflow, and
+/// unknown tool kind/name and disable MCP.
 #[derive(Debug, Clone)]
 pub struct LanePolicy {
     pub deny_commands: Policy,
     pub deny_tool_kinds: Vec<String>,
+    pub deny_tool_names: Vec<String>,
     pub allow_mcp: bool,
     /// Optional per-turn allowlist of MCP server names (`None` allows all
     /// configured servers when `allow_mcp` is true).
@@ -150,20 +180,28 @@ impl LanePolicy {
         Self {
             deny_commands: Policy::new(deny),
             deny_tool_kinds: Vec::new(),
+            deny_tool_names: Vec::new(),
             allow_mcp: true,
             allowed_mcp_servers: None,
             known_mcp_servers: Vec::new(),
         }
     }
 
-    /// Restricted read-only lane: refuses `execute`, `edit`, `delete`, `move`
-    /// and disables MCP servers.
+    /// Restricted read-only lane: refuses mutating, network, search, and
+    /// unknown tool kinds (`RESTRICTED_DENY_KINDS`), blocks risky tool names
+    /// (`RESTRICTED_DENY_NAMES`) even if reported as `"read"`, and disables all
+    /// MCP servers (including internal `mcp-ui`).
     pub fn restricted() -> Self {
         Self {
             deny_commands: Policy::new(&[]),
-            deny_tool_kinds: ["execute", "edit", "delete", "move"]
-                .map(String::from)
-                .to_vec(),
+            deny_tool_kinds: RESTRICTED_DENY_KINDS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            deny_tool_names: RESTRICTED_DENY_NAMES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             allow_mcp: false,
             allowed_mcp_servers: None,
             known_mcp_servers: Vec::new(),
@@ -279,9 +317,29 @@ impl LanePolicy {
                         .and_then(serde_json::Value::as_str)
                         .map(String::from)
                 })
+                .or_else(|| name.map(String::from))
                 .unwrap_or_else(|| kind.to_string());
             return PermissionDecision::Deny {
                 tag: kind.to_string(),
+                detail,
+            };
+        }
+        if let Some(tool_name) = name
+            && self
+                .deny_tool_names
+                .iter()
+                .any(|denied| denied.eq_ignore_ascii_case(tool_name))
+        {
+            let detail = command
+                .or_else(|| {
+                    tool_call
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .map(String::from)
+                })
+                .unwrap_or_else(|| tool_name.to_string());
+            return PermissionDecision::Deny {
+                tag: tool_name.to_string(),
                 detail,
             };
         }
@@ -1108,6 +1166,25 @@ mod tests {
             json!({"toolCall": {"kind": "edit", "title": "notes.md"}}),
             json!({"toolCall": {"kind": "delete", "title": "notes.md"}}),
             json!({"toolCall": {"kind": "move", "title": "notes.md"}}),
+            json!({"toolCall": {"kind": "fetch", "title": "Fetch https://example.com"}}),
+            json!({"toolCall": {"kind": "search", "title": "grep"}}),
+            json!({"toolCall": {"kind": "other", "title": "Unknown action"}}),
+            json!({"toolCall": {"title": "Missing kind defaults to other"}}),
+            json!({"toolCall": {"kind": "read", "name": "read_url_content", "title": "Fetch URL"}}),
+            json!({"toolCall": {"kind": "read", "name": "search_web", "title": "Search web"}}),
+            json!({"toolCall": {"kind": "read", "name": "open_browser_url", "title": "Open URL"}}),
+            json!({"toolCall": {"kind": "read", "name": "browser_subagent"}}),
+            json!({"toolCall": {"kind": "read", "name": "invoke_subagent"}}),
+            json!({"toolCall": {"kind": "read", "name": "define_subagent"}}),
+            json!({"toolCall": {"kind": "read", "name": "manage_subagents"}}),
+            json!({"toolCall": {"kind": "read", "name": "run_workflow"}}),
+            json!({"toolCall": {"kind": "read", "name": "swarm"}}),
+            json!({"toolCall": {"kind": "read", "name": "schedule"}}),
+            json!({"toolCall": {"kind": "read", "name": "send_message"}}),
+            json!({"toolCall": {"kind": "read", "name": "manage_task"}}),
+            json!({"toolCall": {"kind": "read", "name": "run_command"}}),
+            json!({"toolCall": {"kind": "read", "name": "write_file"}}),
+            json!({"toolCall": {"kind": "read", "name": "edit_file"}}),
             json!({"toolCall": {"kind": "other", "name": "mcp_slack_post"}}),
             json!({"toolCall": {
                 "kind": "execute",
@@ -1121,6 +1198,10 @@ mod tests {
                     PermissionDecision::Deny { .. }
                 ),
                 "{blocked} should be denied in restricted lane"
+            );
+            assert!(
+                restricted.will_deny_update(&blocked["toolCall"]),
+                "will_deny_update must deny {blocked} in restricted lane"
             );
         }
         // Per-profile MCP allowlists gate `call_mcp_tool` by ServerName.
@@ -1143,13 +1224,14 @@ mod tests {
                 if tag == "mcp" && detail == "mcp:slack/conversations_history"
         ));
         for allowed in [
-            json!({"toolCall": {"kind": "read", "title": "notes.md"}}),
-            json!({"toolCall": {"kind": "search", "title": "grep"}}),
+            json!({"toolCall": {"kind": "read", "name": "read_file", "title": "notes.md"}}),
+            json!({"toolCall": {"kind": "think", "title": "reasoning"}}),
         ] {
             assert_eq!(
                 restricted.evaluate_permission(&allowed),
                 PermissionDecision::Allow
             );
+            assert!(!restricted.will_deny_update(&allowed["toolCall"]));
         }
 
         // Lazy MCP resource reads (`list_resources`, `read_resource`) are gated
