@@ -2363,3 +2363,425 @@ async fn smart_routing_handles_heuristics_escalation_voice_zero_triage_and_typed
     assert_eq!(h.log_count("empty_fast"), 2);
     h.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn triage_background_promotion_clears_running_and_expiring_recurring_schedule_disables() {
+    use hey_computer::config::Profile;
+    use hey_computer::store::{self, FailureDeliver, NewSchedule};
+
+    let script = r#"{
+        "turns": [
+            {"match": "Classify the user request below", "steps": [{"chunk": "{\"profile\":\"deep\",\"lane\":\"background\"}"}]},
+            {"match": "profile_budget_probe", "steps": ["echo"]}
+        ],
+        "default": [{"chunk": "done"}]
+    }"#;
+    let h = Harness::start(script, |c| {
+        c.context.time = false;
+        c.context.desktop = false;
+        c.profiles.insert(
+            "fast".to_string(),
+            Profile {
+                model: Some("mock-fast".to_string()),
+                thought_level: Some("low".to_string()),
+                ..Profile::default()
+            },
+        );
+        c.profiles.insert(
+            "deep".to_string(),
+            Profile {
+                model: Some("mock-deep".to_string()),
+                thought_level: Some("high".to_string()),
+                max_tool_calls: Some(123),
+                ..Profile::default()
+            },
+        );
+        c.routing.enabled = true;
+        c.routing.fast_profile = "fast".to_string();
+        c.routing.deep_profile = "deep".to_string();
+        c.routing.auto_background = true;
+        c.routing.triage_non_voice = true;
+        c.scheduler.enabled = true;
+        c.scheduler.min_interval_secs = 1.0;
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    // 1. Named profile receives `<budget>` even when `[context]` is disabled.
+    let (_, mut c) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "profile_budget_probe".to_string(),
+            wait: true,
+            new: true,
+            profile: Some("deep".to_string()),
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Cli,
+        },
+    )
+    .await
+    .unwrap();
+    let budget_reply = c.next(Some(Duration::from_secs(10))).await.unwrap();
+    let body = answer(&budget_reply);
+    assert!(body.contains("<budget>"), "{body}");
+    assert!(body.contains("profile: deep"), "{body}");
+    assert!(body.contains("max_tool_calls: 123"), "{body}");
+
+    // 2. Tier 3 triage promoting an unsure typed turn to `background` must not
+    //    leave `status.running` stuck after completion, and records `background` lane.
+    let (promoted_id, _) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "Could you put together a short outline of the quarterly roadmap items we discussed?"
+                .to_string(),
+            wait: false,
+            new: true,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Typed,
+        },
+    )
+    .await
+    .unwrap();
+    h.recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::TaskComplete { id, .. } if *id == promoted_id))
+        })
+        .await
+        .expect("triage-promoted TaskComplete");
+    match ipc::request(&h.socket, &Request::Status).await.unwrap() {
+        Reply::Status(st) => assert_eq!(st.running, None, "status.running leaked: {st:?}"),
+        other => panic!("{other:?}"),
+    }
+    let state_dir = h.dir.join("state");
+    let rec = store::get_turn(&state_dir, promoted_id)
+        .unwrap()
+        .expect("promoted task in db");
+    assert_eq!(rec.lane, store::Lane::Background);
+
+    // 3. Recurring schedule whose next firing would cross `expires_at` disables cleanly.
+    let now_ms = store::unix_timestamp_ms();
+    let job = store::create_schedule(
+        &state_dir,
+        &NewSchedule {
+            name: "expiring-every".to_string(),
+            schedule_spec: "every 1s".to_string(),
+            prompt: "ping".to_string(),
+            profile: String::new(),
+            script: String::new(),
+            no_agent: true,
+            suppress_token: None,
+            failure_deliver: FailureDeliver::Silent,
+            max_runs: None,
+            expires_at: Some(now_ms + 900),
+            next_run_at: now_ms + 150,
+        },
+        128,
+    )
+    .unwrap();
+    let _ = ipc::request(&h.socket, &Request::ScheduleReload).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let cur = store::get_schedule(&state_dir, &job.id.to_string())
+            .unwrap()
+            .unwrap();
+        if cur.run_count >= 1 && !cur.enabled {
+            assert_eq!(cur.next_run_at, None);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "recurring job with expires_at stayed enabled: {cur:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn section3_ux_and_conductor_quirks_regression() {
+    use hey_computer::config::Profile;
+
+    let script = r#"{
+        "turns": [
+            {"match": "Classify the user request below", "steps": [{"sleep_ms": 150}, {"chunk": "{\"profile\":\"deep\",\"lane\":\"background\"}"}]},
+            {"match": "slow_fg", "steps": [{"sleep_ms": 350}, {"chunk": "foreground finished"}]},
+            {"match": "Write a report on storage engines", "steps": [{"sleep_ms": 120}, "echo"]},
+            {"match": "cancel_me_turn1", "steps": [{"sleep_ms": 5000}, {"chunk": "never"}]},
+            {"match": "lazy_mcp_reads", "steps": [
+                {"update": {"sessionUpdate": "tool_call", "toolCallId": "s1", "kind": "read", "name": "read_file", "rawInput": {"Path": "__AGENT_MCP_1__"}}},
+                {"update": {"sessionUpdate": "tool_call", "toolCallId": "s2", "kind": "read", "name": "read_file", "rawInput": {"Path": "__AGENT_MCP_2__"}}},
+                {"permission": {"command": "echo ok"}},
+                {"chunk": "within budget"}
+            ]}
+        ],
+        "default": ["echo"]
+    }"#;
+
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_mem_dir = std::env::temp_dir().join(format!("hc-mem{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_mem_dir);
+    std::fs::create_dir_all(&tmp_mem_dir).unwrap();
+    let mem_path = tmp_mem_dir.join("memory.md");
+    std::fs::write(&mem_path, "Memory v1: likes espresso").unwrap();
+
+    let mem_for_cfg = mem_path.clone();
+    let h = Harness::start(script, move |c| {
+        c.instructions.memory_file = mem_for_cfg.clone();
+        c.conversation.follow_up_secs = 0.6;
+        c.context.time = true;
+        c.context.desktop = false;
+        c.profiles.insert(
+            "fast".to_string(),
+            Profile {
+                model: Some("mock-fast".to_string()),
+                thought_level: Some("low".to_string()),
+                max_tool_calls: Some(1),
+                ..Profile::default()
+            },
+        );
+        c.profiles.insert(
+            "deep".to_string(),
+            Profile {
+                model: Some("mock-deep".to_string()),
+                thought_level: Some("high".to_string()),
+                thinking_label: Some("Pondering Hard…".to_string()),
+                ..Profile::default()
+            },
+        );
+        c.routing.enabled = true;
+        c.routing.fast_profile = "fast".to_string();
+        c.routing.deep_profile = "deep".to_string();
+        c.routing.auto_background = true;
+        c.routing.triage_non_voice = true;
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    // 1. Cancelling turn 1 of a fresh conversation must NOT open a follow-up window.
+    let (cancel_id, _) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "cancel_me_turn1".to_string(),
+            wait: false,
+            new: true,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Voice,
+        },
+    )
+    .await
+    .unwrap();
+    h.wait_log("prompt mock-").await;
+    let cancel_reply = ipc::request(&h.socket, &Request::Cancel { id: None })
+        .await
+        .unwrap();
+    assert_eq!(
+        cancel_reply,
+        Reply::Cancelled {
+            id: Some(cancel_id)
+        }
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    match ipc::request(&h.socket, &Request::Status).await.unwrap() {
+        Reply::Status(st) => assert_eq!(
+            st.follow_up_secs, None,
+            "cancelled turn 1 leaked follow_up_secs: {st:?}"
+        ),
+        other => panic!("{other:?}"),
+    }
+
+    // 2. Routine fast turn suppresses `(fast)` badge (`profile == None` in Presentation::Answer).
+    let (fast_id, _) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "turn off the lamp".to_string(),
+            wait: false,
+            new: true,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Voice,
+        },
+    )
+    .await
+    .unwrap();
+    let items = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::Answer { id, .. } if *id == fast_id))
+        })
+        .await
+        .expect("fast answer presented");
+    assert!(
+        items.iter().any(|i| matches!(
+            i,
+            Presentation::Answer { id, profile: None, .. } if *id == fast_id
+        )),
+        "expected routine fast turn to have profile: None, got: {items:?}"
+    );
+    // Wait out the 0.6s follow-up window before the next independent check.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // 3. Tier 1 auto-backgrounding does NOT supersede a running foreground turn!
+    let (fg_id, _) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "slow_fg".to_string(),
+            wait: false,
+            new: true,
+            profile: Some("deep".to_string()),
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Voice,
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (bg_id, _) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "Write a report on storage engines".to_string(),
+            wait: false,
+            new: true,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Voice,
+        },
+    )
+    .await
+    .unwrap();
+    let both = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            let has_fg = items.iter().any(|i| {
+                matches!(
+                    i,
+                    Presentation::Answer { id, profile: Some(p), .. }
+                        if *id == fg_id && p == "deep"
+                )
+            });
+            let has_bg = items
+                .iter()
+                .any(|i| matches!(i, Presentation::TaskComplete { id, .. } if *id == bg_id));
+            has_fg && has_bg
+        })
+        .await
+        .expect("both fg_id and auto-bg bg_id completed without superseding");
+    assert!(!both.iter().any(
+        |i| matches!(i, Presentation::Failure { id, reason: FailReason::Superseded, .. } if *id == fg_id)
+    ));
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // 4. Slow Tier 3 triage shows instant Progress first, then replaces it via Notice.replaces_id!
+    let (triage_id, _) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "Could you put together a short outline of the quarterly roadmap items we discussed?"
+                .to_string(),
+            wait: false,
+            new: true,
+            profile: None,
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Typed,
+        },
+    )
+    .await
+    .unwrap();
+    let triage_items = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items
+                .iter()
+                .any(|i| matches!(i, Presentation::TaskComplete { id, .. } if *id == triage_id))
+        })
+        .await
+        .expect("triage background complete");
+    let prog_pos = triage_items
+        .iter()
+        .position(|i| matches!(i, Presentation::Progress { id, .. } if *id == triage_id))
+        .expect("instant pre-triage Progress");
+    let notice_pos = triage_items
+        .iter()
+        .position(|i| {
+            matches!(
+                i,
+                Presentation::Notice { summary, replaces_id: Some(rid), .. }
+                    if summary == "Working in the background" && *rid == triage_id
+            )
+        })
+        .expect("Notice replacing Progress");
+    assert!(prog_pos < notice_pos, "{triage_items:?}");
+
+    // 5. Updating `memory.md` refreshes `AGENTS.md` automatically in the background while idle
+    //    (outside `follow_up_secs`), and internal `<agent_dir>/mcp/...` `read_file` calls do NOT
+    //    trip `max_tool_calls = 1`!
+    let agents_md_path = h.dir.join("state/workspace/AGENTS.md");
+    assert!(
+        std::fs::read_to_string(&agents_md_path)
+            .unwrap()
+            .contains("Memory v1: likes espresso")
+    );
+    let patched_script = script
+        .replace(
+            "__AGENT_MCP_1__",
+            &h.dir
+                .join("state/agy/antigravity-cli/mcp/slack/conversations_history.json")
+                .to_string_lossy(),
+        )
+        .replace(
+            "__AGENT_MCP_2__",
+            &h.dir
+                .join("state/agy/antigravity-cli/mcp/google-workspace/list_events.json")
+                .to_string_lossy(),
+        );
+    std::fs::write(h.dir.join("script.json"), patched_script).unwrap();
+    std::fs::write(&mem_path, "Memory v2: prefers filter coffee").unwrap();
+    h.eventually("idle memory auto-reload", || {
+        std::fs::read_to_string(&agents_md_path)
+            .unwrap_or_default()
+            .contains("Memory v2: prefers filter coffee")
+    })
+    .await;
+    // Wait for the recycled warm spare session (`new mock-1` count >= 2) before asking.
+    h.eventually("recycled warm spare", || h.log_count("new mock-1") >= 2)
+        .await;
+    let (_, mut mc) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "lazy_mcp_reads".to_string(),
+            wait: true,
+            new: true,
+            profile: Some("fast".to_string()),
+            background: false,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Voice,
+        },
+    )
+    .await
+    .unwrap();
+    let mcp_reply = mc.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert_eq!(answer(&mcp_reply), "within budget");
+
+    h.stop().await;
+    let _ = std::fs::remove_dir_all(&tmp_mem_dir);
+}

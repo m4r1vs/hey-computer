@@ -9,14 +9,17 @@ immediate payoff and lowest risk through core harness primitives to multi-mode
 and reactive messaging. Implemented items are collected under [Done](#done) with
 their commit.
 
-## The gap: it is a voice Q&A tool, not yet a delegation tool
+## From voice Q&A to a personal delegation harness
 
-Today hey-computer handles one request at a time, a new `ask` supersedes the
-running one, and the result exists only as a notification or a file in
-`$XDG_RUNTIME_DIR`. That is right for "Hey Computer, …" but limits handing it
-longer tasks. Phase 1–2 items make everyday use smoother; Phase 3 turns it into
-a delegation harness; Phases 4–6 build integrations, richer output UX,
-multi-mode isolation, and reactive messaging on top.
+Originally hey-computer handled one request at a time, a new `ask` superseded
+the running one, and the result lived only as a notification or a file in
+`$XDG_RUNTIME_DIR`. Phases 1–4 have closed that core gap: persistent SQLite WAL
++ FTS5 history (`history.db`), multi-lane background tasks, local recall, MCP
+passthrough with lazy schema loading, ambient CWD/`tmux` context, an
+agent-authored hybrid scheduler, 3-tier smart routing, turn-budget awareness,
+and host skills/MCP integrations are all in place. Phases 5–6 build a dedicated
+interactive viewer, periodic memory/skill distillation, spoken answers,
+multi-mode daemon isolation, and reactive notification/messenger bridges on top.
 
 **Triage & trust policy:** Items below are tagged `[Important]` or
 `[Lower priority]`, along with where the change lives (`[Config]` for the
@@ -116,10 +119,16 @@ tooling are mature.
     everything the agent can reach: MCP servers, skills, instructions, vault,
     accounts and model.
     - **Work:** the employer's Linear (official MCP with read/write access,
-      already wired via `mcp_oauth_tokens_file`), GitLab, Slack and Google
-      Calendar.
-    - **Personal:** personal Gmail and Google Calendar, private GitHub projects
-      (`gh`), WhatsApp, Signal.
+      already wired via `mcp_oauth_tokens_file`), GitLab, Slack (including
+      read-only forwarded work email) and Google Calendar / Drive.
+    - **Personal:** personal Gmail, Google Calendar, Contacts, Drive and Tasks,
+      private GitHub projects (`gh`), WhatsApp, Signal.
+
+    *(Interim single-daemon mitigations already in place in the consuming
+    configuration: `open-browser work|personal`, multi-account
+    `google-workspace` OAuth with `google-workspace-auth <email> [work|personal]`,
+    and prompt-level separation routing work mail via Slack DM while keeping
+    Gmail and Google Tasks on the personal account.)*
 
     The simplest clean design is one daemon instance per mode (a systemd
     template unit, `hey-computer@work` / `hey-computer@personal`), each with its
@@ -241,13 +250,31 @@ tooling are mature.
 
 ## Done
 
-- `[Important]` `[Config]` `[Done: NixConfig 89ccf19]` **Google Calendar & Gmail
-  MCP (#20, #21).** Packaged `taylorwilsdon/google_workspace_mcp` (`v1.30.1`,
-  MIT) in `nixpkgs.nix` and wired `programs.configured.hey-computer.googleWorkspace`
-  exclusively into `hey-computer.nix` (`--transport stdio --single-user
-  --tool-tier extended --tools gmail calendar`, keeping OAuth credentials in a
-  `0700` state dir outside `/nix/store`, model context, and the global coding-CLI
-  `mcp.nix` set).
+- `[Important]` `[Upstream + Config]` `[Done: 21b5e80, NixConfig 6a1c4c3]`
+  **System & per-turn budget awareness + raised `deep` budget (#9, #13, #15,
+  #25).** Added `## Turn budgets` to generated `AGENTS.md` (documenting default
+  and per-profile tool-call and wall-clock caps and instructing the model to
+  batch lookups and wrap up cleanly before hitting hard cutoffs), prepended an
+  authoritative `<budget>` block (`profile`, `max_tool_calls`,
+  `time_limit_secs`) per turn, and raised `profiles.deep` in the consuming
+  configuration to `max_tool_calls = 200` and `max_turn_secs = 900` to
+  accommodate lazy MCP schema lookups alongside multi-service tool runs.
+- `[Important]` `[Upstream + Config]` `[Done: c03bb60, NixConfig 89ccf19, 9b2fec0, dbe9d5f, 44752fb, 6a1c4c3, 84c5631]`
+  **Google Workspace MCP (Gmail, Calendar, Contacts, Drive, Tasks), stdio OAuth
+  hardening, & Slack work-mail routing (#20, #21).** Packaged
+  `taylorwilsdon/google_workspace_mcp` (`v1.30.1`, MIT) in `nixpkgs.nix` and
+  wired `programs.configured.hey-computer.googleWorkspace` exclusively into
+  `hey-computer.nix` (`--transport stdio --single-user --tool-tier complete
+  --tools gmail calendar contacts drive tasks`, plus `disabledTools` and
+  `permissions` options, keeping OAuth credentials in a `0700` state dir outside
+  `/nix/store`, model context, and the global coding-CLI `mcp.nix` set). Added a
+  standalone `google-workspace-auth` helper (`--status` and profile-aware OAuth
+  scope upgrades), isolated stdio MCP OAuth browser launches from JSON-RPC
+  stdout via `<agent_dir>/mcp-browser` (`BROWSER` wrapper in `c03bb60`) and
+  `_open_browser_stdio_safe` (`NixConfig 44752fb`), routed dated/timed reminders
+  to personal Google Tasks (`NixConfig 6deffe2, 84c5631`), and routed forwarded
+  work email via read-only Slack DM attachments rather than empty Workspace
+  Gmail (`NixConfig 6a1c4c3`).
 - `[Important]` `[Config]` `[Done: NixConfig 89ccf19]` **Context7 MCP (`deep`),
   `yt-dlp` / `gh` CLI skills, & built-in `agy` `/browser` (#22).** Wired
   `pkgs.context7-mcp` (`programs.configured.mcp.context7`, excluded from
@@ -275,13 +302,13 @@ tooling are mature.
   `MEMORY: <used> / <max> chars (<pct>%)` capacity header in `AGENTS.md`, and
   automatic SQLite/FTS5 maintenance (`turns_fts('optimize')`, `PRAGMA optimize`,
   `PRAGMA incremental_vacuum(256)`) on start, every 100 turns, and shutdown.
-- `[Important]` `[Config]` `[Done: NixConfig 89ccf19]` **Shell-gated proactive
-  timers & split failure routing (#26).** Added `hey-computer-proactive`
-  (`location`, `morning-digest`, `pre-daily`) and gated systemd user timers
-  (`programs.configured.hey-computer.proactive.enable`), keeping clean no-ops
-  silent via `--suppress-token HEARTBEAT_OK` while routing hard errors to
-  `$XDG_STATE_HOME/hey-computer/proactive/failures.log` + a 4-hour rate-limited
-  alert notification.
+- `[Important]` `[Config]` `[Done: NixConfig 89ccf19, 6a1c4c3]` **Shell-gated
+  proactive timers & split failure routing (#26).** Added
+  `hey-computer-proactive` (`location`, `morning-digest`, `pre-daily`) and gated
+  systemd user timers (`programs.configured.hey-computer.proactive.enable`),
+  keeping clean no-ops silent via `--suppress-token HEARTBEAT_OK` while routing
+  hard errors to `$XDG_STATE_HOME/hey-computer/proactive/failures.log` + a
+  4-hour rate-limited alert notification.
 - `[Important]` `[Upstream]` `[Done: cfd2f5e]` **Agent-authored hybrid
   scheduler (#27).** Bumped `history.db` to schema v2 (`schedules` table +
   in-place `v1 -> v2` migration), added `[scheduler]` and `src/scheduler.rs`
@@ -305,12 +332,14 @@ tooling are mature.
   replaced the hardcoded *"which would become root"* message with a generic
   deny-list refusal, scoped `acp::tool_command()` to shell execution calls, and
   added outbound trace redaction for attachment/MCP payloads.
-- `[Important]` `[Upstream]` `[Done: f359999]` **Model and effort profiles
-  (`--profile`) (#15).** Added `[profiles.<name>]` (`model`, `thought_level`,
-  `max_turn_secs`, `max_tool_calls`, `mcp_servers`) and `ask -p/--profile`,
-  follow-up profile inheritance, in-place mid-conversation
-  `session/set_config_option` switching (verified live on `agy` 1.5.13), warm
-  spare preservation for non-default profiles, and profile-tagged progress and
+- `[Important]` `[Upstream + Config]` `[Done: f359999, 4e1daa6, NixConfig 4ece432, fc0fdab]`
+  **Model and effort profiles (`--profile`) (#15).** Added `[profiles.<name>]`
+  (`model`, `thought_level`, `inactivity_timeout_secs`, `max_turn_secs`,
+  `max_tool_calls`, `max_repeat_tool_calls`, `thinking_label`, `mcp_servers`)
+  and `ask -p/--profile`, follow-up profile inheritance, in-place
+  mid-conversation `session/set_config_option` switching (verified live on `agy`
+  1.5.13), warm spare preservation for matching profiles, and profile-tagged
+  progress (including custom `thinking_label` such as `"Pondering Hard…"`) and
   answer notifications.
 - `[Important]` `[Upstream]` `[Done: 22cc456]` **Attachments (`ask --file`,
   `ask --image`) (#16).** Added `src/attachments.rs` (zero extra deps: RFC 4648
@@ -334,23 +363,27 @@ tooling are mature.
   `<untrusted_recall>` framing) and the bundled `skills/recall/SKILL.md`
   enabled by default via `programs.hey-computer.recall.enable` in the Home
   Manager module.
-- `[Important]` `[Upstream]` `[Done: d0b7732, 815dbfb]` **MCP passthrough (#19).**
-  Added `src/mcp.rs`, `[mcp.<name>]` (`env_files` / `header_files` loaded at
-  prepare time so secrets stay out of `config.toml` and `/nix/store`),
-  `agent.mcp_oauth_tokens_file`, per-profile `mcp_servers` allowlists enforced
-  per turn by `LanePolicy`, and `programs.hey-computer.mcp.servers` in
-  `nix/home-manager.nix`. Writes enabled servers to
+- `[Important]` `[Upstream + Config]` `[Done: d0b7732, 2296f7b, 4e1daa6, 815dbfb, c03bb60, NixConfig 4ece432, fc0fdab, 71459c4]`
+  **MCP passthrough (#19).** Added `src/mcp.rs`, `[mcp.<name>]` (`env_files` /
+  `header_files` loaded at prepare time so secrets stay out of `config.toml` and
+  `/nix/store`), `agent.mcp_oauth_tokens_file`, `<agent_dir>/mcp-browser`
+  `BROWSER` isolation for stdio MCP servers, per-profile `mcp_servers`
+  allowlists enforced per turn by `LanePolicy`, and
+  `programs.hey-computer.mcp.servers` in `nix/home-manager.nix` (wiring
+  `nixos`, `linear`, `gitlab`, `slack`, `context7`, and `google-workspace` in
+  the consuming configuration). Writes enabled servers to
   `<agent_dir>/config/mcp_config.json` (mode `0600`) and passes `mcpServers: []`
   on `session/new` so `agy acp` 1.5.13 enables lazy `call_mcp_tool` loading
   without eagerly truncating large tool sets, while preserving conversations on
   mid-session profile switches across different `mcp_servers` allowlists.
-- `[Important]` `[Upstream]` `[Done: 3e3b6e1]` **Bounded, frozen-snapshot memory
-  and fail-loudly prompt rule (#8).** Added `instructions.memory_file` /
-  `instructions.memory_max_chars` (default `4000`, Home Manager `memory.file`
-  defaulting to `~/.config/hey-computer/memory.md`, rejected inside the vault or
-  via symlinks into the vault), loaded into `AGENTS.md` on agent start and kept
-  frozen for the life of the agent process, plus the explicit fail-loudly rule
-  in `BUILT_IN`.
+- `[Important]` `[Upstream + Config]` `[Done: 3e3b6e1, NixConfig 37637a5, 905d20c]`
+  **Bounded, frozen-snapshot memory and fail-loudly prompt rule (#8).** Added
+  `instructions.memory_file` / `instructions.memory_max_chars` (default `4000`,
+  Home Manager `memory.file` defaulting to `~/.config/hey-computer/memory.md`
+  and wired to an `agenix`-encrypted secret path in `NixConfig` when defined,
+  rejected inside the vault or via symlinks into the vault), loaded into
+  `AGENTS.md` on agent start and kept frozen for the life of the agent process,
+  plus the explicit fail-loudly rule in `BUILT_IN`.
 - `[Important]` `[Upstream]` `[Done: acedf5b]` **Hard step and wall-clock
   budgets (#9).** Added `agent.max_tool_calls` (default `20`, deduplicated by
   `toolCallId`, wire reason `limit_reached`) and `agent.max_turn_secs` (default
@@ -361,18 +394,18 @@ tooling are mature.
   summaries (never raw shell arguments) from `conductor.rs` through
   `Presentation::ProgressUpdate` with 400 ms trailing-edge throttling, burst
   coalescing, and `--replace-id` replacement in `Desktop`.
-- `[Important]` `[Upstream]` `[Done: bcf844e]` **Ambient desktop and time
-  context injection (#13).** Added opt-in `[context]` (`time`, `desktop`),
-  prepending a sanitized `<untrusted_desktop_context>` header with local
-  date/time/offset/weekday (`localtime_r`) and active Hyprland workspace/window
-  (with stale-signature and empty-workspace fallbacks) per user turn without
-  busting `AGENTS.md` caching, plus `debug context`.
+- `[Important]` `[Upstream + Config]` `[Done: bcf844e, NixConfig 11eddf5]`
+  **Ambient desktop and time context injection (#13).** Added opt-in `[context]`
+  (`time`, `desktop`), prepending a sanitized `<untrusted_desktop_context>`
+  header with local date/time/offset/weekday (`localtime_r`) and active Hyprland
+  workspace/window (with stale-signature and empty-workspace fallbacks) per user
+  turn without busting `AGENTS.md` caching, plus `debug context`.
 - `[Important]` `[Upstream]` `[Done: 199b2a9]` **Quick retrieval (`hey-computer
-  last`) (#14).** Persisted the last successful answer atomically to
-  `<state_dir>/last.json` (mode `0600`) in `src/store.rs`, added `hey-computer
-  last [--copy | --open]` with HTML-disarmed viewer launching and `wl-copy`-safe
-  `present.clipboard` handling (defaulting to `${pkgs.wl-clipboard}/bin/wl-copy`
-  in the Home Manager module).
+  last`) (#14).** Persisted the last successful answer atomically (originally to
+  `<state_dir>/last.json`, unified into `history.db` in `521caf5`), added
+  `hey-computer last [--copy | --open]` with HTML-disarmed viewer launching and
+  `wl-copy`-safe `present.clipboard` handling (defaulting to
+  `${pkgs.wl-clipboard}/bin/wl-copy` in the Home Manager module).
 - `[Important]` `[Config]` `[Done: NixConfig 8329b59, 4a0f1aa]` **Interactive
   agy sandbox disabled & `toolPermission = "always-proceed"` (intended).** Set
   `enableTerminalSandbox = false` (broken on NixOS with agy 1.5.13) and
@@ -380,33 +413,43 @@ tooling are mature.
   `antigravity-cli.nix` so commands, web requests, and MCP tools run without
   prompts unless matched by explicit `permissions.ask` or `permissions.deny`
   rules.
-- `[Important]` `[Config]` `[Done: NixConfig 8329b59]` **`instructions.extra`
-  and rebuild deny list.** Added metric/24h locale conventions,
-  `Journal/YYYY-MM-DD.md` daily-note format, default browser guidance,
+- `[Important]` `[Config]` `[Done: NixConfig 8329b59, 9e4d25e, 6deffe2]`
+  **`instructions.extra` and rebuild deny list.** Added tone/style and stack
+  preferences, metric/24h locale conventions, `Journal/YYYY-MM-DD.md` daily-note
+  and top-of-list task insertion rules, default browser guidance,
   speech-recognition proper-noun glossary, and off-limits rules (plus
   `nixos-rebuild`/`rebuild` in `permissions.deny`).
-- `[Important]` `[Config]` `[Done: NixConfig 8329b59]` **Generated
-  `desktop-scripts` skill.** Exposed `voice-command` (including `slack`,
-  `signal`, `spotify`) and host desktop scripts (`nightlight`, `powermode`,
-  `caffeinate`, `toggle-zen`, `netbird-vpn`, `darkman`, `spotify-like`,
-  `random-album-of-the-day`, `switch-kb-layout`, `open-linear-ticket`) via
-  `extraPackages` and a generated `desktop-scripts/SKILL.md` in `skills.extra`.
-- `[Important]` `[Config]` `[Done: NixConfig 8329b59, f92c640]` **Typed front
-  end & cancel keybind.** Added minimalist `rofi-ask` `-modi` prompt
-  (`SUPER + a`, matching `rofi-calculator`'s single-bar layout with dynamic
-  follow-up placeholder and `! ` / `/new ` prefix for `--new`) and cancel bind
-  (`SUPER + CTRL + a`).
+- `[Important]` `[Upstream + Config]` `[Done: NixConfig 8329b59, 80e2cce, 37637a5, 905d20c]`
+  **Generated `desktop-scripts`, Philips Hue (`openhue` + `home-lights`), &
+  public `transit` skills.** Exposed `voice-command` (including `slack`,
+  `signal`, `spotify`), `open-browser` (work/personal profiles in transient
+  scopes), and host desktop scripts (`nightlight`, `powermode`, `caffeinate`,
+  `toggle-zen`, `netbird-vpn`, `darkman`, `spotify-like`,
+  `random-album-of-the-day`, `switch-kb-layout`, `open-linear-ticket`,
+  `connect-galaxy-buds`, `GalaxyBudsClient`, `gcalcli`) via `extraPackages` and
+  `desktop-scripts/SKILL.md`; added bundled `openhue` + host `hue-lights` /
+  `home-lights` skills for Philips Hue smart scenes and room aliases; and added
+  a live HVV / Deutsche Bahn `transit` CLI + `transit/SKILL.md`.
+- `[Important]` `[Config]` `[Done: NixConfig 8329b59, f92c640, f2940c2, 4ece432, fc0fdab]`
+  **Typed front end & cancel keybind.** Added minimalist `rofi-ask` `-modi`
+  prompt (`SUPER + a`, matching `rofi-calculator`'s single-bar layout with
+  dynamic follow-up/background-count placeholder and composable `! ` / `/new `,
+  `/deep ` / `/d `, `/fast `, and `/bg ` / `/task ` prefixes) and cancel bind
+  (`SUPER + CTRL + a`), standardized on `"Ask Computer"` UI labels.
 - `[Important]` `[Config]` `[Done: NixConfig 8329b59, f92c640]` **Unified
   desktop context (`desktop-context`).** Replaced the separate "Ask about"
   shortcut/menu with a `desktop-context` CLI & skill (`selection`, `clipboard`
   text/image, frozen region/window/screen `capture` piped into `agy` via
   `read_file`, `copy`, and `paste`) usable directly from `SUPER + v`,
   `SUPER + ALT + v`, and `SUPER + a`.
-- `[Important]` `[Config]` `[Done: NixConfig 8329b59]` **Waybar status
-  indicator.** Added `custom/hey-computer` (`waybar-hey-computer`, 1 s poll +
-  `SIGRTMIN+12`), hidden at idle and showing thinking (`running_secs`),
-  follow-up countdown, starting, and down states; click cancels when thinking
-  or opens `rofi-ask` during follow-up.
+- `[Important]` `[Config]` `[Done: NixConfig 8329b59, 4ece432]` **Waybar status
+  indicator.** Added `custom/hey-computer` (`waybar-hey-computer watch` with
+  `SIGUSR1` wakeups, replacing `custom/os-logo` on `hey-computer` hosts): shows
+  the NixOS logo at idle (preserving left-click search and right-click power
+  menu), an animated robot spinner while thinking (with active profile in the
+  tooltip; click cancels), a robot-chat icon during the follow-up window (click
+  opens `rofi-ask`), and a steady robot icon with task counts while background
+  tasks are running or queued.
 - `[Important]` `[npu-dictate + Config]` `[Done: NixConfig 8329b59, npu-dictate]`
   **Direct push-to-talk key.** Added `start --to RULE` / `toggle --to RULE` and
   `kind = "direct"` in `npu-dictate` (bypassing phrase matching and live

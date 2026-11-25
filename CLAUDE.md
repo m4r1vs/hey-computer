@@ -74,18 +74,22 @@ One binary. `daemon` owns the socket; every other subcommand is a client.
   permission requests in `policy.rs`.
 - `environment`: the agent's private `--gemini-dir` (settings.json, linked skills),
   the `0700` `artifacts/` scratch dir (age-pruned alongside `history_days`), and the
-  workspace with the generated `AGENTS.md` (including live `MEMORY: <used> / <max>`
-  capacity header). Rewritten before every agent start.
+  workspace with the generated `AGENTS.md` (including `## Turn budgets` and live
+  `MEMORY: <used> / <max>` capacity header across `memory_file` + `memory_files`,
+  automatically refreshed when idle outside follow-up windows if memory files change).
+  Rewritten before every agent start.
 - `context`: opt-in per-turn ambient time (`localtime_r`), Hyprland active
-  window/workspace, focused terminal/editor `/proc` CWD, and Ghostty/terminal
-  `tmux` session/window/pane metadata prepended inside `<untrusted_desktop_context>`.
+  window/workspace, focused terminal/editor `/proc` CWD, and focus-aware Ghostty/terminal
+  `tmux` session/window/pane metadata prepended inside `<untrusted_desktop_context>`,
+  plus authoritative per-turn `<budget>` headers.
 - `store`: private `0600` SQLite WAL + FTS5 database at
-  `<state_dir>/history.db` (schema v2 with `turns` + `schedules`,
-  `PRAGMA secure_delete = ON`, automatic FTS5/SQLite `maintain_connection`,
-  dedicated `hc-store` actor thread with `wal_checkpoint(TRUNCATE)` on shutdown,
-  crash recovery, monotonic ID seeding from `sqlite_sequence`, legacy `last.json`
-  migration, safe FTS5 query sanitizer + BM25/recency ranking, `<untrusted_recall>`
-  formatter) backing `last`, `tasks`, `recall`, and `schedule`.
+  `<state_dir>/history.db` (schema v3 with `turns` + `schedules` including
+  declarative `managed` jobs, `PRAGMA secure_delete = ON`, automatic FTS5/SQLite
+  `maintain_connection`, dedicated `hc-store` actor thread with
+  `wal_checkpoint(TRUNCATE)` on shutdown, crash recovery, monotonic ID seeding
+  from `sqlite_sequence`, legacy `last.json` migration, safe FTS5 query sanitizer
+  + BM25/recency ranking, `<untrusted_recall>` formatter) backing `last`,
+  `tasks`, `recall`, and `schedule`.
 - `scheduler`: SQLite-backed hybrid job scheduler (`[scheduler]`, `hey-computer schedule`)
   with local-time human/cron specs, `--script` pre-collectors (0 tokens on empty stdout),
   `--no-agent` timed notifications, `Policy::denied_word` validation, and split

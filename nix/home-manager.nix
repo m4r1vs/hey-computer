@@ -60,6 +60,7 @@
     libnotify
     playerctl
     wireplumber
+    xdg-utils
   ];
 
   agentPath = lib.concatStringsSep ":" (
@@ -102,8 +103,14 @@
       else {};
   in {
     inline = lib.filterAttrs (_: v: builtins.isString v) entries;
-    files = lib.mapAttrs (_: v: v.file) (
-      lib.filterAttrs (_: v: builtins.isAttrs v && v ? file && builtins.isString v.file) entries
+    files = lib.mapAttrs (_: v: toString v.file) (
+      lib.filterAttrs (
+        _: v:
+          builtins.isAttrs v
+          && v ? file
+          && (builtins.isString v.file || builtins.isPath v.file)
+      )
+      entries
     );
   };
 
@@ -258,16 +265,31 @@ in {
       '';
     };
 
-    memory.file = mkOption {
-      type = types.nullOr types.str;
-      default = "${config.xdg.configHome}/hey-computer/memory.md";
-      defaultText = literalExpression ''"''${config.xdg.configHome}/hey-computer/memory.md"'';
-      description = ''
-        Optional user-owned Markdown memory file loaded into `AGENTS.md` when
-        the agent starts and kept frozen until the next agent start. Sets
-        `instructions.memory_file`. A missing or empty file is ignored; null
-        disables memory loading. Keep this file outside the vault.
-      '';
+    memory = {
+      file = mkOption {
+        type = types.nullOr types.str;
+        default = "${config.xdg.configHome}/hey-computer/memory.md";
+        defaultText = literalExpression ''"''${config.xdg.configHome}/hey-computer/memory.md"'';
+        description = ''
+          Optional user-owned Markdown memory file loaded into `AGENTS.md` when
+          the agent starts (and refreshed automatically once idle outside active
+          conversations if edited on disk). Sets `instructions.memory_file`. A
+          missing or empty file is ignored; null disables memory loading. Keep
+          this file outside the vault.
+        '';
+      };
+
+      extraFiles = mkOption {
+        type = types.listOf (types.either types.path types.str);
+        default = [];
+        example = literalExpression ''["''${config.xdg.stateHome}/hey-computer/memory.md"]'';
+        description = ''
+          Additional Markdown memory files (outside the vault) appended after
+          {option}`memory.file` within `instructions.memory_max_chars` — for
+          example pairing a read-only `agenix` bootstrap file with a mutable
+          state-directory memory file. Sets `instructions.memory_files`.
+        '';
+      };
     };
 
     obsidian = {
@@ -415,7 +437,7 @@ in {
 
       command = mkOption {
         type = types.listOf types.str;
-        default = [
+        default = lib.optionals (cfg.viewer.package != null) [
           "${pkgs.coreutils}/bin/env"
           # Marker is a unique GApplication: with a session bus, a second
           # answer would land in the first window as an editor tab. Without
@@ -453,10 +475,11 @@ in {
 
     programs.hey-computer.settings = {
       agent.mcp_oauth_tokens_file = mkIf (cfg.mcp.oauthTokensFile != null) (mkDefault cfg.mcp.oauthTokensFile);
-      mcp = mkIf (translatedMcpServers != {}) (mkDefault translatedMcpServers);
+      mcp = mkIf (translatedMcpServers != {}) (lib.mapAttrs (_: mkDefault) translatedMcpServers);
       instructions = {
         vault = mkIf (cfg.vault != null) (mkDefault cfg.vault);
         memory_file = mkIf (cfg.memory.file != null) (mkDefault cfg.memory.file);
+        memory_files = mkIf (cfg.memory.extraFiles != []) (mkDefault (map toString cfg.memory.extraFiles));
         skills = mkIf (skillDirs != []) skillDirs;
       };
       present = {

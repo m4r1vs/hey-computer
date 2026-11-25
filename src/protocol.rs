@@ -11,9 +11,13 @@
 //!   only the writing side (as `socat` and `nc -N` do at the end of input):
 //!   a waiting client keeps its side open until the answer arrives.
 //! - `"new": true` on an ask starts a fresh conversation.
-//! - `{"type":"cancel"}` → `{"type":"cancelled","id":1}` (`null` when nothing
-//!   was running).
+//! - `{"type":"cancel"}` (or `{"type":"cancel","id":7}`) →
+//!   `{"type":"cancelled","id":1}` (`null` when nothing matched).
 //! - `{"type":"status"}` → `{"type":"status",…}`.
+//! - `{"type":"schedule_reload"}` → `{"type":"ok","message":"…"}` (wakes the
+//!   daemon scheduler after a CLI schedule edit).
+//! - `{"type":"schedule_run","target":"…"}` → `{"type":"ok","message":"…"}`
+//!   (triggers an immediate test run of a scheduled job).
 //!
 //! A line the daemon cannot use gets `{"type":"error","message":"…"}`.
 

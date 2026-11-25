@@ -38,7 +38,7 @@ const WRAPPERS: &[&str] = &[
 /// for the command.
 fn takes_value(wrapper: &str, option: &str) -> bool {
     let options: &[&str] = match wrapper {
-        "env" => &["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
+        "env" => &["-u", "--unset", "-C", "--chdir"],
         "timeout" => &["-s", "--signal", "-k", "--kill-after"],
         "nice" => &["-n", "--adjustment"],
         "ionice" => &["-c", "--class", "-n", "--classdata", "-p", "--pid"],
@@ -140,6 +140,9 @@ pub struct LanePolicy {
     /// Optional per-turn allowlist of MCP server names (`None` allows all
     /// configured servers when `allow_mcp` is true).
     pub allowed_mcp_servers: Option<Vec<String>>,
+    /// Configured MCP server names, used to disambiguate `mcp_<server>_<tool>`
+    /// prefixes when server names themselves contain underscores.
+    pub known_mcp_servers: Vec<String>,
 }
 
 impl LanePolicy {
@@ -149,6 +152,7 @@ impl LanePolicy {
             deny_tool_kinds: Vec::new(),
             allow_mcp: true,
             allowed_mcp_servers: None,
+            known_mcp_servers: Vec::new(),
         }
     }
 
@@ -162,6 +166,7 @@ impl LanePolicy {
                 .to_vec(),
             allow_mcp: false,
             allowed_mcp_servers: None,
+            known_mcp_servers: Vec::new(),
         }
     }
 
@@ -170,6 +175,13 @@ impl LanePolicy {
         let mut copy = self.clone();
         copy.allowed_mcp_servers = allowed;
         copy
+    }
+
+    /// Attach the full set of configured MCP server names for longest-prefix
+    /// disambiguation on eager `mcp_<server>_<tool>` tool names.
+    pub fn with_known_mcp_servers(mut self, known: Vec<String>) -> Self {
+        self.known_mcp_servers = known;
+        self
     }
 
     pub fn evaluate_permission(&self, params: &serde_json::Value) -> PermissionDecision {
@@ -188,16 +200,17 @@ impl LanePolicy {
 
     fn evaluate_tool_call(&self, tool_call: &serde_json::Value) -> PermissionDecision {
         let name = tool_call.get("name").and_then(serde_json::Value::as_str);
-        // Handle MCP tool calls before `deny_tool_kinds` / shell deny-list
-        // checks because `agy` sends lazy `call_mcp_tool` calls with
-        // `kind: "execute"`.
-        if name == Some("call_mcp_tool") {
+        // Handle lazy MCP dispatch tools (`call_mcp_tool`, `list_resources`,
+        // `read_resource`) before `deny_tool_kinds` / shell deny-list checks.
+        if crate::acp::is_lazy_mcp_tool(name) {
             let server = crate::acp::mcp_server_name(tool_call);
             let tool = crate::acp::mcp_tool_name(tool_call);
+            let fallback = name.unwrap_or("call_mcp_tool");
             let detail = match (&server, &tool) {
                 (Some(s), Some(t)) => format!("mcp:{s}/{t}"),
-                (Some(s), None) => format!("mcp:{s}"),
-                _ => "call_mcp_tool".to_string(),
+                (Some(s), None) if fallback == "call_mcp_tool" => format!("mcp:{s}"),
+                (Some(s), None) => format!("mcp:{s}/{fallback}"),
+                _ => fallback.to_string(),
             };
             if !self.allow_mcp {
                 return PermissionDecision::Deny {
@@ -224,15 +237,25 @@ impl LanePolicy {
                     detail: mcp_name.to_string(),
                 };
             }
-            if let Some(allowed) = &self.allowed_mcp_servers
-                && !allowed
-                    .iter()
-                    .any(|s| mcp_name.starts_with(&format!("mcp_{s}_")))
-            {
-                return PermissionDecision::Deny {
-                    tag: "mcp".to_string(),
-                    detail: mcp_name.to_string(),
+            if let Some(allowed) = &self.allowed_mcp_servers {
+                let is_allowed = if !self.known_mcp_servers.is_empty() {
+                    let matched_server = self
+                        .known_mcp_servers
+                        .iter()
+                        .filter(|s| mcp_name.starts_with(&format!("mcp_{s}_")))
+                        .max_by_key(|s| s.len());
+                    matched_server.is_some_and(|srv| allowed.iter().any(|a| a == srv))
+                } else {
+                    allowed
+                        .iter()
+                        .any(|s| mcp_name.starts_with(&format!("mcp_{s}_")))
                 };
+                if !is_allowed {
+                    return PermissionDecision::Deny {
+                        tag: "mcp".to_string(),
+                        detail: mcp_name.to_string(),
+                    };
+                }
             }
             return PermissionDecision::Allow;
         }
@@ -301,6 +324,23 @@ pub fn command_words(line: &str, depth: usize) -> Vec<String> {
                 if words[i] == "--" {
                     i += 1;
                     break;
+                }
+                if name == "env" {
+                    if words[i] == "-S" || words[i] == "--split-string" {
+                        if let Some(split_arg) = words.get(i + 1) {
+                            found.extend(command_words(split_arg, depth + 1));
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if let Some(rest) = words[i]
+                        .strip_prefix("--split-string=")
+                        .or_else(|| words[i].strip_prefix("-S").filter(|r| !r.is_empty()))
+                    {
+                        found.extend(command_words(rest, depth + 1));
+                        i += 1;
+                        continue;
+                    }
                 }
                 if takes_value(&name, &words[i]) {
                     i += 1;
@@ -672,7 +712,17 @@ fn split_commands(line: &str) -> Vec<String> {
                     current.push_str(&line[pos..next]);
                     pos = next;
                 }
-                b';' | b'&' | b'|' | b'\n' | b'(' | b')' | b'{' | b'}' | b'`' => {
+                b'$' if bytes.get(pos + 1) == Some(&b'(') => {
+                    let (_, next) = scan_command_sub(line, pos + 2);
+                    current.push_str(&line[pos..next]);
+                    pos = next;
+                }
+                b'`' => {
+                    let (_, next) = scan_backtick(line, pos + 1, false);
+                    current.push_str(&line[pos..next]);
+                    pos = next;
+                }
+                b';' | b'&' | b'|' | b'\n' | b'(' | b')' | b'{' | b'}' => {
                     segments.push(std::mem::take(&mut current));
                     pos += 1;
                 }
@@ -1095,5 +1145,64 @@ mod tests {
                 PermissionDecision::Allow
             );
         }
+
+        // Lazy MCP resource reads (`list_resources`, `read_resource`) are gated
+        // both in restricted lanes and by per-profile `mcp_servers`.
+        for res_tool in ["list_resources", "read_resource"] {
+            assert!(matches!(
+                restricted.evaluate_permission(&json!({"toolCall": {
+                    "kind": "read",
+                    "name": res_tool,
+                    "rawInput": {"ServerName": "nixos"}
+                }})),
+                PermissionDecision::Deny { ref tag, .. } if tag == "mcp"
+            ));
+            assert_eq!(
+                scoped.evaluate_permission(&json!({"toolCall": {
+                    "kind": "read",
+                    "name": res_tool,
+                    "rawInput": {"ServerName": "nixos"}
+                }})),
+                PermissionDecision::Allow
+            );
+            assert!(matches!(
+                scoped.evaluate_permission(&json!({"toolCall": {
+                    "kind": "read",
+                    "name": res_tool,
+                    "rawInput": {"ServerName": "slack"}
+                }})),
+                PermissionDecision::Deny { ref tag, .. } if tag == "mcp"
+            ));
+        }
+
+        // Longest-prefix disambiguation prevents `git` from allowing `git_admin`.
+        let known = std_lane
+            .with_known_mcp_servers(vec!["git".to_string(), "git_admin".to_string()])
+            .with_mcp_servers(Some(vec!["git".to_string()]));
+        assert_eq!(
+            known.evaluate_permission(&json!({
+                "toolCall": {"kind": "other", "name": "mcp_git_status"}
+            })),
+            PermissionDecision::Allow
+        );
+        assert!(matches!(
+            known.evaluate_permission(&json!({
+                "toolCall": {"kind": "other", "name": "mcp_git_admin_drop"}
+            })),
+            PermissionDecision::Deny { ref tag, .. } if tag == "mcp"
+        ));
+
+        // `env -S` / `--split-string` inner commands are checked, and arguments
+        // after unquoted substitutions are not misparsed as command words.
+        let p = Policy::new(&["sudo".to_string()]);
+        assert_eq!(p.denied_word("env -S 'sudo id'").as_deref(), Some("sudo"));
+        assert_eq!(p.denied_word("env -S sudo id").as_deref(), Some("sudo"));
+        assert_eq!(
+            p.denied_word("env --split-string='sudo id'").as_deref(),
+            Some("sudo")
+        );
+        assert_eq!(p.denied_word("echo $(date) sudo"), None);
+        assert_eq!(p.denied_word("echo `date` sudo"), None);
+        assert_eq!(p.denied_word("echo $(sudo id)").as_deref(), Some("sudo"));
     }
 }

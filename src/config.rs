@@ -202,6 +202,10 @@ pub struct Agent {
     /// an interactive `agy` install) symlinked into `<agent_dir>/antigravity-cli/`
     /// before agent start so OAuth-authenticated remote MCP servers share tokens.
     pub mcp_oauth_tokens_file: PathBuf,
+    /// Optional default MCP server allowlist for `[agent]` (`default` profile).
+    /// `None` allows all enabled `[mcp.*]` servers; `Some([])` allows none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Vec<String>>,
     /// Merged over the agent's `settings.json` that the daemon writes.
     pub settings: toml::Table,
 }
@@ -250,6 +254,9 @@ pub struct Scheduler {
     pub script_timeout_secs: f64,
     /// Maximum number of scheduled jobs stored in `history.db`.
     pub max_jobs: usize,
+    /// Declarative jobs reconciled into `history.db` (`managed = 1`) on daemon start.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub jobs: BTreeMap<String, ScheduledJobConfig>,
 }
 
 impl Default for Scheduler {
@@ -259,6 +266,45 @@ impl Default for Scheduler {
             min_interval_secs: 60.0,
             script_timeout_secs: 30.0,
             max_jobs: 128,
+            jobs: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Declarative scheduled job under `[scheduler.jobs.<name>]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScheduledJobConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub schedule: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub script: String,
+    pub no_agent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppress_token: Option<String>,
+    pub failure_deliver: crate::store::FailureDeliver,
+}
+
+impl Default for ScheduledJobConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            schedule: String::new(),
+            prompt: String::new(),
+            profile: String::new(),
+            script: String::new(),
+            no_agent: false,
+            suppress_token: None,
+            failure_deliver: crate::store::FailureDeliver::Notify,
         }
     }
 }
@@ -327,10 +373,14 @@ pub struct Instructions {
     /// directory with a `SKILL.md`) or a directory of such skills.
     pub skills: Vec<PathBuf>,
     /// Optional user-owned Markdown memory file (absolute path), loaded into
-    /// `AGENTS.md` before each agent start and frozen until the next start.
-    /// Empty disables memory loading; a missing or empty file is ignored.
+    /// `AGENTS.md` before each agent start and refreshed when idle outside
+    /// active conversations. Empty disables; missing/empty files are ignored.
     pub memory_file: PathBuf,
-    /// Maximum number of characters loaded from `memory_file`.
+    /// Additional user-owned Markdown memory files (absolute paths, outside the
+    /// vault) appended after `memory_file` within the shared `memory_max_chars` cap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_files: Vec<PathBuf>,
+    /// Maximum number of characters loaded across configured memory files.
     pub memory_max_chars: usize,
 }
 
@@ -341,6 +391,7 @@ impl Default for Instructions {
             vault: PathBuf::new(),
             skills: Vec::new(),
             memory_file: PathBuf::new(),
+            memory_files: Vec::new(),
             memory_max_chars: DEFAULT_MEMORY_MAX_CHARS,
         }
     }
@@ -406,6 +457,7 @@ impl Default for Agent {
             restart_delay_secs: 1.0,
             history_days: 7.0,
             mcp_oauth_tokens_file: PathBuf::new(),
+            mcp_servers: None,
             settings: toml::Table::new(),
         }
     }
@@ -550,17 +602,35 @@ impl Config {
         {
             bail!("instructions.vault must be an absolute path");
         }
-        if !self.instructions.memory_file.as_os_str().is_empty() {
-            if !self.instructions.memory_file.is_absolute() {
-                bail!("instructions.memory_file must be an absolute path");
+        for (label, mem_path) in std::iter::once((
+            "instructions.memory_file".to_string(),
+            &self.instructions.memory_file,
+        ))
+        .filter(|(_, p)| !p.as_os_str().is_empty())
+        .chain(
+            self.instructions
+                .memory_files
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (format!("instructions.memory_files[{i}]"), p)),
+        ) {
+            if mem_path.as_os_str().is_empty() || !mem_path.is_absolute() {
+                bail!("{label} must be an absolute path");
             }
             if !self.instructions.vault.as_os_str().is_empty() {
-                let memory = normalize_lexical(&self.instructions.memory_file);
+                let memory = normalize_lexical(mem_path);
                 let vault = normalize_lexical(&self.instructions.vault);
                 if memory.starts_with(&vault) {
                     bail!(
-                        "instructions.memory_file must not be inside instructions.vault (the vault is untrusted data)"
+                        "{label} must not be inside instructions.vault (the vault is untrusted data)"
                     );
+                }
+            }
+        }
+        if let Some(servers) = &self.agent.mcp_servers {
+            for server in servers {
+                if !self.mcp.contains_key(server) {
+                    bail!("agent.mcp_servers references unknown MCP server `{server}`");
                 }
             }
         }
@@ -657,11 +727,7 @@ impl Config {
                         server.transport
                     );
                 }
-                let ok_url = server.url.starts_with("https://")
-                    || server.url.starts_with("http://127.0.0.1")
-                    || server.url.starts_with("http://localhost")
-                    || server.url.starts_with("http://[::1]");
-                if !ok_url {
+                if !is_allowed_mcp_url(&server.url) {
                     bail!(
                         "mcp.{name}.url must use https:// or loopback http:// (127.0.0.1, localhost, [::1])"
                     );
@@ -725,6 +791,49 @@ impl Config {
                 self.scheduler.max_jobs
             );
         }
+        if self.scheduler.jobs.len() > self.scheduler.max_jobs {
+            bail!(
+                "scheduler.jobs defines {} jobs, exceeding scheduler.max_jobs ({})",
+                self.scheduler.jobs.len(),
+                self.scheduler.max_jobs
+            );
+        }
+        for (name, job) in &self.scheduler.jobs {
+            if name.is_empty()
+                || name.len() > 64
+                || name.chars().all(|c| c.is_ascii_digit())
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            {
+                bail!(
+                    "scheduler.jobs.{name}: name must be 1..=64 ASCII letters, digits, '-' or '_' (not all digits)"
+                );
+            }
+            let parsed = crate::scheduler::ScheduleSpec::parse(&job.schedule)
+                .with_context(|| format!("scheduler.jobs.{name}.schedule"))?;
+            if matches!(parsed, crate::scheduler::ScheduleSpec::InSecs(_)) {
+                bail!("scheduler.jobs.{name}.schedule cannot use relative `in ...` in config.toml");
+            }
+            parsed
+                .check_min_interval(self.scheduler.min_interval_secs)
+                .with_context(|| format!("scheduler.jobs.{name}.schedule"))?;
+            if !job.profile.is_empty()
+                && let Err(msg) = self.resolve_profile(Some(&job.profile))
+            {
+                bail!("scheduler.jobs.{name}.profile: {msg}");
+            }
+            crate::scheduler::validate_script(&job.script, &self.permissions.deny)
+                .with_context(|| format!("scheduler.jobs.{name}.script"))?;
+            if job.prompt.trim().is_empty() && job.script.trim().is_empty() {
+                bail!("scheduler.jobs.{name}: set `prompt`, `script`, or both");
+            }
+            if let Some(tok) = &job.suppress_token
+                && tok.trim().is_empty()
+            {
+                bail!("scheduler.jobs.{name}.suppress_token must not be empty");
+            }
+        }
         if self.routing.enabled {
             if let Err(msg) = self.resolve_profile(Some(&self.routing.fast_profile)) {
                 bail!("routing.fast_profile: {msg}");
@@ -750,6 +859,19 @@ impl Config {
             .map(|(k, _)| k.clone())
             .collect();
         let Some(name) = name else {
+            let default_mcp = match &self.agent.mcp_servers {
+                None => all_enabled_mcp,
+                Some(list) => {
+                    let mut chosen: Vec<String> = list
+                        .iter()
+                        .filter(|s| self.mcp.get(*s).is_some_and(|m| m.enabled))
+                        .cloned()
+                        .collect();
+                    chosen.sort();
+                    chosen.dedup();
+                    chosen
+                }
+            };
             return Ok(ResolvedProfile {
                 name: None,
                 model: self.agent.model.clone(),
@@ -760,7 +882,7 @@ impl Config {
                     .then_some(self.agent.max_tool_calls),
                 max_repeat_tool_calls: (self.agent.max_repeat_tool_calls > 0)
                     .then_some(self.agent.max_repeat_tool_calls),
-                mcp_servers: all_enabled_mcp,
+                mcp_servers: default_mcp,
                 thinking_label: None,
             });
         };
@@ -844,6 +966,18 @@ pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+fn is_allowed_mcp_url(url: &str) -> bool {
+    if let Some(rest) = url.strip_prefix("https://") {
+        return !rest.is_empty() && !rest.starts_with('/');
+    }
+    for prefix in ["http://127.0.0.1", "http://localhost", "http://[::1]"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            return rest.is_empty() || matches!(rest.as_bytes()[0], b':' | b'/' | b'?' | b'#');
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1170,5 +1304,26 @@ mod tests {
                 .max_repeat_tool_calls,
             Some(4)
         );
+
+        for ok_url in [
+            "https://mcp.example.com/mcp",
+            "http://localhost",
+            "http://localhost:8080/mcp",
+            "http://127.0.0.1:3000",
+            "http://[::1]:9000/sse",
+        ] {
+            let cfg: Config = toml::from_str(&format!("[mcp.t]\nurl = {ok_url:?}\n")).unwrap();
+            cfg.validate().unwrap_or_else(|e| panic!("{ok_url}: {e}"));
+        }
+        for bad_url in [
+            "http://localhost.evil.example/mcp",
+            "http://127.0.0.1.nip.io/mcp",
+            "http://localhost@evil.example/mcp",
+            "https://",
+            "http://example.com/mcp",
+        ] {
+            let cfg: Config = toml::from_str(&format!("[mcp.t]\nurl = {bad_url:?}\n")).unwrap();
+            assert!(cfg.validate().is_err(), "{bad_url} should be rejected");
+        }
     }
 }

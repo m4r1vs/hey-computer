@@ -71,10 +71,14 @@ Inspect or manage them with `hey-computer tasks`.
 **Timeouts and budgets.** A request is cancelled if the agent sends nothing for
 45 s (`agent.inactivity_timeout_secs`). To stop runaway retry loops even while
 updates keep arriving, each turn also has generous hard caps of 300 s wall-clock
-time (`agent.max_turn_secs`), 20 distinct tool calls (`agent.max_tool_calls`),
-and a consecutive identical tool-call guard (`agent.max_repeat_tool_calls`,
-default 3); set any of them to 0 to disable it. Profiles can override
-`max_turn_secs`, `max_tool_calls`, and `max_repeat_tool_calls`.
+time (`agent.max_turn_secs`), 20 distinct tool calls (`agent.max_tool_calls`;
+internal `read_file` lookups on local MCP tool schemas do not count), and a
+consecutive identical tool-call guard (`agent.max_repeat_tool_calls`, default
+3); set any of them to 0 to disable it. Profiles can override
+`inactivity_timeout_secs`, `max_turn_secs`, `max_tool_calls`, and
+`max_repeat_tool_calls`. Generated `AGENTS.md` documents these limits and each
+turn carries an authoritative `<budget>` block when context or a named profile
+is active.
 
 **Agent-authored hybrid scheduler (`hey-computer schedule`).** Recurring and
 one-shot jobs live in `history.db` (`schedules` table) and run inside the daemon
@@ -251,6 +255,9 @@ new interactive request would still continue the current conversation;
 `background_running` and `background_queued` count active and waiting tasks in
 the background lane.
 
+**schedule_reload / schedule_run** `{"type":"schedule_reload"}` or
+`{"type":"schedule_run","target":"…"}` → `{"type":"ok","message":"…"}`.
+
 **Errors.** A line the daemon cannot use (not JSON, an unknown type or field,
 an empty ask, not UTF-8, longer than 256 KiB) gets
 `{"type":"error","message":"…"}`. Several clients may be connected at once
@@ -285,6 +292,7 @@ max_repeat_tool_calls = 3           # abort after N consecutive identical tool c
 restart_delay_secs = 1              # doubles with every failure in a row, up to 60 s
 history_days = 7                    # prune agy history and artifacts older than this at agent start; 0 = keep
 # mcp_oauth_tokens_file = "/home/alice/.gemini/antigravity-cli/mcp_oauth_tokens.json"
+# mcp_servers = ["nixos"]           # optional default allowlist for base [agent]
 
 [agent.settings]                    # merged over the generated agy settings.json
 # showTips = false
@@ -302,7 +310,8 @@ extra = ""                          # appended to the built-in instructions
 vault = ""                          # an Obsidian vault (absolute path), read and written freely
 skills = []                         # skill directories: one skill, or a directory of skills
 memory_file = ""                    # optional user-owned Markdown file (outside the vault), loaded at agent start
-memory_max_chars = 4000             # character cap for memory_file (1..=32768)
+memory_files = []                   # additional Markdown memory files appended after memory_file
+memory_max_chars = 4000             # character cap across memory files (1..=32768)
 
 [context]
 time = false                        # prepend local date, time, offset and weekday to each user turn
@@ -328,6 +337,11 @@ enabled = true                      # run the SQLite-backed hybrid scheduler loo
 min_interval_secs = 60              # minimum recurring interval allowed (seconds)
 script_timeout_secs = 30            # timeout for `--script` pre-collectors (seconds)
 max_jobs = 128                      # maximum scheduled jobs stored in history.db (1..=1024)
+# [scheduler.jobs.morning]          # declarative jobs reconciled into history.db on start
+# schedule = "daily 08:00"
+# script = "/path/to/precheck"
+# prompt = "Summarize updates."
+# suppress_token = "HEARTBEAT_OK"
 
 [routing]
 enabled = false                     # automatic profile/lane routing when -p/-b are omitted
@@ -348,6 +362,7 @@ suppressed_days = 7                 # prune suppressed heartbeat turns older tha
 # [profiles.deep]
 # model = "gemini-4-neon"
 # thought_level = "high"
+# inactivity_timeout_secs = 90
 # max_turn_secs = 600
 # max_tool_calls = 40
 # max_repeat_tool_calls = 3
@@ -448,6 +463,7 @@ told about Obsidian.
 | `systemPath` | the home profile, `/etc/profiles/per-user/$USER/bin`, `/run/current-system/sw/bin`, `/run/wrappers/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` | searched after the packages |
 | `vault` | null | sets `instructions.vault` |
 | `memory.file` | `"${config.xdg.configHome}/hey-computer/memory.md"` | sets `instructions.memory_file`; missing or empty files are ignored; null disables |
+| `memory.extraFiles` | `[]` | additional Markdown memory files appended after `memory.file` (`instructions.memory_files`) |
 | `obsidian.enable` | `vault != null` | the Obsidian skills and the `obsidian` shim |
 | `obsidian.package` | `pkgs.obsidian` (unfree) | whose `bin/obsidian-cli` the shim runs |
 | `openhue.enable` | false | puts `openhue` on the agent's PATH and links the bundled `openhue` skill |
@@ -466,10 +482,10 @@ told about Obsidian.
 
 **The service** is bound to `graphical-session.target` (`After`, `PartOf`,
 `WantedBy`), restarts on failure, and runs with `NoNewPrivileges=yes` and a
-`PATH` of: the `obsidian` shim (when enabled), `openhue` (when enabled), the
-agent package, `extraPackages`, a set of basics (bash, coreutils, findutils,
-diffutils, grep, sed, awk, procps, curl, jq, ripgrep, notify-send, playerctl,
-wpctl), then `systemPath`. It takes `DBUS_SESSION_BUS_ADDRESS`,
+`PATH` of: the `obsidian` shim (when enabled), `openhue` (when enabled), `tmux`
+(when enabled), the agent package, `hey-computer` itself, `extraPackages`, a set
+of basics (bash, coreutils, findutils, diffutils, grep, sed, awk, procps, curl,
+jq, ripgrep, notify-send, playerctl, wpctl, xdg-open), then `systemPath`. It takes `DBUS_SESSION_BUS_ADDRESS`,
 `WAYLAND_DISPLAY` and `HYPRLAND_INSTANCE_SIGNATURE` from the user manager's
 environment, as every graphical-session service does. agy needs the session bus
 for its login in the keyring.

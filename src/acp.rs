@@ -269,23 +269,7 @@ impl Connection {
 
         let tail = Arc::new(Mutex::new(String::new()));
         let stderr_tail = Arc::clone(&tail);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                tracing::debug!("agent stderr: {line}");
-                if let Ok(mut tail) = stderr_tail.lock() {
-                    tail.push_str(&line);
-                    tail.push('\n');
-                    if tail.len() > STDERR_TAIL {
-                        let cut = tail.len() - STDERR_TAIL;
-                        let cut = (cut..tail.len())
-                            .find(|&i| tail.is_char_boundary(i))
-                            .unwrap_or(tail.len());
-                        tail.drain(..cut);
-                    }
-                }
-            }
-        });
+        tokio::spawn(read_stderr_lossy(BufReader::new(stderr), stderr_tail));
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
@@ -364,6 +348,10 @@ impl Connection {
                 "still running, killed".to_string()
             }
         };
+        // Clean up any surviving stdio MCP children or backgrounded subprocesses
+        // in the agent's process group (while any member lives, the kernel holds
+        // the PGID so it cannot be reused).
+        self.kill_group(libc::SIGKILL);
         // The stderr reader may still be draining the last lines.
         tokio::time::sleep(Duration::from_millis(50)).await;
         let tail = last_lines(&self.stderr_tail(), 3);
@@ -408,6 +396,82 @@ impl Drop for Connection {
 fn last_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].join(" / ")
+}
+
+/// Drain the child's `stderr` until EOF without ever closing the pipe on
+/// non-UTF-8 bytes or buffering unbounded lines without `\n`.
+async fn read_stderr_lossy<R: tokio::io::AsyncBufRead + Unpin>(
+    mut reader: R,
+    stderr_tail: Arc<Mutex<String>>,
+) {
+    const MAX_STDERR_LINE: usize = STDERR_TAIL / 4;
+    let mut line = Vec::new();
+    let mut discarding = false;
+    loop {
+        let (consumed, done) = match reader.fill_buf().await {
+            Ok([]) => (0, true),
+            Ok(buf) => {
+                if let Some(nl) = buf.iter().position(|&b| b == b'\n' || b == b'\r') {
+                    let slice = &buf[..nl];
+                    if !discarding {
+                        let room = MAX_STDERR_LINE.saturating_sub(line.len());
+                        line.extend_from_slice(&slice[..slice.len().min(room)]);
+                    }
+                    if !line.is_empty() {
+                        let text = String::from_utf8_lossy(&line);
+                        tracing::debug!("agent stderr: {text}");
+                        if let Ok(mut tail) = stderr_tail.lock() {
+                            tail.push_str(&text);
+                            tail.push('\n');
+                            if tail.len() > STDERR_TAIL {
+                                let cut = tail.len() - STDERR_TAIL;
+                                let cut = (cut..tail.len())
+                                    .find(|&i| tail.is_char_boundary(i))
+                                    .unwrap_or(tail.len());
+                                tail.drain(..cut);
+                            }
+                        }
+                        line.clear();
+                    }
+                    discarding = false;
+                    (nl + 1, false)
+                } else {
+                    if !discarding {
+                        let room = MAX_STDERR_LINE.saturating_sub(line.len());
+                        let take = buf.len().min(room);
+                        line.extend_from_slice(&buf[..take]);
+                        if take < buf.len() {
+                            discarding = true;
+                        }
+                    }
+                    (buf.len(), false)
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        if consumed > 0 {
+            reader.consume(consumed);
+        }
+        if done {
+            if !line.is_empty() {
+                let text = String::from_utf8_lossy(&line);
+                tracing::debug!("agent stderr: {text}");
+                if let Ok(mut tail) = stderr_tail.lock() {
+                    tail.push_str(&text);
+                    tail.push('\n');
+                    if tail.len() > STDERR_TAIL {
+                        let cut = tail.len() - STDERR_TAIL;
+                        let cut = (cut..tail.len())
+                            .find(|&i| tail.is_char_boundary(i))
+                            .unwrap_or(tail.len());
+                        tail.drain(..cut);
+                    }
+                }
+            }
+            break;
+        }
+    }
 }
 
 async fn read_loop<R: tokio::io::AsyncBufRead + Unpin>(
@@ -637,9 +701,18 @@ fn redact_outbound_for_trace(line: &str) -> String {
     value.to_string()
 }
 
-/// Extract the target MCP server name from a lazy `call_mcp_tool` call, if any.
+/// Whether `name` is one of `agy`'s lazy MCP dispatch tools.
+pub fn is_lazy_mcp_tool(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some("call_mcp_tool" | "list_resources" | "read_resource")
+    )
+}
+
+/// Extract the target MCP server name from a lazy MCP call (`call_mcp_tool`,
+/// `list_resources`, or `read_resource`), if any.
 pub fn mcp_server_name(call: &Value) -> Option<String> {
-    if call.get("name").and_then(Value::as_str) != Some("call_mcp_tool") {
+    if !is_lazy_mcp_tool(call.get("name").and_then(Value::as_str)) {
         return None;
     }
     ["rawInput", "args"].into_iter().find_map(|key| {
@@ -668,12 +741,11 @@ pub fn mcp_tool_name(call: &Value) -> Option<String> {
 /// The shell command on a `toolCall` object, if it is one.
 ///
 /// Scoped to shell-execution tool calls (`kind == "execute"` or
-/// `name == "run_command"`) and explicitly excludes `call_mcp_tool` (which
-/// `agy` labels `kind: "execute"`) so MCP tools are never misparsed as shell
-/// commands.
+/// `name == "run_command"`) and explicitly excludes lazy MCP dispatch tools so
+/// MCP calls are never misparsed as shell commands.
 pub fn tool_command(call: &Value) -> Option<String> {
     let name = call.get("name").and_then(Value::as_str);
-    if name == Some("call_mcp_tool") {
+    if is_lazy_mcp_tool(name) {
         return None;
     }
     let is_execute =
@@ -1197,5 +1269,31 @@ mod tests {
             tool_progress(&call).as_deref(),
             Some("slack: conversations_history")
         );
+
+        let res_call = json!({
+            "name": "read_resource",
+            "kind": "read",
+            "rawInput": {"ServerName": "gitlab", "Uri": "gitlab://proj"}
+        });
+        assert!(is_lazy_mcp_tool(Some("list_resources")));
+        assert!(is_lazy_mcp_tool(Some("read_resource")));
+        assert_eq!(mcp_server_name(&res_call).as_deref(), Some("gitlab"));
+    }
+
+    #[tokio::test]
+    async fn stderr_reader_survives_non_utf8_and_oversized_lines() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"first line\n");
+        payload.extend_from_slice(b"bad utf8: \xff\xfe ok\n");
+        payload.extend_from_slice(&vec![b'x'; STDERR_TAIL * 4]);
+        payload.push(b'\r');
+        payload.extend_from_slice(b"final tail line\n");
+
+        let tail = Arc::new(Mutex::new(String::new()));
+        read_stderr_lossy(BufReader::new(&payload[..]), Arc::clone(&tail)).await;
+        let got = tail.lock().unwrap().clone();
+        assert!(got.contains("bad utf8:"), "{got:?}");
+        assert!(got.contains("final tail line"), "{got:?}");
+        assert!(got.len() <= STDERR_TAIL);
     }
 }

@@ -426,5 +426,72 @@ async fn recall_and_tasks_cli_read_history_db_directly() {
         "{rendered}"
     );
 
+    // `schedule add` + `schedule edit --no-agent` + validation against clearing both prompt & script.
+    let sched_add = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--socket")
+        .arg(dir.join("offline.sock"))
+        .args([
+            "schedule",
+            "add",
+            "remind-test",
+            "--schedule",
+            "in 10m",
+            "--prompt",
+            "check oven",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        sched_add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sched_add.stderr)
+    );
+    let sched_edit = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--socket")
+        .arg(dir.join("offline.sock"))
+        .args(["schedule", "edit", "remind-test", "--no-agent"])
+        .output()
+        .unwrap();
+    assert!(
+        sched_edit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sched_edit.stderr)
+    );
+    let sched_bad = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--socket")
+        .arg(dir.join("offline.sock"))
+        .args(["schedule", "edit", "remind-test", "--prompt", ""])
+        .output()
+        .unwrap();
+    assert!(!sched_bad.status.success());
+
+    // Pure IPC client subcommands (`status`, `cancel`) must not fail with a
+    // TOML parse error when config.toml contains unknown future keys.
+    let future_cfg_dir = dir.join("future-cfg");
+    std::fs::create_dir_all(future_cfg_dir.join("hey-computer")).unwrap();
+    std::fs::write(
+        future_cfg_dir.join("hey-computer/config.toml"),
+        "future_unknown_key = true\n",
+    )
+    .unwrap();
+    let cancel_out = Command::new(env!("CARGO_BIN_EXE_hey-computer"))
+        .env("XDG_CONFIG_HOME", &future_cfg_dir)
+        .arg("--socket")
+        .arg(dir.join("offline.sock"))
+        .arg("cancel")
+        .output()
+        .unwrap();
+    let cancel_err = String::from_utf8_lossy(&cancel_out.stderr);
+    assert!(
+        !cancel_err.contains("TOML parse error"),
+        "cancel parsed config.toml unnecessarily: {cancel_err}"
+    );
+
     std::fs::remove_dir_all(&dir).unwrap();
 }

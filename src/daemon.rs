@@ -87,6 +87,14 @@ pub async fn serve_with_context(
             return Err(e.context("opening the history database"));
         }
     };
+    if let Err(e) = crate::store::sync_managed_schedules(
+        &paths.state_dir,
+        &config.scheduler.jobs,
+        crate::store::unix_timestamp_ms(),
+    ) {
+        let _ = std::fs::remove_file(socket);
+        return Err(e.context("reconciling declarative [scheduler.jobs]"));
+    }
     tracing::info!("agent directory {}", paths.agent_dir.display());
     tracing::info!("listening on {}", socket.display());
 

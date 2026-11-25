@@ -35,8 +35,8 @@ hey-computer schedule add friday-summary \
 # <untrusted_collector_output>.
 hey-computer schedule add pr-ci-watch \
   --schedule "every 15m" \
-  --script "gh pr checks 42 --fail-fast || echo 'CI check needs attention'" \
-  --prompt "Inspect the PR CI output and alert me only if something failed or completed." \
+  --script "gh pr checks 42 --fail-fast >/dev/null 2>&1 || gh pr checks 42 2>&1" \
+  --prompt "Inspect the failed PR CI output and alert me briefly; if everything is still pending and no action is needed yet, reply with exactly HEARTBEAT_OK." \
   --suppress-token HEARTBEAT_OK \
   --failure-deliver notify \
   --max-runs 24 \

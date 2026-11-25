@@ -101,7 +101,12 @@ pub fn format_turn_budget(
         out.push_str(&format!("max_tool_calls: {limit}\n"));
     }
     if let Some(limit) = max_turn {
-        out.push_str(&format!("time_limit_secs: {}\n", limit.as_secs()));
+        let secs = limit.as_secs_f64();
+        if secs.fract().abs() < 1e-6 && secs >= 1.0 {
+            out.push_str(&format!("time_limit_secs: {:.0}\n", secs));
+        } else {
+            out.push_str(&format!("time_limit_secs: {:.1}\n", secs));
+        }
     }
     out.push_str("</budget>");
     Some(out)
@@ -445,19 +450,34 @@ async fn query_desktop_inner(hyprctl: &str, tmux: &str, proc_root: &Path) -> Opt
             let descendants =
                 tokio::task::spawn_blocking(move || collect_descendants(&proc_root_owned, pid))
                     .await
-                    .unwrap_or_else(|_| vec![(pid, 0)]);
+                    .unwrap_or_else(|_| {
+                        vec![Descendant {
+                            pid,
+                            depth: 0,
+                            surface_pid: pid,
+                        }]
+                    });
 
+            let mut unfocused_tmux_roots = HashSet::new();
             if is_term {
-                let pid_set: HashSet<u32> = descendants.iter().map(|(p, _)| *p).collect();
-                if let Some((cwd, tmux_state)) = query_tmux(tmux, &pid_set).await {
+                let pid_set: HashSet<u32> = descendants.iter().map(|d| d.pid).collect();
+                let (matched_tmux, unfocused) = query_tmux(tmux, &pid_set).await;
+                unfocused_tmux_roots = unfocused;
+                if let Some((cwd, tmux_state)) = matched_tmux {
                     state.cwd = cwd;
                     state.tmux = Some(tmux_state);
                 }
             }
             if state.cwd.is_none() {
                 let proc_root_owned = proc_root.to_path_buf();
+                let win_title = state.title.clone();
                 state.cwd = tokio::task::spawn_blocking(move || {
-                    resolve_cwd(&proc_root_owned, &descendants)
+                    resolve_cwd(
+                        &proc_root_owned,
+                        &descendants,
+                        &unfocused_tmux_roots,
+                        win_title.as_deref(),
+                    )
                 })
                 .await
                 .ok()
@@ -497,16 +517,29 @@ fn is_editor_class(class: &str) -> bool {
         || lower.starts_with("helix")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Descendant {
+    pid: u32,
+    depth: usize,
+    /// Top-level (`depth == 1`) child of `root_pid` that owns this subtree,
+    /// corresponding to one terminal tab/window surface on single-PID terminals.
+    surface_pid: u32,
+}
+
 /// Walk `/proc` descendants of `root_pid` (up to `PROC_MAX_DEPTH` and
 /// `PROC_MAX_PIDS`) without spawning subprocesses. Uses `/proc/<pid>/task/*/children`
 /// when the kernel provides it and falls back to `/proc/<pid>/stat` parent links.
-fn collect_descendants(proc_root: &Path, root_pid: u32) -> Vec<(u32, usize)> {
+fn collect_descendants(proc_root: &Path, root_pid: u32) -> Vec<Descendant> {
     let mut visited = HashSet::new();
     let mut ordered = Vec::new();
     let mut queue = VecDeque::new();
     visited.insert(root_pid);
-    ordered.push((root_pid, 0));
-    queue.push_back((root_pid, 0usize));
+    ordered.push(Descendant {
+        pid: root_pid,
+        depth: 0,
+        surface_pid: root_pid,
+    });
+    queue.push_back((root_pid, 0usize, root_pid));
 
     // Check whether the kernel exposes `/proc/<pid>/task/<tid>/children`.
     let has_task_children = read_task_children(proc_root, root_pid).is_some();
@@ -516,7 +549,7 @@ fn collect_descendants(proc_root: &Path, root_pid: u32) -> Vec<(u32, usize)> {
         Some(build_ppid_map(proc_root))
     };
 
-    while let Some((pid, depth)) = queue.pop_front() {
+    while let Some((pid, depth, surface)) = queue.pop_front() {
         if depth >= PROC_MAX_DEPTH || ordered.len() >= PROC_MAX_PIDS {
             continue;
         }
@@ -529,8 +562,13 @@ fn collect_descendants(proc_root: &Path, root_pid: u32) -> Vec<(u32, usize)> {
                 break;
             }
             if visited.insert(child) {
-                ordered.push((child, depth + 1));
-                queue.push_back((child, depth + 1));
+                let child_surface = if depth == 0 { child } else { surface };
+                ordered.push(Descendant {
+                    pid: child,
+                    depth: depth + 1,
+                    surface_pid: child_surface,
+                });
+                queue.push_back((child, depth + 1, child_surface));
             }
         }
     }
@@ -596,14 +634,77 @@ fn parse_stat_ppid(stat: &str) -> Option<u32> {
     (ppid > 0).then_some(ppid)
 }
 
-/// Resolve the deepest readable `/proc/<pid>/cwd`, falling back to shallower
-/// ancestors down to the window PID itself.
-fn resolve_cwd(proc_root: &Path, descendants: &[(u32, usize)]) -> Option<String> {
-    let mut by_depth = descendants.to_vec();
-    // Prefer deepest child; break ties by highest PID (most recent foreground child).
-    by_depth.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
-    for (pid, _) in by_depth {
-        let link = proc_root.join(pid.to_string()).join("cwd");
+/// Resolve the focused surface's deepest readable `/proc/<pid>/cwd`, pruning
+/// surfaces occupied by unfocused `tmux` clients and disambiguating multi-window
+/// single-PID terminals (Ghostty, WezTerm, GNOME Terminal) via window title and
+/// pty input `mtime` before falling back to depth and PID.
+fn resolve_cwd(
+    proc_root: &Path,
+    descendants: &[Descendant],
+    unfocused_tmux_pids: &HashSet<u32>,
+    window_title: Option<&str>,
+) -> Option<String> {
+    let ignored_surfaces: HashSet<u32> = descendants
+        .iter()
+        .filter(|d| d.depth > 0 && unfocused_tmux_pids.contains(&d.pid))
+        .map(|d| d.surface_pid)
+        .collect();
+
+    let mut surface_meta: HashMap<u32, (bool, u128)> = HashMap::new();
+    let title_lower = window_title.map(|t| t.to_lowercase());
+    for d in descendants {
+        if d.depth == 0 || ignored_surfaces.contains(&d.surface_pid) {
+            continue;
+        }
+        let link = proc_root.join(d.pid.to_string()).join("cwd");
+        let title_hit = match (&title_lower, std::fs::read_link(&link).ok()) {
+            (Some(tl), Some(path)) => path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| n.len() >= 2)
+                .is_some_and(|base| tl.contains(&base.to_lowercase())),
+            _ => false,
+        };
+        let pty_mtime = if d.pid == d.surface_pid {
+            std::fs::metadata(proc_root.join(d.pid.to_string()).join("fd/0"))
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|dur| dur.as_nanos())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let entry = surface_meta.entry(d.surface_pid).or_insert((false, 0));
+        entry.0 |= title_hit;
+        entry.1 = entry.1.max(pty_mtime);
+    }
+
+    let mut candidates: Vec<Descendant> = descendants
+        .iter()
+        .copied()
+        .filter(|d| !ignored_surfaces.contains(&d.surface_pid))
+        .collect();
+    candidates.sort_by(|a, b| {
+        let a_non_root = a.depth > 0;
+        let b_non_root = b.depth > 0;
+        let a_surf = surface_meta
+            .get(&a.surface_pid)
+            .copied()
+            .unwrap_or((false, 0));
+        let b_surf = surface_meta
+            .get(&b.surface_pid)
+            .copied()
+            .unwrap_or((false, 0));
+        b_non_root
+            .cmp(&a_non_root)
+            .then_with(|| b_surf.0.cmp(&a_surf.0))
+            .then_with(|| b_surf.1.cmp(&a_surf.1))
+            .then_with(|| b.depth.cmp(&a.depth))
+            .then_with(|| b.pid.cmp(&a.pid))
+    });
+    for d in candidates {
+        let link = proc_root.join(d.pid.to_string()).join("cwd");
         if let Ok(path) = std::fs::read_link(&link) {
             let s = path.to_string_lossy();
             if !s.is_empty() {
@@ -614,13 +715,17 @@ fn resolve_cwd(proc_root: &Path, descendants: &[(u32, usize)]) -> Option<String>
     None
 }
 
-async fn query_tmux(tmux: &str, pids: &HashSet<u32>) -> Option<(Option<String>, TmuxState)> {
-    const CLIENT_FMT: &str = "#{client_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_current_path}\t#{pane_current_command}";
+async fn query_tmux(
+    tmux: &str,
+    pids: &HashSet<u32>,
+) -> (Option<(Option<String>, TmuxState)>, HashSet<u32>) {
+    const CLIENT_FMT: &str = "#{client_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_current_path}\t#{pane_current_command}\t#{client_flags}\t#{client_termfeatures}\t#{client_activity}";
+    let mut unfocused_pids = HashSet::new();
     let RunResult::Ok(raw) = run_program(tmux, &["list-clients", "-F", CLIENT_FMT]).await else {
-        return None;
+        return (None, unfocused_pids);
     };
     let text = String::from_utf8_lossy(&raw);
-    let mut matched = None;
+    let mut best: Option<((bool, u64), Option<String>, TmuxState)> = None;
     for line in text.lines() {
         let mut fields = line.split('\t');
         let Some(client_pid) = fields.next().and_then(|s| s.trim().parse::<u32>().ok()) else {
@@ -635,7 +740,22 @@ async fn query_tmux(tmux: &str, pids: &HashSet<u32>) -> Option<(Option<String>, 
         let pane = fields.next().unwrap_or("").trim().to_string();
         let path = fields.next().unwrap_or("").trim();
         let cmd = fields.next().unwrap_or("").trim();
+        let flags = fields.next().unwrap_or("").trim();
+        let termfeatures = fields.next().unwrap_or("").trim();
+        let activity = fields
+            .next()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         if session.is_empty() || pane.is_empty() {
+            continue;
+        }
+        let has_focus_events = termfeatures.split(',').any(|f| f == "focus");
+        let is_focused = flags.split(',').any(|f| f == "focused");
+        // Single-PID terminals (Ghostty, Kitty, WezTerm, Foot) report `focus`
+        // in `client_termfeatures`; an unfocused client belongs to a different
+        // window/tab than the currently focused one.
+        if has_focus_events && !is_focused {
+            unfocused_pids.insert(client_pid);
             continue;
         }
         let window = if win_name.is_empty() {
@@ -645,19 +765,21 @@ async fn query_tmux(tmux: &str, pids: &HashSet<u32>) -> Option<(Option<String>, 
         };
         let cwd = (!path.is_empty()).then(|| path.to_string());
         let pane_command = (!cmd.is_empty()).then(|| cmd.to_string());
-        matched = Some((
-            cwd,
-            TmuxState {
-                session,
-                window,
-                pane,
-                pane_command,
-                window_panes: None,
-            },
-        ));
-        break;
+        let priority = (is_focused, activity);
+        let state = TmuxState {
+            session,
+            window,
+            pane,
+            pane_command,
+            window_panes: None,
+        };
+        if best.as_ref().is_none_or(|(p, _, _)| priority > *p) {
+            best = Some((priority, cwd, state));
+        }
     }
-    let (cwd, mut state) = matched?;
+    let Some((_, cwd, mut state)) = best else {
+        return (None, unfocused_pids);
+    };
     if is_valid_pane_id(&state.pane) {
         const PANE_FMT: &str = "#{pane_id}\t#{pane_active}\t#{pane_current_command}";
         if let RunResult::Ok(panes_raw) =
@@ -666,7 +788,7 @@ async fn query_tmux(tmux: &str, pids: &HashSet<u32>) -> Option<(Option<String>, 
             state.window_panes = format_tmux_panes(&String::from_utf8_lossy(&panes_raw));
         }
     }
-    Some((cwd, state))
+    (Some((cwd, state)), unfocused_pids)
 }
 
 fn is_valid_pane_id(pane: &str) -> bool {
@@ -1022,6 +1144,46 @@ esac
             .unwrap();
         assert!(state.cwd.is_none());
         assert!(state.tmux.is_none());
+
+        // 4. Multi-window single-PID Ghostty: unfocused `focus`-capable tmux
+        //    client on surface 101 must NOT bleed into focused plain-shell
+        //    surface 103 (whose window title matches `work-c`).
+        let work_c = dir.join("work-c");
+        std::fs::create_dir_all(&work_c).unwrap();
+        make_proc(103, 100, "zsh", &work_c);
+        let hypr_plain = write_script(
+            &dir,
+            "hypr-ghostty-plain",
+            r#"echo '{"class":"ghostty.default","title":"zsh ~/work-c","pid":100,"workspace":{"id":2,"name":"2"}}'"#,
+        );
+        let tmux_unfocused = write_script(
+            &dir,
+            "tmux-unfocused",
+            r#"
+case "$1" in
+  list-clients)
+    printf '102\tdev\t2\teditor\t%%7\t/home/alice/repo\tnvim\tattached,UTF-8\tbpaste,focus,title\t1700000000\n'
+    ;;
+esac
+"#,
+        );
+        let state = query_desktop_with(
+            &hypr_plain,
+            &tmux_unfocused,
+            &proc_root,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(
+            state.tmux.is_none(),
+            "unfocused Ghostty tmux client bled across windows: {:?}",
+            state.tmux
+        );
+        assert_eq!(
+            state.cwd.as_deref(),
+            Some(work_c.to_string_lossy().as_ref())
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

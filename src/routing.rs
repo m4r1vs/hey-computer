@@ -97,6 +97,10 @@ const DEEP_WORDS: &[&str] = &[
     "refactor",
     "architect",
     "architecture",
+    "implement",
+    "implementiere",
+    "optimize",
+    "optimiere",
     "prove",
     "beweise",
     "tradeoff",
@@ -116,10 +120,27 @@ const DEEP_PHRASES: &[&str] = &[
     "step by step",
     "schritt für schritt",
     "root cause",
+    "race condition",
 ];
 
-/// Short imperative desktop/action/lookup cues that clearly belong on `fast_profile`.
-const FAST_PREFIXES: &[&str] = &[
+/// Polite conversational lead-ins stripped before checking [`FAST_START_PHRASES`].
+const POLITE_LEAD_INS: &[&str] = &[
+    "please ",
+    "bitte mal ",
+    "bitte ",
+    "can you please ",
+    "could you please ",
+    "can you ",
+    "could you ",
+    "kannst du bitte ",
+    "kannst du mal ",
+    "kannst du ",
+];
+
+/// Anchored imperative desktop/action/lookup cues matched only at the start of
+/// a short single-line request (with word boundaries), so words like `"set"`,
+/// `"open"`, or `"close"` mid-sentence in a coding prompt never bypass triage.
+const FAST_START_PHRASES: &[&str] = &[
     "what time",
     "wie spät",
     "turn on",
@@ -128,25 +149,27 @@ const FAST_PREFIXES: &[&str] = &[
     "switch off",
     "schalte",
     "mach das licht",
-    "licht ",
-    "lights ",
+    "licht",
+    "lights",
     "lamp",
     "volume",
     "lautstärke",
+    "brightness",
+    "helligkeit",
     "mute",
     "unmute",
     "pause",
-    "play ",
-    "resume ",
+    "play",
+    "resume",
     "next track",
     "previous track",
     "skip",
-    "open ",
-    "öffne ",
-    "close ",
-    "schließe ",
+    "open",
+    "öffne",
+    "close",
+    "schließe",
     "switch to",
-    "wechsle ",
+    "wechsle",
     "workspace",
     "weather",
     "wetter",
@@ -157,16 +180,19 @@ const FAST_PREFIXES: &[&str] = &[
     "was steht",
     "when is my",
     "wann ist mein",
-    "set ",
-    "toggle ",
-    "mute",
-    "convert ",
-    "translate ",
-    "übersetze ",
+    "set",
+    "toggle",
+    "convert",
+    "translate",
+    "übersetze",
     "wie viel",
     "how much",
     "how many",
 ];
+
+/// Unambiguous desktop/media phrases safe to match anywhere in short single-line asks.
+const FAST_ANYWHERE_PHRASES: &[&str] =
+    &["next track", "previous track", "lautstärke", "helligkeit"];
 
 /// True when a follow-up turn starts with a correction/disagreement cue.
 pub fn is_correction_followup(text: &str) -> bool {
@@ -220,13 +246,7 @@ pub fn classify_heuristic(
     }
 
     let single_line = !trimmed.contains('\n');
-    if single_line
-        && char_len <= 100
-        && (FAST_PREFIXES
-            .iter()
-            .any(|p| lower.starts_with(p) || contains_phrase(&lower, p.trim()))
-            || char_len <= 45)
-    {
+    if single_line && char_len <= 100 && (matches_fast_cue(&lower) || char_len <= 45) {
         return HeuristicResult::Decided(RouteDecision {
             profile: TierChoice::Fast,
             lane: LaneChoice::Interactive,
@@ -234,6 +254,25 @@ pub fn classify_heuristic(
     }
 
     HeuristicResult::Unsure
+}
+
+fn matches_fast_cue(lower: &str) -> bool {
+    let mut core = lower.trim_start();
+    for lead in POLITE_LEAD_INS {
+        if let Some(rest) = core.strip_prefix(lead) {
+            core = rest.trim_start();
+            break;
+        }
+    }
+    if FAST_START_PHRASES
+        .iter()
+        .any(|p| starts_with_phrase(core, p))
+    {
+        return true;
+    }
+    FAST_ANYWHERE_PHRASES
+        .iter()
+        .any(|p| contains_phrase(lower, p))
 }
 
 fn matches_background(lower: &str, char_len: usize) -> bool {
@@ -488,6 +527,42 @@ mod tests {
         assert_eq!(
             classify_heuristic("and the day after?", false, true, true, true),
             HeuristicResult::Unsure
+        );
+
+        // Mid-sentence "set"/"open" must NOT falsely match FAST_START_PHRASES.
+        assert_eq!(
+            classify_heuristic(
+                "Write a Rust function to parse a hash set and handle collisions cleanly",
+                false,
+                false,
+                true,
+                true
+            ),
+            HeuristicResult::Unsure
+        );
+
+        // Polite lead-ins before anchored desktop commands still route fast.
+        assert_eq!(
+            classify_heuristic("Please turn off the desk lamp", false, false, true, true),
+            HeuristicResult::Decided(RouteDecision {
+                profile: TierChoice::Fast,
+                lane: LaneChoice::Interactive,
+            })
+        );
+
+        // Newly added deep words ("implement", "optimize", "race condition") route deep.
+        assert_eq!(
+            classify_heuristic(
+                "Implement a lock-free ring buffer",
+                false,
+                false,
+                true,
+                true
+            ),
+            HeuristicResult::Decided(RouteDecision {
+                profile: TierChoice::Deep,
+                lane: LaneChoice::Interactive,
+            })
         );
     }
 

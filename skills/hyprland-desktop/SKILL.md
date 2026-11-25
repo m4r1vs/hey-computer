@@ -95,10 +95,9 @@ usual way (not run here) is
 notify-send "Title" "Body"          # body may use Pango markup: <b>, <i>, &amp;
 ```
 
-## Media players and volume
+## Media players, volume, and brightness
 
-The following comes from the tools' own `--help`; it was not run against a
-playing player.
+The following comes from the tools' own `--help` and desktop verification. Prefer `pamixer` over `wpctl` when `pamixer` is on `PATH` so host volume limits and mute indicators match the desktop's media keys:
 
 ```bash
 playerctl -l                        # players that can be controlled
@@ -109,9 +108,26 @@ playerctl -p spotify play-pause     # one player by name
 ```
 
 ```bash
+# Prefer pamixer when installed on PATH:
+pamixer --get-volume-human          # e.g. "45%" or "muted"
+pamixer -i 5                        # louder by 5 %
+pamixer -d 5                        # quieter by 5 %
+pamixer --set-volume 30             # exactly 30 %
+pamixer -t                          # toggle speaker/headphone mute
+pamixer --default-source -t         # toggle microphone mute
+
+# Fallback when pamixer is not installed:
 wpctl get-volume @DEFAULT_AUDIO_SINK@          # "Volume: 0.45" (1.0 is 100 %)
 wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+   # louder by 5 %, never above 100 %
 wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
 wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.3          # exactly 30 %
 wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle         # or 1 / 0
+```
+
+```bash
+# Screen brightness (when brightnessctl is installed on PATH):
+brightnessctl -m                    # machine-readable current brightness (%)
+brightnessctl set 10%+              # brighter by 10 %
+brightnessctl set 10%-              # dimmer by 10 %
+brightnessctl set 50%               # set to 50 %
 ```

@@ -88,11 +88,13 @@ pub enum Presentation {
         background: bool,
     },
     /// A standalone notification (e.g. scheduled reminder, split failure alert,
-    /// or background-delegation notice) that never replaces interactive progress.
+    /// or background-delegation notice). Replaces an active progress popup only
+    /// when `replaces_id` matches that request's id.
     Notice {
         summary: String,
         body: String,
         urgency: Urgency,
+        replaces_id: Option<u64>,
     },
 }
 
@@ -352,6 +354,11 @@ impl FenceState {
                 true
             }
             None if is_fence => {
+                // CommonMark §4.5: backtick code fences cannot contain backticks
+                // in their info string (` ```code``` ` is an inline code span).
+                if marker.starts_with('`') && trimmed[marker.len()..].contains('`') {
+                    return false;
+                }
                 self.open = Some(marker);
                 true
             }
@@ -376,64 +383,84 @@ pub fn disarm_html(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len());
     let mut fence = FenceState::default();
     let mut in_math = false;
+    let mut paragraph = String::new();
+    let flush_paragraph = |paragraph: &mut String, out: &mut String, in_math: &mut bool| {
+        if !paragraph.is_empty() {
+            out.push_str(&disarm_paragraph(paragraph, in_math, &refs));
+            paragraph.clear();
+        }
+    };
     for line in markdown.split_inclusive('\n') {
-        if fence.step(line, in_math) {
+        if fence.step(line, in_math) || line.trim().is_empty() {
+            flush_paragraph(&mut paragraph, &mut out, &mut in_math);
             out.push_str(line);
         } else {
-            out.push_str(&disarm_line(line, &mut in_math, &refs));
+            paragraph.push_str(line);
         }
     }
+    flush_paragraph(&mut paragraph, &mut out, &mut in_math);
     out
 }
 
-/// One line outside a fenced block. `in_math` carries a `$$` display block
-/// over to the next line.
-fn disarm_line(line: &str, in_math: &mut bool, refs: &HashMap<String, bool>) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    if *in_math {
-        match rest.find("$$") {
-            Some(end) => {
-                out.push_str(&math(&rest[..end + 2]));
-                rest = &rest[end + 2..];
-                *in_math = false;
+/// One non-blank paragraph outside fenced blocks. Operating on the whole
+/// paragraph lets inline code spans cross single newlines when closed while
+/// still disarming `<` and `![…]` after unclosed backticks. `in_math` carries
+/// a `$$` display block over across lines/paragraphs.
+fn disarm_paragraph(paragraph: &str, in_math: &mut bool, refs: &HashMap<String, bool>) -> String {
+    let mut out = String::with_capacity(paragraph.len());
+    let mut rest = paragraph;
+    while !rest.is_empty() {
+        if *in_math {
+            match rest.find("$$") {
+                Some(end) => {
+                    out.push_str(&math(&rest[..end + 2], refs));
+                    rest = &rest[end + 2..];
+                    *in_math = false;
+                }
+                None => {
+                    out.push_str(&math(rest, refs));
+                    return out;
+                }
             }
-            None => return math(rest),
+            continue;
         }
-    }
-    while let Some(i) = rest.find(['`', '<', '$', '\\', '!']) {
+        let Some(i) = rest.find(['`', '<', '$', '\\', '!']) else {
+            out.push_str(rest);
+            break;
+        };
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        // The closing delimiter of a span that opens here, if any.
         let span = |open: &str, close: &str| {
             rest.strip_prefix(open)
                 .and_then(|inner| inner.find(close))
                 .map(|end| open.len() + end + close.len())
         };
         if rest.starts_with('`') {
-            // A code span closes with a run of as many backticks.
+            // CommonMark §6.1: a code span closes only with an exact run of
+            // `run` backticks within the same paragraph.
             let run = rest.len() - rest.trim_start_matches('`').len();
-            let end = span(&rest[..run], &rest[..run]).unwrap_or(run);
+            let end = find_closing_backticks(&rest.as_bytes()[run..], run)
+                .map(|close| run + close)
+                .unwrap_or(run);
             out.push_str(&rest[..end]);
             rest = &rest[end..];
         } else if rest.starts_with("$$") {
             match span("$$", "$$") {
                 Some(end) => {
-                    out.push_str(&math(&rest[..end]));
+                    out.push_str(&math(&rest[..end], refs));
                     rest = &rest[end..];
                 }
                 None => {
-                    // A display block that goes on below.
                     *in_math = true;
-                    out.push_str(&math(rest));
+                    out.push_str(&math(rest, refs));
                     return out;
                 }
             }
-        } else if let Some(end) = span("$", "$")
+        } else if let Some(end) = find_inline_dollar_math(rest)
             .or_else(|| span("\\(", "\\)"))
             .or_else(|| span("\\[", "\\]"))
         {
-            out.push_str(&math(&rest[..end]));
+            out.push_str(&math(&rest[..end], refs));
             rest = &rest[end..];
         } else if rest.starts_with("![") && is_disarmed_image(rest, refs) {
             // Shown as a link: the web view would fetch or render it at once.
@@ -442,6 +469,13 @@ fn disarm_line(line: &str, in_math: &mut bool, refs: &HashMap<String, bool>) -> 
         } else if rest.starts_with("\\<") {
             // Markdown's own escape for a `<` shown as it is.
             out.push_str("&lt;");
+            rest = &rest[2..];
+        } else if rest.starts_with("\\\\")
+            || rest.starts_with("\\`")
+            || rest.starts_with("\\$")
+            || rest.starts_with("\\!")
+        {
+            out.push_str(&rest[..2]);
             rest = &rest[2..];
         } else if rest.starts_with('<') && is_autolink(rest) {
             let end = rest.find('>').map_or(rest.len(), |e| e + 1);
@@ -457,13 +491,70 @@ fn disarm_line(line: &str, in_math: &mut bool, refs: &HashMap<String, bool>) -> 
             rest = &rest[c..];
         }
     }
-    out.push_str(rest);
     out
 }
 
-/// Math with `<` spelt as KaTeX's `\lt`.
-fn math(text: &str) -> String {
-    text.replace('<', "\\lt ")
+/// Byte length of a single-line `$…$` inline math span starting at `rest`, if
+/// it has non-whitespace inner boundaries, contains no unescaped backticks, and
+/// is not followed by an alphanumeric currency/identifier continuation.
+fn find_inline_dollar_math(rest: &str) -> Option<usize> {
+    if !rest.starts_with('$') || rest.starts_with("$$") {
+        return None;
+    }
+    let line = rest.split('\n').next().unwrap_or(rest);
+    let after_open = line.get(1..)?.chars().next()?;
+    if after_open.is_whitespace() {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += if i + 1 < bytes.len() { 2 } else { 1 };
+            }
+            b'`' => return None,
+            b'$' => {
+                let run = bytes[i..].iter().take_while(|&&b| b == b'$').count();
+                if run > 1 {
+                    return None;
+                }
+                let before = line[1..i].chars().next_back();
+                let after = line[i + 1..].chars().next();
+                let valid_close = before.is_some_and(|c| !c.is_whitespace())
+                    && after.is_none_or(|c| !c.is_alphanumeric() && c != '{' && c != '\\');
+                if valid_close {
+                    return Some(i + 1);
+                }
+                return None;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Math with `<` spelt as KaTeX's `\lt` and any remote/scheme `![…]` images
+/// disarmed in case the viewer rejects the math span and falls back to Markdown.
+fn math(text: &str, refs: &HashMap<String, bool>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(['<', '!']) {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        if rest.starts_with('<') {
+            out.push_str("\\lt ");
+            rest = &rest[1..];
+        } else if rest.starts_with("![") && is_disarmed_image(rest, refs) {
+            out.push_str("[image: ");
+            rest = &rest[2..];
+        } else {
+            out.push('!');
+            rest = &rest[1..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Whether `![…]` (at the start of `text`) is an image whose target is remote
@@ -1199,12 +1290,29 @@ impl Worker {
                 summary,
                 body,
                 urgency,
+                replaces_id,
             } => {
+                let replaces = match (&self.progress, replaces_id) {
+                    (
+                        Some(ProgressSlot::Active {
+                            request_id,
+                            notif_id,
+                            ..
+                        }),
+                        Some(target),
+                    ) if *request_id == target => {
+                        let id = *notif_id;
+                        self.progress = None;
+                        self.pending = None;
+                        Some(id)
+                    }
+                    _ => None,
+                };
                 let expire = match urgency {
                     Urgency::Low => 4_000,
                     Urgency::Normal => FAILURE_EXPIRE_MS,
                 };
-                self.notify(&summary, &escape_markup(&body), urgency, expire, None)
+                self.notify(&summary, &escape_markup(&body), urgency, expire, replaces)
                     .await;
             }
             Presentation::Failure {
@@ -3218,5 +3326,32 @@ mod tests {
             recorded.contains("--replace-id=7 -- Answer Quick reply."),
             "{recorded}"
         );
+    }
+
+    #[test]
+    fn disarm_html_closes_commonmark_backtick_fence_multiline_and_dollar_bypasses() {
+        // 1. Exact backtick-run matching (` ``` ` does not close at byte 0 of ` ``` `).
+        let a = disarm_html("Explain ` ``` ` and <script>alert(1)</script> `end`");
+        assert!(!a.contains("<script>"), "{a}");
+        assert!(a.contains("&lt;script>alert(1)&lt;/script>"), "{a}");
+
+        // 2. Backticks inside backtick fence info strings are inline code, not fences.
+        let b =
+            disarm_html("```code``` <script>alert(1)</script>\n![x](https://evil.example/a.png)\n");
+        assert!(!b.contains("<script>"), "{b}");
+        assert!(b.contains("[image: x](https://evil.example/a.png)"), "{b}");
+
+        // 3. Multi-line inline code spans do not invert parity on line 2, while
+        //    unclosed backticks before a blank line still disarm line 2.
+        let c = disarm_html("Here is `multi-line\ncode` <script>alert(1)</script> `tail`\n");
+        assert!(!c.contains("<script>"), "{c}");
+        let c_unclosed = disarm_html("Unclosed `tick\n<script>alert(1)</script>\n\nNext para\n");
+        assert!(!c_unclosed.contains("<script>"), "{c_unclosed}");
+
+        // 4. Currency `$` pairs do not swallow remote images or code-span backticks.
+        let d = disarm_html("It costs $5 (see ![p](https://evil.example/p.png)) or $10.");
+        assert!(d.contains("[image: p](https://evil.example/p.png)"), "{d}");
+        let e = disarm_html("Price is $5 (`$10` in store) <script>alert(1)</script> `code`");
+        assert!(!e.contains("<script>"), "{e}");
     }
 }

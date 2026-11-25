@@ -26,7 +26,7 @@ use crate::protocol::FailReason;
 pub const DB_FILE: &str = "history.db";
 pub const LAST_FILE: &str = "last.json";
 pub const SCHEMA_VERSION: u32 = 1;
-pub const DB_SCHEMA_VERSION: i32 = 2;
+pub const DB_SCHEMA_VERSION: i32 = 3;
 
 const PRUNE_EVERY_TURNS: u64 = 100;
 
@@ -212,6 +212,10 @@ pub struct NewTurn {
 
 enum StoreCmd {
     CreateTurn(NewTurn),
+    PromoteBackground {
+        id: u64,
+        profile: String,
+    },
     MarkRunning {
         id: u64,
         lane: Lane,
@@ -286,12 +290,36 @@ impl Store {
         let handle = std::thread::Builder::new()
             .name("hc-store".to_string())
             .spawn(move || {
-                let mut completed_since_prune: u64 = 0;
+                let mut turns_since_prune: u64 = 0;
+                let maybe_prune = |conn: &Connection, count: &mut u64| {
+                    *count += 1;
+                    if *count >= PRUNE_EVERY_TURNS {
+                        *count = 0;
+                        match prune_connection(conn, &history, unix_timestamp_ms()) {
+                            Ok(n) if n > 0 => {
+                                tracing::info!("pruned {n} old history row(s)");
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("history prune failed: {e:#}"),
+                        }
+                        if let Err(e) = maintain_connection(conn) {
+                            tracing::warn!("history maintenance failed: {e:#}");
+                        }
+                    }
+                };
                 while let Some(cmd) = rx.blocking_recv() {
                     match cmd {
                         StoreCmd::CreateTurn(turn) => {
                             if let Err(e) = insert_turn(&conn, &turn) {
                                 tracing::warn!("cannot record turn {}: {e:#}", turn.id);
+                            }
+                        }
+                        StoreCmd::PromoteBackground { id, profile } => {
+                            if let Err(e) = conn.execute(
+                                "UPDATE turns SET lane = 'background', profile = ?2 WHERE id = ?1",
+                                params![id as i64, profile],
+                            ) {
+                                tracing::warn!("cannot promote turn {id} to background: {e}");
                             }
                         }
                         StoreCmd::MarkRunning {
@@ -342,20 +370,7 @@ impl Store {
                             ) {
                                 tracing::warn!("cannot finish turn {id}: {e}");
                             } else {
-                                completed_since_prune += 1;
-                                if completed_since_prune >= PRUNE_EVERY_TURNS {
-                                    completed_since_prune = 0;
-                                    match prune_connection(&conn, &history, unix_timestamp_ms()) {
-                                        Ok(n) if n > 0 => {
-                                            tracing::info!("pruned {n} old history row(s)");
-                                        }
-                                        Ok(_) => {}
-                                        Err(e) => tracing::warn!("history prune failed: {e:#}"),
-                                    }
-                                    if let Err(e) = maintain_connection(&conn) {
-                                        tracing::warn!("history maintenance failed: {e:#}");
-                                    }
-                                }
+                                maybe_prune(&conn, &mut turns_since_prune);
                             }
                         }
                         StoreCmd::FinishSuppressed {
@@ -372,6 +387,8 @@ impl Store {
                                 params![id as i64, token, finished_at_ms],
                             ) {
                                 tracing::warn!("cannot mark turn {id} suppressed: {e}");
+                            } else {
+                                maybe_prune(&conn, &mut turns_since_prune);
                             }
                         }
                         StoreCmd::FinishFailed {
@@ -390,6 +407,8 @@ impl Store {
                                 params![id as i64, reason, message, finished_at_ms],
                             ) {
                                 tracing::warn!("cannot mark turn {id} failed: {e}");
+                            } else {
+                                maybe_prune(&conn, &mut turns_since_prune);
                             }
                         }
                         StoreCmd::FinishCancelled {
@@ -408,6 +427,8 @@ impl Store {
                                 params![id as i64, reason, message, finished_at_ms],
                             ) {
                                 tracing::warn!("cannot mark turn {id} cancelled: {e}");
+                            } else {
+                                maybe_prune(&conn, &mut turns_since_prune);
                             }
                         }
                         StoreCmd::Flush(ack) => {
@@ -435,6 +456,10 @@ impl Store {
 
     pub fn create_turn(&self, turn: NewTurn) {
         let _ = self.tx.send(StoreCmd::CreateTurn(turn));
+    }
+
+    pub fn promote_to_background(&self, id: u64, profile: String) {
+        let _ = self.tx.send(StoreCmd::PromoteBackground { id, profile });
     }
 
     pub fn mark_running(
@@ -748,7 +773,15 @@ CREATE INDEX idx_schedules_due ON schedules(next_run_at ASC)
     WHERE enabled = 1 AND next_run_at IS NOT NULL;
 "#;
 
+const SCHEMA_V3: &str = r#"
+ALTER TABLE schedules ADD COLUMN managed INTEGER NOT NULL DEFAULT 0 CHECK (managed IN (0, 1));
+"#;
+
 fn migrate(conn: &mut Connection) -> Result<()> {
+    let cur: i32 = conn.query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+    if cur == DB_SCHEMA_VERSION {
+        return Ok(());
+    }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut version: i32 = tx.query_row("PRAGMA user_version;", [], |r| r.get(0))?;
     if version > DB_SCHEMA_VERSION {
@@ -765,6 +798,11 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tx.execute_batch(SCHEMA_V2)
             .context("migrating history database schema v1 -> v2")?;
         version = 2;
+    }
+    if version == 2 {
+        tx.execute_batch(SCHEMA_V3)
+            .context("migrating history database schema v2 -> v3")?;
+        version = 3;
     }
     tx.pragma_update(None, "user_version", version)?;
     tx.commit()?;
@@ -909,15 +947,24 @@ fn prune_connection(conn: &Connection, history: &HistoryConfig, now_ms: i64) -> 
              WHERE status NOT IN ('queued', 'running') AND created_at < ?1",
             params![cutoff],
         )?;
+        if has_schedules_table(conn).unwrap_or(false) {
+            let _ = conn.execute(
+                "DELETE FROM schedules
+                 WHERE managed = 0 AND enabled = 0 AND updated_at < ?1",
+                params![cutoff],
+            );
+        }
     }
     if history.max_entries > 0 {
+        // Prioritize preserving completed/failed/cancelled user turns ahead of
+        // suppressed heartbeat rows when enforcing `max_entries`.
         deleted += conn.execute(
             "DELETE FROM turns
              WHERE status NOT IN ('queued', 'running')
                AND id NOT IN (
                    SELECT id FROM turns
                    WHERE status NOT IN ('queued', 'running')
-                   ORDER BY id DESC
+                   ORDER BY CASE WHEN status = 'suppressed' THEN 1 ELSE 0 END ASC, id DESC
                    LIMIT ?1
                )",
             params![history.max_entries as i64],
@@ -1407,6 +1454,38 @@ pub fn parse_time_spec(spec: &str, now_ms: i64) -> Result<i64> {
     );
 }
 
+/// Parse an `--until` time bound: relative specs (`24h`, `7d`) behave like
+/// [`parse_time_spec`], while calendar dates (`today`, `yesterday`,
+/// `YYYY-MM-DD`) resolve to `00:00:00` of the **next** local day so
+/// `created_at < ?until` includes the entire named calendar day.
+pub fn parse_until_time_spec(spec: &str, now_ms: i64) -> Result<i64> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        bail!("time specification is empty");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "today" {
+        return local_midnight_ms(now_ms, 1);
+    }
+    if lower == "yesterday" {
+        return local_midnight_ms(now_ms, 0);
+    }
+    let parts: Vec<&str> = trimmed.split('-').collect();
+    if parts.len() == 3
+        && let (Ok(year), Ok(month), Ok(day)) = (
+            parts[0].parse::<i32>(),
+            parts[1].parse::<i32>(),
+            parts[2].parse::<i32>(),
+        )
+        && (1970..=9999).contains(&year)
+        && (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+    {
+        return local_date_end_to_ms(year, month, day);
+    }
+    parse_time_spec(spec, now_ms)
+}
+
 unsafe extern "C" {
     fn tzset();
 }
@@ -1442,8 +1521,26 @@ fn local_date_to_ms(year: i32, month: i32, day: i32) -> Result<i64> {
         tzset();
         libc::mktime(&mut tm)
     };
+    if t == -1 || tm.tm_year != year - 1900 || tm.tm_mon != month - 1 || tm.tm_mday != day {
+        bail!("invalid calendar date {year:04}-{month:02}-{day:02}");
+    }
+    Ok((t as i64) * 1000)
+}
+
+fn local_date_end_to_ms(year: i32, month: i32, day: i32) -> Result<i64> {
+    // Validate the calendar date first so `2027-02-31` is rejected.
+    let _ = local_date_to_ms(year, month, day)?;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = day + 1;
+    tm.tm_isdst = -1;
+    let t = unsafe {
+        tzset();
+        libc::mktime(&mut tm)
+    };
     if t == -1 {
-        bail!("invalid date {year:04}-{month:02}-{day:02}");
+        bail!("invalid calendar date {year:04}-{month:02}-{day:02}");
     }
     Ok((t as i64) * 1000)
 }
@@ -1599,12 +1696,14 @@ impl fmt::Display for FailureDeliver {
     }
 }
 
-/// One row from the `schedules` table (schema v2).
+/// One row from the `schedules` table (schema v3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleRecord {
     pub id: u64,
     pub name: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub managed: bool,
     pub schedule_spec: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
@@ -1668,7 +1767,7 @@ pub struct SchedulePatch {
 const SCHEDULE_COLUMNS: &str = "id, name, enabled, schedule_spec, prompt, profile, script, \
     no_agent, suppress_token, failure_deliver, max_runs, expires_at, run_count, \
     consecutive_failures, next_run_at, last_run_at, last_status, last_error, \
-    created_at, updated_at";
+    created_at, updated_at, managed";
 
 fn row_to_schedule(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRecord> {
     let id: i64 = row.get(0)?;
@@ -1691,10 +1790,12 @@ fn row_to_schedule(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRecord> 
     let last_error: Option<String> = row.get(17)?;
     let created_at: i64 = row.get(18)?;
     let updated_at: i64 = row.get(19)?;
+    let managed: i64 = row.get(20).unwrap_or(0);
     Ok(ScheduleRecord {
         id: id.max(0) as u64,
         name,
         enabled: enabled != 0,
+        managed: managed != 0,
         schedule_spec,
         prompt,
         profile,
@@ -1784,24 +1885,91 @@ pub fn get_schedule(state_dir: &Path, id_or_name: &str) -> Result<Option<Schedul
     lookup_schedule(&conn, id_or_name)
 }
 
-/// Insert a new scheduled job, enforcing `max_jobs`.
+/// Insert a new scheduled job, enforcing `max_jobs`. If a non-managed disabled
+/// one-shot or expired job with the same `name` already exists, reuses and
+/// reactivates that row cleanly so recurring voice reminders do not collide on
+/// `UNIQUE(name)`.
 pub fn create_schedule(
     state_dir: &Path,
     spec: &NewSchedule,
     max_jobs: usize,
 ) -> Result<ScheduleRecord> {
     let conn = open_migrated_writer(state_dir)?;
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM schedules", [], |r| r.get(0))?;
-    if count as usize >= max_jobs {
+    let now_ms = unix_timestamp_ms();
+    if let Some(existing) = lookup_schedule(&conn, &spec.name)? {
+        let existing_one_shot = crate::scheduler::ScheduleSpec::parse(&existing.schedule_spec)
+            .map(|s| s.is_one_shot())
+            .unwrap_or(false);
+        let replaceable = !existing.managed
+            && !existing.enabled
+            && (existing_one_shot || existing.last_status.as_deref() == Some("expired"));
+        if replaceable {
+            conn.execute(
+                "UPDATE schedules
+                 SET enabled = 1,
+                     schedule_spec = ?2,
+                     prompt = ?3,
+                     profile = ?4,
+                     script = ?5,
+                     no_agent = ?6,
+                     suppress_token = ?7,
+                     failure_deliver = ?8,
+                     max_runs = ?9,
+                     expires_at = ?10,
+                     run_count = 0,
+                     consecutive_failures = 0,
+                     next_run_at = ?11,
+                     last_run_at = NULL,
+                     last_status = NULL,
+                     last_error = NULL,
+                     updated_at = ?12
+                 WHERE id = ?1",
+                params![
+                    existing.id as i64,
+                    spec.schedule_spec,
+                    spec.prompt,
+                    spec.profile,
+                    spec.script,
+                    i64::from(spec.no_agent),
+                    spec.suppress_token,
+                    spec.failure_deliver.as_str(),
+                    spec.max_runs.map(|v| v as i64),
+                    spec.expires_at,
+                    spec.next_run_at,
+                    now_ms,
+                ],
+            )?;
+            return lookup_schedule(&conn, &existing.id.to_string())?
+                .context("reactivated schedule could not be read back");
+        }
+    }
+
+    let active_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM schedules WHERE enabled = 1 OR managed = 1",
+        [],
+        |r| r.get(0),
+    )?;
+    if active_count as usize >= max_jobs {
         bail!("maximum number of scheduled jobs reached (scheduler.max_jobs = {max_jobs})");
     }
-    let now_ms = unix_timestamp_ms();
+    let total_count: i64 = conn.query_row("SELECT COUNT(*) FROM schedules", [], |r| r.get(0))?;
+    if total_count as usize >= max_jobs {
+        let _ = conn.execute(
+            "DELETE FROM schedules WHERE id IN (
+                 SELECT id FROM schedules
+                 WHERE managed = 0 AND enabled = 0
+                 ORDER BY updated_at ASC
+                 LIMIT ?1
+             )",
+            params![(total_count as usize + 1 - max_jobs) as i64],
+        );
+    }
     conn.execute(
         "INSERT INTO schedules (
-            name, enabled, schedule_spec, prompt, profile, script, no_agent,
+            name, enabled, managed, schedule_spec, prompt, profile, script, no_agent,
             suppress_token, failure_deliver, max_runs, expires_at, next_run_at,
             created_at, updated_at
-        ) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+        ) VALUES (?1, 1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
         params![
             spec.name,
             spec.schedule_spec,
@@ -1820,6 +1988,140 @@ pub fn create_schedule(
     .with_context(|| format!("creating schedule `{}`", spec.name))?;
     let id = conn.last_insert_rowid() as u64;
     lookup_schedule(&conn, &id.to_string())?.context("created schedule could not be read back")
+}
+
+/// Reconcile declarative `[scheduler.jobs.<name>]` definitions into `history.db`
+/// (`managed = 1`), preserving `run_count` and `last_run_at` across daemon
+/// restarts and removing stale `managed = 1` entries no longer in `config.toml`.
+pub fn sync_managed_schedules(
+    state_dir: &Path,
+    jobs: &std::collections::BTreeMap<String, crate::config::ScheduledJobConfig>,
+    now_ms: i64,
+) -> Result<()> {
+    if jobs.is_empty() {
+        let Some(reader) = open_reader_connection(state_dir)? else {
+            return Ok(());
+        };
+        if !has_schedules_table(&reader)? {
+            return Ok(());
+        }
+        let version: i32 = reader.query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+        if version < 3 {
+            return Ok(());
+        }
+        let has_managed: bool = reader.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schedules WHERE managed = 1)",
+            [],
+            |r| r.get(0),
+        )?;
+        drop(reader);
+        if !has_managed {
+            return Ok(());
+        }
+    }
+
+    let mut conn = open_migrated_writer(state_dir)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let existing_managed: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT name FROM schedules WHERE managed = 1")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        out
+    };
+    for old_name in existing_managed {
+        if !jobs.contains_key(&old_name) {
+            tx.execute(
+                "DELETE FROM schedules WHERE managed = 1 AND name = ?1",
+                params![old_name],
+            )?;
+        }
+    }
+
+    for (name, cfg) in jobs {
+        let spec_trimmed = cfg.schedule.trim();
+        let parsed = crate::scheduler::ScheduleSpec::parse(spec_trimmed)?;
+        let fresh_next = if cfg.enabled {
+            Some(parsed.first_run_after(now_ms)?)
+        } else {
+            None
+        };
+        let profile = if cfg.profile == "default" {
+            ""
+        } else {
+            cfg.profile.as_str()
+        };
+        let existing = lookup_schedule(&tx, name)?;
+        match existing {
+            Some(cur) => {
+                let keep_next = cfg.enabled
+                    && cur.enabled
+                    && cur.schedule_spec == spec_trimmed
+                    && cur.next_run_at.is_some_and(|t| t > now_ms);
+                let next_run_at = if keep_next {
+                    cur.next_run_at
+                } else {
+                    fresh_next
+                };
+                tx.execute(
+                    "UPDATE schedules
+                     SET enabled = ?2,
+                         managed = 1,
+                         schedule_spec = ?3,
+                         prompt = ?4,
+                         profile = ?5,
+                         script = ?6,
+                         no_agent = ?7,
+                         suppress_token = ?8,
+                         failure_deliver = ?9,
+                         max_runs = NULL,
+                         expires_at = NULL,
+                         next_run_at = ?10,
+                         updated_at = ?11
+                     WHERE id = ?1",
+                    params![
+                        cur.id as i64,
+                        i64::from(cfg.enabled),
+                        spec_trimmed,
+                        cfg.prompt,
+                        profile,
+                        cfg.script,
+                        i64::from(cfg.no_agent),
+                        cfg.suppress_token,
+                        cfg.failure_deliver.as_str(),
+                        next_run_at,
+                        now_ms,
+                    ],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO schedules (
+                        name, enabled, managed, schedule_spec, prompt, profile, script,
+                        no_agent, suppress_token, failure_deliver, next_run_at,
+                        created_at, updated_at
+                    ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                    params![
+                        name,
+                        i64::from(cfg.enabled),
+                        spec_trimmed,
+                        cfg.prompt,
+                        profile,
+                        cfg.script,
+                        i64::from(cfg.no_agent),
+                        cfg.suppress_token,
+                        cfg.failure_deliver.as_str(),
+                        fresh_next,
+                        now_ms,
+                    ],
+                )?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// Apply partial edits to a scheduled job.
@@ -1861,6 +2163,9 @@ pub fn update_schedule(
     }
     if let Some(exp) = patch.expires_at {
         job.expires_at = exp;
+    }
+    if job.prompt.trim().is_empty() && job.script.trim().is_empty() {
+        bail!("schedule must keep a non-empty --prompt, --script, or both");
     }
     let now_ms = unix_timestamp_ms();
     conn.execute(
@@ -1906,6 +2211,9 @@ pub fn set_schedule_enabled(
     let Some(job) = lookup_schedule(&conn, id_or_name)? else {
         bail!("schedule `{id_or_name}` not found");
     };
+    if job.prompt.trim().is_empty() && job.script.trim().is_empty() {
+        bail!("schedule must keep a non-empty --prompt, --script, or both");
+    }
     let now_ms = unix_timestamp_ms();
     conn.execute(
         "UPDATE schedules
@@ -1925,6 +2233,12 @@ pub fn delete_schedule(state_dir: &Path, id_or_name: &str) -> Result<Option<Sche
     let Some(job) = lookup_schedule(&conn, id_or_name)? else {
         return Ok(None);
     };
+    if job.managed {
+        bail!(
+            "schedule `{}` is managed by config.toml (use `schedule pause` or remove it from config)",
+            job.name
+        );
+    }
     conn.execute(
         "DELETE FROM schedules WHERE id = ?1",
         params![job.id as i64],
@@ -1995,6 +2309,37 @@ pub fn disable_expired_schedule(state_dir: &Path, id: u64, now_ms: i64) -> Resul
     Ok(())
 }
 
+/// Disable any enabled schedule whose `expires_at <= now_ms`, even when its
+/// `next_run_at` is after `expires_at` or `NULL`.
+pub fn sweep_expired_schedules(state_dir: &Path, now_ms: i64) -> Result<usize> {
+    let Some(reader) = open_reader_connection(state_dir)? else {
+        return Ok(0);
+    };
+    if !has_schedules_table(&reader)? {
+        return Ok(0);
+    }
+    let has_expired: bool = reader.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schedules WHERE enabled = 1 AND expires_at IS NOT NULL AND expires_at <= ?1)",
+        params![now_ms],
+        |r| r.get(0),
+    )?;
+    drop(reader);
+    if !has_expired {
+        return Ok(0);
+    }
+    let conn = open_migrated_writer(state_dir)?;
+    let n = conn.execute(
+        "UPDATE schedules
+         SET enabled = 0, next_run_at = NULL, last_status = 'expired', updated_at = ?1
+         WHERE enabled = 1 AND expires_at IS NOT NULL AND expires_at <= ?1",
+        params![now_ms],
+    )?;
+    Ok(n)
+}
+
+/// Atomically record a schedule firing outcome in SQLite without clobbering
+/// concurrent CLI edits (`max_runs`, `enabled`, `consecutive_failures`).
+/// Returns the updated `consecutive_failures` count.
 #[allow(clippy::too_many_arguments)]
 pub fn record_schedule_outcome(
     state_dir: &Path,
@@ -2003,55 +2348,46 @@ pub fn record_schedule_outcome(
     updated_at: i64,
     last_status: &str,
     last_error: Option<&str>,
-    run_count: u64,
-    consecutive_failures: u64,
-    disable: bool,
-) -> Result<()> {
+    failed: bool,
+    manual: bool,
+    force_disable: bool,
+) -> Result<u64> {
     let conn = open_migrated_writer(state_dir)?;
-    if disable {
-        conn.execute(
+    let new_failures: i64 = conn
+        .query_row(
             "UPDATE schedules
-             SET enabled = 0,
-                 next_run_at = NULL,
-                 run_count = ?2,
-                 consecutive_failures = ?3,
-                 last_run_at = ?4,
-                 last_status = ?5,
-                 last_error = ?6,
-                 updated_at = ?7
-             WHERE id = ?1",
+             SET run_count = run_count + 1,
+                 consecutive_failures = CASE WHEN ?5 = 1 THEN consecutive_failures + 1 ELSE 0 END,
+                 last_run_at = ?2,
+                 last_status = ?3,
+                 last_error = ?4,
+                 enabled = CASE
+                     WHEN ?7 = 1 OR (?6 = 0 AND max_runs IS NOT NULL AND run_count + 1 >= max_runs)
+                     THEN 0
+                     ELSE enabled
+                 END,
+                 next_run_at = CASE
+                     WHEN ?7 = 1 OR (?6 = 0 AND max_runs IS NOT NULL AND run_count + 1 >= max_runs)
+                     THEN NULL
+                     ELSE next_run_at
+                 END,
+                 updated_at = ?8
+             WHERE id = ?1
+             RETURNING consecutive_failures",
             params![
                 id as i64,
-                run_count as i64,
-                consecutive_failures as i64,
                 last_run_at,
                 last_status,
                 last_error,
+                i64::from(failed),
+                i64::from(manual),
+                i64::from(force_disable),
                 updated_at,
             ],
-        )?;
-    } else {
-        conn.execute(
-            "UPDATE schedules
-             SET run_count = ?2,
-                 consecutive_failures = ?3,
-                 last_run_at = ?4,
-                 last_status = ?5,
-                 last_error = ?6,
-                 updated_at = ?7
-             WHERE id = ?1",
-            params![
-                id as i64,
-                run_count as i64,
-                consecutive_failures as i64,
-                last_run_at,
-                last_status,
-                last_error,
-                updated_at,
-            ],
-        )?;
-    }
-    Ok(())
+            |r| r.get(0),
+        )
+        .unwrap_or(i64::from(failed));
+    Ok(new_failures.max(0) as u64)
 }
 
 #[cfg(test)]
@@ -2288,6 +2624,14 @@ mod tests {
         );
         assert!(parse_time_spec("2026-11-24", now).is_ok());
         assert!(parse_time_spec("bogus", now).is_err());
+        // Impossible calendar dates are rejected strictly instead of overflowing.
+        assert!(parse_time_spec("2027-02-31", now).is_err());
+        assert!(parse_until_time_spec("2027-02-31", now).is_err());
+        // `parse_until_time_spec` makes date-only bounds inclusive through 23:59:59.999.
+        let since_day = parse_time_spec("2026-11-24", now).unwrap();
+        let until_day = parse_until_time_spec("2026-11-24", now).unwrap();
+        assert!(until_day > since_day);
+        assert!(until_day - since_day >= 23 * 3_600_000);
     }
 
     #[tokio::test]
@@ -2338,6 +2682,159 @@ mod tests {
         assert!(list_schedules(&dir, true).unwrap().is_empty());
 
         store.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_schedules_oneshot_reuse_and_suppressed_first_pruning() {
+        use crate::config::ScheduledJobConfig;
+        use std::collections::BTreeMap;
+
+        let dir = scratch("v3-managed-and-prune");
+        // Seed schema v2 database directly to verify v2 -> v3 migration.
+        {
+            let conn = open_writer_connection(&dir).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+
+        let (store, _) = Store::open(
+            &dir,
+            &HistoryConfig {
+                retention_days: 90.0,
+                max_entries: 2,
+                suppressed_days: 7.0,
+            },
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+
+        // 1. Declarative managed schedules sync, reject `delete_schedule`, and
+        //    clean up when removed from config.
+        let mut jobs = BTreeMap::new();
+        jobs.insert(
+            "morning-digest".to_string(),
+            ScheduledJobConfig {
+                enabled: true,
+                schedule: "*/5 5-14 * * *".to_string(),
+                prompt: "digest v1".to_string(),
+                profile: "deep".to_string(),
+                script: "echo hi".to_string(),
+                no_agent: false,
+                suppress_token: Some("HEARTBEAT_OK".to_string()),
+                failure_deliver: FailureDeliver::Notify,
+            },
+        );
+        sync_managed_schedules(&dir, &jobs, now).unwrap();
+        let seeded = get_schedule(&dir, "morning-digest").unwrap().unwrap();
+        assert!(seeded.managed);
+        assert_eq!(seeded.prompt, "digest v1");
+        assert!(delete_schedule(&dir, "morning-digest").is_err());
+
+        jobs.get_mut("morning-digest").unwrap().prompt = "digest v2".to_string();
+        sync_managed_schedules(&dir, &jobs, now + 1000).unwrap();
+        let updated = get_schedule(&dir, "morning-digest").unwrap().unwrap();
+        assert_eq!(updated.id, seeded.id);
+        assert_eq!(updated.prompt, "digest v2");
+
+        jobs.clear();
+        sync_managed_schedules(&dir, &jobs, now + 2000).unwrap();
+        assert!(get_schedule(&dir, "morning-digest").unwrap().is_none());
+
+        // 2. Disabled one-shot schedule (`at ...`) is reused cleanly on name collision,
+        //    whereas a paused recurring schedule still errors on duplicate name.
+        let oneshot = create_schedule(
+            &dir,
+            &NewSchedule {
+                name: "tea-timer".to_string(),
+                schedule_spec: "in 5m".to_string(),
+                prompt: "steep tea".to_string(),
+                profile: String::new(),
+                script: String::new(),
+                no_agent: false,
+                suppress_token: None,
+                failure_deliver: FailureDeliver::Notify,
+                max_runs: None,
+                expires_at: None,
+                next_run_at: now + 300_000,
+            },
+            128,
+        )
+        .unwrap();
+        record_schedule_outcome(
+            &dir,
+            oneshot.id,
+            now + 300_000,
+            now + 300_000,
+            "ok",
+            None,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        let reused = create_schedule(
+            &dir,
+            &NewSchedule {
+                name: "tea-timer".to_string(),
+                schedule_spec: "in 10m".to_string(),
+                prompt: "steep green tea".to_string(),
+                profile: String::new(),
+                script: String::new(),
+                no_agent: false,
+                suppress_token: None,
+                failure_deliver: FailureDeliver::Notify,
+                max_runs: None,
+                expires_at: None,
+                next_run_at: now + 600_000,
+            },
+            128,
+        )
+        .unwrap();
+        assert_eq!(reused.id, oneshot.id);
+        assert!(reused.enabled);
+        assert_eq!(reused.prompt, "steep green tea");
+
+        // 3. Under `max_entries = 2`, newer `suppressed` noise is evicted before
+        //    older `completed` user conversations.
+        for id in [1u64, 2] {
+            store.create_turn(NewTurn {
+                id,
+                lane: Lane::Interactive,
+                status: TurnStatus::Queued,
+                profile: String::new(),
+                created_at_ms: now + (id as i64) * 10,
+                request: format!("important question {id}"),
+                attachments: vec![],
+            });
+            store.finish_completed(id, format!("important answer {id}"), vec![], now + 100);
+        }
+        store.create_turn(NewTurn {
+            id: 3,
+            lane: Lane::Background,
+            status: TurnStatus::Queued,
+            profile: String::new(),
+            created_at_ms: now + 500,
+            request: "noisy heartbeat".to_string(),
+            attachments: vec![],
+        });
+        store.finish_suppressed(3, "HEARTBEAT_OK".to_string(), now + 600);
+        store.shutdown().await;
+
+        let (store2, _) = Store::open(
+            &dir,
+            &HistoryConfig {
+                retention_days: 90.0,
+                max_entries: 2,
+                suppressed_days: 7.0,
+            },
+        )
+        .unwrap();
+        assert!(get_turn(&dir, 1).unwrap().is_some());
+        assert!(get_turn(&dir, 2).unwrap().is_some());
+        assert!(get_turn(&dir, 3).unwrap().is_none());
+        store2.shutdown().await;
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

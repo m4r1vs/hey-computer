@@ -262,7 +262,12 @@ enum ScheduleCommand {
         profile: Option<String>,
         #[arg(long, value_name = "CMD")]
         script: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            value_name = "BOOL"
+        )]
         no_agent: Option<bool>,
         /// Set or clear (`""`) the suppress token.
         #[arg(long, value_name = "TOKEN")]
@@ -435,7 +440,40 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let config = Config::load(cli.config.as_deref())?;
+    // Pure socket client subcommands do not read config.toml so a long-running
+    // front end or Waybar watcher survives config additions across rebuilds.
+    match &cli.command {
+        Command::Cancel { id } => {
+            let socket = ipc::socket_path(cli.socket.as_deref())?;
+            return cancel_id(&socket, *id).await;
+        }
+        Command::Status { json } => {
+            let socket = ipc::socket_path(cli.socket.as_deref())?;
+            return match ipc::request(&socket, &Request::Status).await? {
+                Reply::Status(status) => {
+                    if *json {
+                        println!("{}", serde_json::to_string(&status)?);
+                    } else {
+                        println!("{status}");
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                other => unexpected(other),
+            };
+        }
+        _ => {}
+    }
+
+    let config = match (&cli.command, cli.config.as_deref()) {
+        (Command::Ask { .. }, None) => match Config::load(None) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::debug!("falling back to default client config for ask: {e:#}");
+                Config::default()
+            }
+        },
+        _ => Config::load(cli.config.as_deref())?,
+    };
 
     match cli.command {
         Command::Daemon => {
@@ -684,7 +722,7 @@ fn recall_cmd(
         .transpose()?;
     let until_ms = until
         .as_deref()
-        .map(|s| store::parse_time_spec(s, now_ms))
+        .map(|s| store::parse_until_time_spec(s, now_ms))
         .transpose()?;
     let query = if words.is_empty() {
         None
@@ -1102,6 +1140,9 @@ async fn schedule_cmd(
                     patch.expires_at = Some(None);
                 } else {
                     let ts = scheduler::parse_expires_at(&exp, now_ms)?;
+                    if ts <= now_ms {
+                        anyhow::bail!("--expires time must be in the future");
+                    }
                     patch.expires_at = Some(Some(ts));
                 }
             }
@@ -1350,6 +1391,14 @@ mod tests {
             vec!["hey-computer", "tasks", "open", "3"],
             vec!["hey-computer", "tasks", "copy", "3"],
             vec!["hey-computer", "tasks", "cancel", "3"],
+            vec!["hey-computer", "schedule", "edit", "foo", "--no-agent"],
+            vec![
+                "hey-computer",
+                "schedule",
+                "edit",
+                "foo",
+                "--no-agent=false",
+            ],
             vec!["hey-computer", "recall"],
             vec![
                 "hey-computer",
