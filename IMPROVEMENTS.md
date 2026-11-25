@@ -5,9 +5,9 @@ it up (voice prefix rule in npu-dictate, Hyprland window rule, the
 `programs.hey-computer` options), and patterns reported by users of other personal
 AI harnesses (Hermes Agent, LifeOS / PAI, OpenClaw, and hardened offshoots
 NanoClaw / ZeroClaw). Items are ordered for implementation from highest
-immediate payoff and lowest risk through core harness primitives to multi-mode
-and reactive messaging. Implemented items are collected under [Done](#done) with
-their commit.
+immediate payoff and lowest risk through core harness primitives to unified
+workday-aware context and reactive messaging. Implemented items are collected
+under [Done](#done) with their commit.
 
 ## From voice Q&A to a personal delegation harness
 
@@ -20,8 +20,8 @@ CWD/`tmux` context, an agent-authored hybrid scheduler, 3-tier smart routing,
 turn-budget awareness, host skills/MCP integrations, a native GTK4 + WebKitGTK
 6.0 answer viewer with `mcp-ui` widgets and template skills, periodic
 memory/skill distillation, and modality-matched DE/EN streaming spoken answers
-are all in place. Phase 6 builds multi-mode daemon isolation and reactive
-notification/messenger bridges on top.
+are all in place. Phase 6 adds unified workday-aware context/briefing and
+reactive notification/messenger bridges on top.
 
 **Triage & trust policy:** Items below are tagged `[Important]` or
 `[Lower priority]`, along with where the change lives (`[Config]` for the
@@ -56,67 +56,72 @@ All Phase 4 items (#20–#28) are implemented and listed under [Done](#done).
 
 All Phase 5 items (#29–#32) are implemented and listed under [Done](#done).
 
-## Phase 6: Multi-mode isolation & reactive messaging
+## Phase 6: Unified work/personal context & reactive messaging
 
-Highest operational surface; best built once the single-mode daemon and its
-tooling are mature.
+Builds workday-aware personal + work briefing and reactive incoming-message
+workflows on top of the single daemon.
 
 33. `[Lower priority]` `[Upstream + Config]` **Native keyring wait
     (`agent.wait_for_keyring`).** Move the consumer's GNOME Keyring wait into
     the daemon before warm start so downstream Home Manager configs do not need
     to `mkForce` `ExecStart` (which otherwise silently masks future module
-    changes and complicates the systemd template unit in #34). Wait for
-    `org.freedesktop.secrets` to be unlocked before warm start (avoiding a
-    hidden gcr-prompter behind the lock screen timing out).
+    changes). Wait for `org.freedesktop.secrets` to be unlocked before warm
+    start (avoiding a hidden gcr-prompter behind the lock screen timing out).
 
     *Implementation note:* Bind `hey-computer.sock` **first** and watch
     `org.freedesktop.secrets` `Locked == false` via a D-Bus `PropertiesChanged`
     subscription inside `Conductor::run`'s `select!` loop (rather than a `0.5 s`
     `dbus-send` shell poll), exposing `agent: "locked"` (or `"starting"`) via
     `status --json` so Waybar and Rofi reflect the locked state immediately.
-34. `[Important]` **Work and personal modes.** A mode is a named profile of
-    everything the agent can reach: MCP servers, skills, instructions, vault,
-    accounts and model.
-    - **Work:** the employer's Linear (official MCP with read/write access,
-      already wired via `mcp_oauth_tokens_file`), GitLab, Slack (including
-      read-only forwarded work email) and Google Calendar / Drive.
-    - **Personal:** personal Gmail, Google Calendar, Contacts, Drive and Tasks,
-      private GitHub projects (`gh`), WhatsApp, Signal.
+34. `[Important]` `[Config]` **Unified work + personal mode & workday-aware
+    Morning Brief.** Keep **one** single daemon instance that reaches both
+    personal and work integrations simultaneously—no split `hey-computer@work` /
+    `hey-computer@personal` daemons, socket switching, or separate conversation
+    history/memory.
+    - **Work & personal in one harness:**
+      - **Work:** the employer's Linear (official MCP with read/write access,
+        already wired via `mcp_oauth_tokens_file`), GitLab (direct write access
+        allowed without permission prompts), Slack (including read-only
+        forwarded work email), and work Google Calendar / Drive.
+      - **Personal:** personal Gmail, Google Calendar, Contacts, Drive and
+        Tasks, private GitHub projects (`gh`), WhatsApp, Signal, and Philips Hue
+        (`openhue`).
+      - Single-daemon foundations already in place in the consuming
+        configuration: `open-browser work|personal`, multi-account
+        `google-workspace` OAuth with `google-workspace-auth <email>
+        [work|personal]`, and prompt-level separation routing work mail via
+        Slack DM while keeping Gmail and Google Tasks strictly on the personal
+        account. Points settled: the employer allows sending work data (Linear,
+        GitLab, Slack, calendar) to the model service, and everything runs as
+        the same Unix user (not an OS security boundary).
+    - **Workday-aware Morning Brief (`morning-digest`) & standup
+      (`pre-daily`):**
+      - **Working days:** the Morning Brief covers **both personal and work**
+        items (personal + work Google Calendars, unread personal Gmail,
+        non-noise forwarded work emails in Slack, and urgent Slack/Linear/GitLab
+        updates).
+      - **Weekends & days off:** the Morning Brief covers **only personal**
+        items (personal calendar, unread personal Gmail, personal tasks—skipping
+        work calendar, forwarded work mail, Slack, Linear, and GitLab
+        completely), and `pre-daily` suppresses itself (`HEARTBEAT_OK`).
+      - **Day-off detection via personal Google Calendar:** treat a day as a
+        **working day** only on weekdays (`Mon–Fri`) when an `"Arbeit"` event is
+        scheduled for that day in the personal Google Calendar (and no
+        all-day vacation/out-of-office override applies). Weekends or weekdays
+        without an `"Arbeit"` event in personal Google Calendar (vacation,
+        public holidays, sick/flex days off) automatically switch the brief to
+        personal-only.
 
-    *(Interim single-daemon mitigations already in place in the consuming
-    configuration: `open-browser work|personal`, multi-account
-    `google-workspace` OAuth with `google-workspace-auth <email> [work|personal]`,
-    and prompt-level separation routing work mail via Slack DM while keeping
-    Gmail and Google Tasks on the personal account.)*
-
-    The simplest clean design is one daemon instance per mode (a systemd
-    template unit, `hey-computer@work` / `hey-computer@personal`), each with its
-    own socket, `state_dir` and agy `--gemini-dir`. Then conversation history,
-    memory and agy's transcripts never mix between modes. The front ends talk to
-    whichever socket is active; switch with a voice command, a keybind or a
-    Waybar click, and show the active mode in Waybar. Points settled:
-    - **Not a security boundary.** Both instances run as the same user, so each
-      can read the other's tokens on disk. Separate Unix users would be needed
-      for a real boundary.
-    - **Work data policy.** Settled: the employer allows sending work data
-      (Linear, GitLab, Slack, calendar) to the model service.
-    - **GitLab write access.** Allowed directly without permission prompts.
-
-    *Implementation notes from codebase review:*
-    - Namespace `$XDG_RUNTIME_DIR/hey-computer/` viewer/answer Markdown files per
-      instance (`daemon.rs`, `present.rs`, `main.rs`) and pass instance-aware
-      `--socket` / `--state-dir` to `hey-computer-viewer` so `work` and
-      `personal` windows, follow-ups, and answer files never collide or prune
-      each other.
-    - Export `HEY_COMPUTER_SOCKET` and `HEY_COMPUTER_CONFIG` alongside
-      `HEY_COMPUTER_STATE_DIR` in `acp.rs` and `scheduler.rs` so
-      `hey-computer schedule|recall|tasks|distill|speak|view` invoked by skills
-      or jobs inside `hey-computer@work` vs `hey-computer@personal` hit the
-      matching daemon socket and config.
-    - Splitting stdio MCP servers across `work` (`gitlab`, `linear`, `slack`,
-      work Calendar/Drive) and `personal` (`gmail`, personal
-      Calendar/Contacts/Drive/Tasks, `gh`, `openhue`) will also roughly halve
-      per-daemon idle/peak RSS and swap usage.
+    *Implementation notes:*
+    - Verify `google-workspace-mcp` multi-account credential selection when both
+      personal and work `<email>.json` tokens live in `credentialsDir` (in
+      particular whether `--single-user` pins one account vs. honoring
+      `user_google_email` across both personal and work Calendar/Drive calls in
+      the same session).
+    - Have `morning-digest` (and `pre-daily`) check the personal Google Calendar
+      for today's `"Arbeit"` event **first**—before calling any work MCP tools
+      (`slack`, `linear`, `gitlab`, or work Google Calendar)—so weekends and
+      days off never spend tool calls on or surface work noise.
 35. `[Important]` **Acting on incoming notifications (v1: notification text
     only).** Watch notifications (a D-Bus monitor on
     `org.freedesktop.Notifications`, or a hook in the notification daemon) for
@@ -147,8 +152,10 @@ tooling are mature.
     - **Cost and noise.** A cheap filter decides first whether a message
       deserves a model at all (sender allowlist, group chats off, quiet hours),
       with `HEARTBEAT_OK`-style suppression (#17) and a rate limit.
-    - **Only for the active mode** (#34), so work messages never get drafts from
-      the personal profile and the other way round.
+    - **Channel-scoped & workday-aware** (#34): drafts run in the MCP-free
+      restricted lane from the notification's own app/sender/text preview, and
+      work-app notifications (if allowlisted) can be suppressed on weekends and
+      detected days off alongside quiet hours.
 36. `[Important]` **Separate messenger bridge (WhatsApp / Signal) & phone
     self-chat.** Worth adding once v1 drafts (#35) prove useful and need the
     previous messages of a chat, or when you want to talk to hey-computer from
