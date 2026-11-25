@@ -13,13 +13,15 @@ their commit.
 
 Originally hey-computer handled one request at a time, a new `ask` superseded
 the running one, and the result lived only as a notification or a file in
-`$XDG_RUNTIME_DIR`. Phases 1–4 have closed that core gap: persistent SQLite WAL
-+ FTS5 history (`history.db`), multi-lane background tasks, local recall, MCP
-passthrough with lazy schema loading, ambient CWD/`tmux` context, an
-agent-authored hybrid scheduler, 3-tier smart routing, turn-budget awareness,
-and host skills/MCP integrations are all in place. Phases 5–6 build a dedicated
-interactive viewer, periodic memory/skill distillation, spoken answers,
-multi-mode daemon isolation, and reactive notification/messenger bridges on top.
+`$XDG_RUNTIME_DIR`. Phases 1–5 have closed that core gap and output UX:
+persistent SQLite WAL + FTS5 history (`history.db`), multi-lane background
+tasks, local recall, MCP passthrough with lazy schema loading, ambient
+CWD/`tmux` context, an agent-authored hybrid scheduler, 3-tier smart routing,
+turn-budget awareness, host skills/MCP integrations, a native GTK4 + WebKitGTK
+6.0 answer viewer with `mcp-ui` widgets and template skills, periodic
+memory/skill distillation, and modality-matched DE/EN streaming spoken answers
+are all in place. Phase 6 builds multi-mode daemon isolation and reactive
+notification/messenger bridges on top.
 
 **Triage & trust policy:** Items below are tagged `[Important]` or
 `[Lower priority]`, along with where the change lives (`[Config]` for the
@@ -50,99 +52,9 @@ All Phase 3 items (#15–#19) are implemented and listed under [Done](#done).
 
 All Phase 4 items (#20–#28) are implemented and listed under [Done](#done).
 
-## Phase 5: Better output UX (viewer, distillation & spoken answers)
+## Phase 5: Better output UX (viewer, distillation & spoken answers) — Implemented
 
-Built after the `$XDG_STATE_HOME` history store (#17–#18) and the typed front
-end (#4) are in place.
-
-29. `[Important]` **A much better answer view, with actions & interactive
-    widgets (WebKitGTK).** Marker has known limits (README: an editor at heart
-    with Open/Save buttons, umlauts break syntax highlighting, last release in
-    2023). Build a dedicated **WebKitGTK** viewer that offers:
-    - copy the whole answer or a single code block;
-    - run a code block directly on click (no permission prompt);
-    - open links (still disarmed until clicked);
-    - a follow-up input field that continues the same conversation;
-    - "save to vault" (append to today's note) and "open in editor";
-    - a history of recent answers (ties in with `hey-computer last` #14 and the
-      local recall index #18);
-    - **interactive `show_widget` HTML widgets** baked directly into the viewer
-      (personal-use trust model — no strict sandboxed iframe required): a
-      `sendPrompt(text)` JS bridge so widget buttons/forms can trigger follow-up
-      turns in the same conversation, a theme bridge injecting live light/dark
-      CSS variables (pairs with `darkman`), and an uncaught-error reporter that
-      surfaces broken widget JS back to the session.
-
-    Short answers should get notification actions too: Copy, Reply (opens the
-    typed front end #4 in follow-up mode) and Open in viewer. Keep HTML and
-    remote-image disarming for regular Markdown answers.
-
-    *Implementation notes from codebase review:*
-    - **Conversation resumption beyond `follow_up_secs`:** Reading a long answer
-      or interacting with a widget often takes longer than `follow_up_secs`
-      (90 s), after which `conductor.rs` has closed the live ACP session (and
-      background task sessions close immediately on completion). Add
-      `reply_to: Option<u64>` to `Request::Ask` and use the existing
-      `idx_turns_conversation_id` SQLite index in `store.rs` to seed a fresh ACP
-      session with prior turns from `history.db` when the live session is gone.
-    - **Structured `show_widget` delivery:** Capture widget payloads strictly
-      from dedicated ACP tool calls in `conductor::turn`, never from fenced code
-      blocks inside Markdown answers (which untrusted web or note content could
-      forge).
-    - **Short-answer notification replacement & waiter eviction:** Update
-      `wait_action_notification` in `present.rs` to pass
-      `--print-id --replace-id=N` (reading line 1's notification ID before
-      awaiting action selection) so short answers with `Copy` / `Reply` / `Open`
-      actions still replace `"Thinking…"` cleanly in place, and use LRU eviction
-      (rather than dropping new waiters) on `MAX_ACTION_WAITERS` (`16`).
-30. `[Important]` `[Upstream]` **Periodic memory & skill distillation
-    (`hey-computer distill`).** Dedicated CLI subcommand (run manually or via a
-    weekly background task) that reviews recent `history.db` turns (#17–#18)
-    against `instructions.memory_file` / `instructions.memory_files` (#8) and
-    proposes a minimal diff to `memory.md` (promoting durable preferences/facts
-    while respecting the 4,000-char cap and pruning stale entries) and/or draft
-    `SKILL.md` files for workflows repeated 3+ times. Pairs with the improved
-    viewer (#29) so you review and apply diffs manually — never auto-applied,
-    avoiding skill poisoning.
-
-    *Implementation notes from codebase review:*
-    - **Two-tier read-only + mutable memory compatibility:** When `memory.file`
-      points to a read-only `agenix` secret (`/run/agenix/…`) paired with a
-      mutable `$XDG_STATE_HOME/hey-computer/memory.md` via `memory_files`
-      (`memory.extraFiles`, added in `8dc667d`), load the combined memory set
-      for deduplication and `memory_max_chars` budgeting while targeting diffs
-      and writes strictly at the writable state memory file (idle fingerprint
-      auto-reloading will then refresh `AGENTS.md` automatically).
-    - **Exclude scheduled/collector turns:** Add a `schedule_id` / `origin`
-      column on `turns` in `history.db` so `hey-computer distill` skips
-      automated scheduled and pre-collector turns—preventing both false
-      "repeated 3+ times" `SKILL.md` candidates from recurring jobs and
-      memory/skill poisoning from `<untrusted_collector_output>`.
-31. `[Important]` `[Upstream]` **Optional audio feedback hook (`present.speak` /
-    earcons, streaming-ready).** For hands-free voice ergonomics, add an
-    optional `present.speak` hook (e.g. Piper or Kokoro) or subtle earcons that
-    can accept streamed sentence chunks as `agent_message_chunk` updates arrive
-    from `conductor.rs`, with `cancel` stopping playback immediately.
-32. `[Important]` **Optional spoken answers (streaming TTS).** Expands the
-    `present.speak` hook (#31). Use a local TTS engine (Piper or Kokoro) with a
-    German and an English voice, streaming completed sentences as chunks arrive
-    over ACP to cut time-to-first-audio (detecting DE vs EN on sentence 1).
-    Speak short answers whole; if subsequent chunks push past the short
-    threshold (or hit code blocks/tables), stop queuing further sentences and
-    open the viewer instead (never stream TTS on background or
-    `--suppress-token` turns). `cancel` or pressing the talk key stops speech at
-    once (and barge-in stops it once hotword detection lands). Lower media
-    volume (or pause via playerctl) while speaking. Make it a toggle that is
-    easy to reach (voice command, Waybar click), because it's wanted at the desk
-    only sometimes.
-
-    *Implementation notes for #31–#32:*
-    - **Post-turn `cancel` & Tier 2 escalation flush:** Route
-      `Request::Cancel { id: None }` (`hey-computer cancel`) to stop active TTS
-      audio in `Presenter` **even after the ACP turn has already completed**,
-      since short spoken answers finish streaming from the LLM seconds before
-      audio playback finishes. Also abort/flush any queued TTS chunks if Tier 2
-      (`escalate_on_failure`) retries a failed `fast` turn on `deep`.
+All Phase 5 items (#29–#32) are implemented and listed under [Done](#done).
 
 ## Phase 6: Multi-mode isolation & reactive messaging
 
@@ -318,6 +230,26 @@ tooling are mature.
 
 ## Done
 
+- `[Important]` `[Upstream]` `[Done: e5decb7, 69fd4ea, 0cb1a36, aeb64fc]` **GTK4 + WebKitGTK 6.0 answer viewer
+  (`hey-computer-viewer`), `mcp-ui` widgets & template skills, `hey-computer
+  distill`, & voice-matched DE/EN streaming TTS (#29, #30, #31, #32).**
+  Promoted the `poc/viewer` prototype into the production `hey-computer-viewer`
+  binary (`application_id = "hey-computer.answer"`, `NON_UNIQUE`, `hc://`
+  disarmed asset scheme, Flexoki dual-theme `syntect`/`two-face` code blocks with
+  inline `▶ Run`, `pulldown-latex` MathML Core, Morning Brief auto drop-caps,
+  `Info` (`i`) toggle, `inert`-hardened SQLite FTS5 Recall drawer (`h`),
+  local-date Vault Journal save (`v`), and live `~/.theme/{mode,palette.json}`
+  `inotify` sync) and removed Marker and `poc/viewer/`. Bumped `history.db` to
+  schema v4 (`widgets_json`, `origin`, `schedule_id`), added `reply_to` live/DB
+  session resumption and `stream: true` socket streaming, added internal stdio
+  `hey-computer mcp-ui` (`show_widget` and `propose_widget_template` with
+  user-skill linking + idle reload), added `hey-computer distill` with two-tier
+  read-only + mutable `memory_files` budgeting and scheduled-turn exclusion,
+  added short-answer `Copy`/`Reply`/`Open` notifications with `--replace-id` and
+  LRU waiter eviction, and added `[present.speak]` / `hey-computer speak`
+  (`programs.hey-computer.speak`) with voice-only modality matching, widget
+  restraint on voice queries, sentence-streamed DE/EN TTS, media ducking,
+  earcons, Tier 2 escalation flush, and post-turn `cancel`.
 - `[Important]` `[Upstream + Config]` `[Done: 8dc667d, NixConfig c7f1428, f8cb9b8]`
   **Post-Phase-4 review hardening, declarative scheduler jobs, multi-file memory
   auto-reload, & UX polish (#8, #9, #17, #23, #26, #27, #28).** Added

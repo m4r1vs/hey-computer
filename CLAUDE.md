@@ -7,10 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A user daemon (Rust, edition 2024, tokio) that keeps one ACP agent process (`agy acp`, the
 Antigravity CLI) warm and answers one-shot requests: `hey-computer ask` hands it a request,
 usually a speech transcript; the agent works on it with tools; the answer is shown as a
-notification when short, in a Markdown viewer (Marker by default) when long or rich. README.md
-is the user-facing reference: command line, socket protocol, configuration, Home Manager
-module, permission model. Keep it, `Config` in `src/config.rs`, and the module's options in
-`nix/home-manager.nix` in sync when adding a key.
+notification (plus optional DE/EN sentence-streamed TTS when asked via `--voice`) when short,
+or in the native GTK4 + WebKitGTK 6.0 viewer (`hey-computer-viewer`) when long, rich, or
+carrying `mcp-ui` widgets. README.md is the user-facing reference: command line, socket
+protocol, configuration, Home Manager module, permission model. Keep it, `Config` in
+`src/config.rs`, and the module's options in `nix/home-manager.nix` in sync when adding a key.
 
 The repository is public. Never commit local paths, host names, personal names, e-mail
 addresses (git's author field aside), credentials, or recorded agy logs: they carry account
@@ -37,7 +38,11 @@ files: `git add` new files before building.
 
 ## Architecture
 
-One binary. `daemon` owns the socket; every other subcommand is a client.
+One package, two binaries: `hey-computer` (`daemon`, `ask`, `cancel`, `status`, `speak`,
+`distill`, `view`, `last`, `tasks`, `recall`, `schedule`, internal `mcp-ui`, and `debug` —
+pure Rust, never linking GTK4/WebKitGTK) and `hey-computer-viewer` (native GTK4 + WebKitGTK
+6.0 viewer with `application_id = "hey-computer.answer"`, `NON_UNIQUE`). `daemon` owns the
+socket; every other subcommand is a client.
 
 - `protocol`, `ipc`: the JSON-lines socket protocol (documented at the top of
   `protocol.rs` and in README) and the client side. `lines`: bounded line reading shared by

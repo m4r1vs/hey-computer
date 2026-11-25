@@ -40,11 +40,17 @@ answered by the daemon at once (see [permission model](#permission-model)).
 When the turn ends, the answer is persisted to `history.db` and shown:
 
 - **short and plain** (by default at most 230 characters and 4 lines, and no
-  heading, table, code block or LaTeX math): a notification. The text is
-  escaped for Pango markup; `**bold**` and `` `code` `` are rendered.
+  heading, table, code block, LaTeX math, or structured `mcp-ui` widget): a
+  notification with **Copy**, **Reply**, and **Open** actions (replacing
+  `"Thinking…"` in place). The text is escaped for Pango markup; `**bold**` and
+  `` `code` `` are rendered. When spoken answers (`[present.speak]`) are enabled
+  and the request arrived via `--voice`, completed sentences are also streamed
+  to local TTS (auto-detecting German vs English on sentence 1), while typed
+  and CLI requests stay text-only.
 - **otherwise**: the Markdown is written to a private file under
-  `$XDG_RUNTIME_DIR/hey-computer/` (the newest 20 are kept), the viewer is
-  started with it, and a one-line notification names it.
+  `$XDG_RUNTIME_DIR/hey-computer/` (the newest 20 are kept), the native GTK4 +
+  WebKitGTK 6.0 answer viewer (`hey-computer-viewer`) is started with `--turn-id`
+  and the file, and a one-line notification names it.
 
 While an interactive request runs, a low-urgency "Thinking…" notification is
 shown (tagged with the profile name when non-default), updated in place with
@@ -155,10 +161,13 @@ hey-computer [--config FILE] [--socket PATH] [-v|-vv] COMMAND
 | Command | What it does |
 |---|---|
 | `daemon` | Run the daemon. |
-| `ask [--print] [--new] [-b\|--background] [--suppress-token TOKEN] [-p\|--profile NAME] [--voice \| --source cli\|voice\|typed] [-f\|--file PATH]... [-i\|--image PATH]... [--] [TEXT...]` | Hand the daemon a request: the arguments joined by spaces, or stdin when there are none (up to 256 KiB; skipped if stdin is a TTY and attachments were passed). Without `--print` it exits 0 as soon as accepted; background tasks print their task ID to stdout with no submission popup. With `--print` it waits, prints the answer on stdout and exits 0 (silently when matched by `--suppress-token`), or prints the failure on stderr and exits 1; the daemon shows nothing. `--new` starts a new conversation; `-p`/`--profile` picks a `[profiles.<name>]` (or `default`); `--voice` / `--source` tags input origin for `[routing]` (voice skips LLM triage); `-f`/`--file` attaches UTF-8 text files; `-i`/`--image` attaches PNG/JPEG/WebP/GIF images. Ctrl-C while waiting cancels the request. |
-| `cancel [--id ID]` | Cancel the running interactive request, or a specific running/queued task with `--id`: `cancelled request N` or `nothing to cancel`. |
-| `status [--json]` | For example `agent ready, idle, follow-ups for 78 s, 7 handled` (plus active profile and background running/queued counts when non-zero). |
-| `last [--copy \| --open] [--lane interactive\|background\|all] [--json]` | Retrieve the last successful answer (defaults to the `interactive` lane): print it, output JSON, copy to the clipboard (`present.clipboard`), or open in the Markdown viewer (`present.viewer`). Works even when the daemon is stopped. |
+| `ask [--print] [--new \| --reply-to ID] [-b\|--background] [--suppress-token TOKEN] [-p\|--profile NAME] [--voice \| --source cli\|voice\|typed] [-f\|--file PATH]... [-i\|--image PATH]... [--] [TEXT...]` | Hand the daemon a request: the arguments joined by spaces, or stdin when there are none (up to 256 KiB; skipped if stdin is a TTY and attachments were passed). Without `--print` it exits 0 as soon as accepted; background tasks print their task ID to stdout with no submission popup. With `--print` it waits, prints the answer on stdout and exits 0 (silently when matched by `--suppress-token`), or prints the failure on stderr and exits 1; the daemon shows nothing. `--new` starts a new conversation; `--reply-to ID` resumes an earlier turn's conversation (reusing the live ACP session when open, or seeding a fresh session from `history.db`); `-p`/`--profile` picks a `[profiles.<name>]` (or `default`); `--voice` / `--source` tags input origin for `[routing]` and voice-matched TTS (voice skips LLM triage and avoids widgets unless strictly needed); `-f`/`--file` attaches UTF-8 text files; `-i`/`--image` attaches PNG/JPEG/WebP/GIF images. Ctrl-C while waiting cancels the request. |
+| `cancel [--id ID]` | Cancel the running interactive request (or stop ongoing TTS speech after a short voice answer), or cancel a specific running/queued task with `--id`: `cancelled request N` or `nothing to cancel`. |
+| `status [--json]` | For example `agent ready, idle, follow-ups for 78 s, 7 handled` (plus active profile, background running/queued counts, and `speak` / `speaking` state). |
+| `speak [on \| off \| toggle \| status] [--json]` | Enable, disable, toggle, or inspect spoken voice answers (`present.speak`), persisting `<state_dir>/speak_enabled` and updating the running daemon immediately. |
+| `distill [--since SPEC] [--limit N] [-p\|--profile NAME] [-b\|--background] [--print \| --json]` | Review recent user-originated `history.db` turns (skipping scheduled, pre-collector, and suppressed runs) against configured `memory_file` / `memory_files` and propose per-hunk `memory.md` diffs and repeated-workflow `SKILL.md` drafts in `hey-computer-viewer` (never auto-applied). |
+| `view [FILE] [--turn-id ID] [--focus-composer]` | Open a Markdown file or persisted conversation turn in `hey-computer-viewer`. |
+| `last [--copy \| --open] [--lane interactive\|background\|restricted\|all] [--json]` | Retrieve the last successful answer (defaults to the `interactive` lane): print it, output JSON, copy to the clipboard (`present.clipboard`), or open in the viewer (`present.viewer`). Works even when the daemon is stopped. |
 | `tasks [list \| show ID \| open ID \| copy ID \| cancel ID]` | List recent tasks (`--lane`, `--status`, `--all`, `--limit`, `--json`; defaults to the `background` lane), inspect one task, open it in the viewer, copy its answer, or cancel a running/queued task. `list`, `show`, `open`, and `copy` work even when the daemon is stopped. |
 | `schedule [add \| list \| show \| edit \| pause \| resume \| remove \| run]` | Create, inspect, pause, resume, edit, remove, or test-run scheduled jobs stored in `history.db`. `list`/`show` and mutations work even when the daemon is stopped (mutations wake a running daemon automatically); `run <id\|name>` triggers an immediate test run in the running daemon. |
 | `recall [--since SPEC] [--until SPEC] [-n\|--limit N] [--lane ...] [--sort relevance\|recent] [--any] [--full] [--max-chars N] [--raw-fts] [--json] [--plain] [QUERY...]` | Full-text search (SQLite FTS5) over past completed answers, wrapped in `<untrusted_recall>` by default (for agent skill use; `--plain` or `--json` for direct terminal/script use). Time specs accept relative (`24h`, `7d`, `2w`) and calendar (`today`, `yesterday`, `YYYY-MM-DD`) forms. Works even when the daemon is stopped. |
@@ -323,9 +332,21 @@ progress = true                     # "Thinking…" while a request runs (with l
 max_chars = 230                     # longer answers go to the viewer
 max_lines = 4                       # so do answers with more lines
 notifier = ["notify-send"]          # called with notify-send's options
-viewer = []                         # e.g. ["marker", "--preview", "{file}"]; empty: a notification with the path
+viewer = []                         # e.g. ["hey-computer-viewer", "--turn-id", "{id}", "{file}"]
+# reply_command = ["rofi-ask", "--reply-to", "{id}"]
 clipboard = ["wl-copy"]             # fed the raw answer on stdin by `hey-computer last --copy`
 keep_answers = 20                   # answer files kept in $XDG_RUNTIME_DIR/hey-computer
+
+[present.speak]
+enabled = false                     # initial state before `hey-computer speak toggle`
+voice_only = true                   # speak only for `--voice` requests; typed/CLI stays text-only
+media_duck = "none"                 # "none", "pause" (playerctl), or "lower" (pamixer/wpctl)
+# command = ["piper-speak", "{lang}"]
+# command_en = ["piper-speak-en"]
+# command_de = ["piper-speak-de"]
+# earcon_start = ["pw-play", "/path/to/start.oga"]
+# earcon_done = ["pw-play", "/path/to/done.oga"]
+# earcon_cancel = ["pw-play", "/path/to/cancel.oga"]
 
 [tasks]
 max_concurrent = 1                  # concurrent turns in the background lane (1..=8)
@@ -476,8 +497,9 @@ told about Obsidian.
 | `mcp.oauthTokensFile` | null | optional path to an existing `mcp_oauth_tokens.json` (e.g. from interactive `agy`) symlinked into the agent's private directory so OAuth-authenticated remote MCP servers share tokens |
 | `skills.enable` | true | the bundled `hyprland-desktop` skill, plus `recall`, `tmux`, `schedule`, Obsidian, and `openhue` skills when enabled |
 | `skills.extra` | `[]` | more skill directories |
-| `viewer.package` | `pkgs.marker` | installed |
-| `viewer.command` | `env DBUS_SESSION_BUS_ADDRESS=disabled: marker --name=hey-computer.answer --preview {file}` | |
+| `viewer.package` | `null` | optional external viewer package; `null` uses the built-in `hey-computer-viewer` |
+| `viewer.command` | `["${cfg.package}/bin/hey-computer-viewer" "--turn-id" "{id}" "{file}"]` | started in its own `systemd-run --user --scope` |
+| `speak.enable` | `false` | enables `[present.speak]` spoken answers & earcons (`voiceOnly = true` by default; pairs with `pkgs.piper-tts` -> `pw-play` when `voiceEn`/`voiceDe` are set) |
 | `service.enable` | true | the systemd user service |
 
 **The service** is bound to `graphical-session.target` (`After`, `PartOf`,
@@ -515,43 +537,43 @@ with its command-line interface turned on. It drives the real application:
 `eval` (JavaScript inside Obsidian) and `delete` included. Without the app
 running, the agent edits the vault's files directly.
 
-### The Markdown viewer
+### The Answer Viewer (`hey-computer-viewer`)
 
-[Marker](https://github.com/fabiocolacio/Marker) was chosen by trying the
-candidates in nixpkgs on a sample with two heading levels, a table, a code
-block, inline and display math and umlauts, with no network access:
+Long or rich answers—and any turn carrying structured `mcp-ui` widgets—open in
+`hey-computer-viewer`, a native **GTK4 + WebKitGTK 6.0** viewer built directly in
+this package (`application_id = "hey-computer.answer"`, `NON_UNIQUE` so each
+answer gets its own floating Wayland window while keeping session D-Bus active
+for dark/light portal updates):
 
-- **Marker** (GTK3, WebKitGTK): `marker --preview FILE` opens straight into a
-  rendered view; headings are larger than body text; math is typeset by the
-  KaTeX copy the package ships. `--name=hey-computer.answer` (a GTK option)
-  sets the window's Wayland app id, so a window rule can match the assistant's
-  windows only.
-- Apostrophe left the math as raw `\(…\)` in its default preview and showed a
-  blank preview with scripts allowed; it also needs a preference changed to
-  open in preview mode. litemdview and formiko have no math rendering; Iotas
-  cannot open a file from the command line; Folio opens files in an editor.
+- **Typography, code & math:** Flexoki Warm Paper / Warm Ink styling,
+  `syntect` + `two-face` dual-theme Flexoki syntax highlighting with line
+  numbers, click-to-copy (`Copy`) and inline snippet execution (`▶ Run`), and
+  pure-Rust `pulldown-latex` → MathML Core math rendering. Morning Briefs
+  automatically render a floated drop cap (`d` toggles drop caps on other
+  answers); turn timings, profile, lane, and tool provenance stay tucked behind
+  the **`Info` (`i`)** toggle.
+- **Automatic theme & live wallpaper sync:** Tracks `darkman` / GTK
+  `prefer-dark-theme` and `~/.theme/mode`, plus live `inotify` updates from
+  `~/.theme/palette.json` (`--primary-color`, `--secondary-color`, WCAG
+  `--on-primary-color`).
+- **Follow-ups, Recall, Vault & Widgets:** Bottom `"Ask Computer"` composer
+  (`/`) streaming follow-ups over `hey-computer.sock` (`stream: true`,
+  `reply_to: ID`, resuming expired sessions from `history.db`), slide-over
+  SQLite FTS5 **History & Recall** drawer (`h`), **Save to Vault** (`v` →
+  `<vault>/Journal/YYYY-MM-DD.md` in local time), curated MCP cards (Calendar,
+  Transit, Tasks, Dev Triage, Hue Rooms, `distill` diff review), and custom
+  `show_widget` HTML/SVG surfaces (`window.sendPrompt`, `hc:widget-error`
+  boundary, and `Save as Template…` writing reusable `SKILL.md` + `template.html`
+  skills under `~/.config/hey-computer/skills/widget-<slug>/`).
 
-Marker is a unique GApplication: with a session bus, a second answer would be
-added to the first window as an editor tab. The default command therefore sets
-`DBUS_SESSION_BUS_ADDRESS=disabled:` (unsetting it is not enough: GLib falls
-back to `$XDG_RUNTIME_DIR/bus`), and every answer gets its own preview window.
-Marker then cannot save its own preferences.
-
-What Marker does not do: its preview window still has "Open" and "Save"
-buttons (it is an editor at heart), syntax highlighting treats an umlaut as a
-word boundary, level-two headings are only a little larger than body text
-(level one clearly so), and its last release is from 2023.
-
-**Raw HTML and remote images are disarmed.** Marker renders Markdown in a web
-view, where raw HTML in an answer (quoted from a web page, say) would run
-scripts, and a remote image would be fetched as soon as the answer is shown
-(checked: `![x](http://…)` was requested at once). Before the answer file is
-written, every `<` outside code becomes `&lt;` in text and KaTeX's `\lt` in
-math, so it shows as `<` and nothing in it is HTML, and a remote or reference
-image becomes a link (`[image: x](http://…)`), fetched only if you click it.
-Code spans, fenced blocks, autolinks (`<https://…>`) and local images are left
-as they are. Inline HTML a model uses for layout (`<br>`, `<sup>`) therefore
-shows as text. A viewer of your own gets the same file.
+**Raw HTML and remote images are disarmed.** All viewer assets load from an
+in-memory `hc://` URI scheme with external navigation blocked (`https://`,
+`http://`, and `mailto:` user link clicks open externally). Before Markdown is
+rendered or written to `$XDG_RUNTIME_DIR/hey-computer/`, every `<` outside code
+becomes `&lt;` in text and `\lt` in math, and remote/reference/data-URI images
+become links (`[image: x](http://…)`). Structured widgets are captured strictly
+from internal `hey-computer mcp-ui` ACP tool calls—never from Markdown code
+fences.
 
 A floating rule for Hyprland's Lua configuration (checked with 0.55.4):
 
@@ -560,7 +582,7 @@ hl.window_rule({
     name   = "hey-computer-answer",
     match  = { class = "^(hey-computer\\.answer)$" },
     float  = true,
-    size   = "900 700",
+    size   = "1000 1100",
     center = true,
 })
 ```
