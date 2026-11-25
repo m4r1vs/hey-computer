@@ -1686,7 +1686,7 @@ fn attach_theme_dir_monitor(
     monitor.connect_changed(move |_mon, file, other_file, _event| {
         let relevant = [Some(file), other_file].into_iter().flatten().any(|f| {
             f.basename()
-                .and_then(|n| n.into_string().ok())
+                .and_then(|n| n.into_os_string().into_string().ok())
                 .is_some_and(|name| {
                     name == "palette.json" || name == "mode" || name.starts_with('.')
                 })
