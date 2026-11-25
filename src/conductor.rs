@@ -1215,7 +1215,7 @@ impl Conductor {
                 request: &token,
                 stop: &stop,
             };
-            let header = if config.context.is_enabled() {
+            let ambient = if config.context.is_enabled() {
                 tokio::select! {
                     header = context_provider.gather(&config.context) => header,
                     reason = interrupts.wait() => {
@@ -1237,6 +1237,21 @@ impl Conductor {
                 }
             } else {
                 None
+            };
+            let budget_header = if config.context.is_enabled() {
+                context::format_turn_budget(
+                    used_profile.as_deref(),
+                    budgets.max_tool_calls,
+                    budgets.max_turn,
+                )
+            } else {
+                None
+            };
+            let header = match (budget_header, ambient) {
+                (Some(b), Some(a)) => Some(format!("{b}\n\n{a}")),
+                (Some(b), None) => Some(b),
+                (None, Some(a)) => Some(a),
+                (None, None) => None,
             };
             if let Some(header) = &header {
                 tracing::debug!("request {}: ambient context: {:?}", ask.id, header);

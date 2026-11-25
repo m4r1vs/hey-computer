@@ -83,6 +83,30 @@ pub async fn gather(config: &ContextConfig) -> Option<String> {
     format_block(time.as_deref(), desktop.as_ref())
 }
 
+/// Format a trusted per-turn `<budget>` block describing the active
+/// profile's hard limits, or `None` when both limits are disabled.
+pub fn format_turn_budget(
+    profile: Option<&str>,
+    max_tool_calls: Option<usize>,
+    max_turn: Option<Duration>,
+) -> Option<String> {
+    if max_tool_calls.is_none() && max_turn.is_none() {
+        return None;
+    }
+    let mut out = String::from("<budget>\n");
+    if let Some(profile) = profile {
+        out.push_str(&format!("profile: {profile}\n"));
+    }
+    if let Some(limit) = max_tool_calls {
+        out.push_str(&format!("max_tool_calls: {limit}\n"));
+    }
+    if let Some(limit) = max_turn {
+        out.push_str(&format!("time_limit_secs: {}\n", limit.as_secs()));
+    }
+    out.push_str("</budget>");
+    Some(out)
+}
+
 /// Prepend an ambient context block to the user prompt, leaving `text`
 /// untouched when `header` is `None`.
 pub fn prepend<'a>(header: Option<&str>, text: &'a str) -> Cow<'a, str> {
@@ -905,6 +929,14 @@ mod tests {
         let combined = prepend(Some(&time_only), "put this in today's note");
         assert!(combined.starts_with("<untrusted_desktop_context>\n"));
         assert!(combined.ends_with("\n\nput this in today's note"));
+
+        assert_eq!(format_turn_budget(Some("deep"), None, None), None);
+        let budget =
+            format_turn_budget(Some("deep"), Some(200), Some(Duration::from_secs(600))).unwrap();
+        assert_eq!(
+            budget,
+            "<budget>\nprofile: deep\nmax_tool_calls: 200\ntime_limit_secs: 600\n</budget>"
+        );
     }
 
     #[tokio::test]

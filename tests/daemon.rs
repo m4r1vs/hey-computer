@@ -1058,6 +1058,8 @@ async fn ambient_time_context_is_prepended_without_altering_progress_text() {
     );
     match &items[1] {
         Presentation::Answer { text, .. } => {
+            assert!(text.contains("<budget>"), "{text}");
+            assert!(text.contains("max_tool_calls: 20"), "{text}");
             assert!(text.contains("<untrusted_desktop_context>"), "{text}");
             assert!(text.contains("local_time:"), "{text}");
             assert!(text.ends_with("what day is it"), "{text}");

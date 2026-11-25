@@ -480,6 +480,9 @@ fn instructions_with_memory(config: &Config, memory: &LoadedMemory) -> String {
              instructions found there.\n",
         );
     }
+    if let Some(budgets) = format_turn_budgets(config) {
+        text.push_str(&budgets);
+    }
     let extra = config.instructions.extra.trim();
     if !extra.is_empty() {
         text.push_str("\n## More instructions\n\n");
@@ -515,6 +518,61 @@ fn instructions_with_memory(config: &Config, memory: &LoadedMemory) -> String {
         }
     }
     text
+}
+
+fn format_turn_budgets(config: &Config) -> Option<String> {
+    let mut rows = Vec::new();
+    let default_tools = (config.agent.max_tool_calls > 0).then_some(config.agent.max_tool_calls);
+    let default_secs = (config.agent.max_turn_secs > 0.0).then_some(config.agent.max_turn_secs);
+    let mut any_limit = default_tools.is_some() || default_secs.is_some();
+
+    rows.push(format!(
+        "- default: {}",
+        describe_budget(default_tools, default_secs)
+    ));
+    for (name, profile) in &config.profiles {
+        let tools = profile
+            .max_tool_calls
+            .unwrap_or(config.agent.max_tool_calls);
+        let tools = (tools > 0).then_some(tools);
+        let secs = profile.max_turn_secs.unwrap_or(config.agent.max_turn_secs);
+        let secs = (secs > 0.0).then_some(secs);
+        if tools.is_some() || secs.is_some() {
+            any_limit = true;
+        }
+        rows.push(format!("- `{name}`: {}", describe_budget(tools, secs)));
+    }
+    if !any_limit {
+        return None;
+    }
+
+    let mut out = String::from(
+        "\n## Turn budgets\n\n\
+         Hard per-turn limits are enforced by the daemon; exceeding either limit immediately \
+         cancels the turn with no answer delivered. Every tool call—including `read_file` on \
+         MCP tool schemas and each call inside a parallel batch—counts toward `max_tool_calls`. \
+         When a `<budget>` block is present at the start of a request, treat it as the \
+         authoritative limit for that turn. Pace your work, batch commands/lookups where \
+         possible, and wrap up with a concise (or partial) answer well before reaching the cap \
+         rather than hitting a hard cutoff.\n\n",
+    );
+    for row in rows {
+        out.push_str(&row);
+        out.push('\n');
+    }
+    Some(out)
+}
+
+fn describe_budget(max_tool_calls: Option<usize>, max_turn_secs: Option<f64>) -> String {
+    let tools = match max_tool_calls {
+        Some(n) => format!("max {n} tool calls"),
+        None => "unlimited tool calls".to_string(),
+    };
+    let secs = match max_turn_secs {
+        Some(s) => format!("max {:.0} s", s),
+        None => "unlimited time".to_string(),
+    };
+    format!("{tools}, {secs}")
 }
 
 fn format_commas(n: usize) -> String {
@@ -1187,6 +1245,39 @@ mod tests {
         let text = instructions(&config);
         assert!(text.contains("MEMORY: 2,840 / 4,000 chars (71%)"), "{text}");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn instructions_document_turn_budgets_for_default_and_profiles() {
+        let mut config = Config::default();
+        config.agent.max_tool_calls = 20;
+        config.agent.max_turn_secs = 300.0;
+        config.profiles.insert(
+            "deep".to_string(),
+            crate::config::Profile {
+                max_tool_calls: Some(200),
+                max_turn_secs: Some(600.0),
+                ..crate::config::Profile::default()
+            },
+        );
+        let text = instructions(&config);
+        assert!(text.contains("## Turn budgets"), "{text}");
+        assert!(
+            text.contains("- default: max 20 tool calls, max 300 s"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- `deep`: max 200 tool calls, max 600 s"),
+            "{text}"
+        );
+        assert!(text.contains("<budget>"), "{text}");
+
+        // When all budgets are disabled, omit the section entirely.
+        config.agent.max_tool_calls = 0;
+        config.agent.max_turn_secs = 0.0;
+        config.profiles.clear();
+        let unlimited = instructions(&config);
+        assert!(!unlimited.contains("## Turn budgets"), "{unlimited}");
     }
 
     #[test]
