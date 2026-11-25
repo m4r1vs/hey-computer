@@ -1099,6 +1099,7 @@ async fn run_agent_job(
                 denied,
                 profile,
                 widgets,
+                icons: Vec::new(),
             });
             AgentJobResult::Ok
         }

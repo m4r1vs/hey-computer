@@ -120,6 +120,14 @@ pub struct McpServer {
     /// Runtime-loaded secret HTTP headers (`Header = "/abs/path"`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub header_files: BTreeMap<String, PathBuf>,
+    /// Optional Nerd Font icon shown in notification titles when this MCP server
+    /// is called (`""` suppresses the server's default icon).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Optional per-tool icon overrides matched against the MCP tool name
+    /// (`exact`, `prefix*`, `*suffix`, or `*substring*`; `""` suppresses).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_icons: BTreeMap<String, String>,
 }
 
 impl Default for McpServer {
@@ -134,6 +142,8 @@ impl Default for McpServer {
             transport: String::new(),
             headers: BTreeMap::new(),
             header_files: BTreeMap::new(),
+            icon: None,
+            tool_icons: BTreeMap::new(),
         }
     }
 }
@@ -160,6 +170,8 @@ pub struct ResolvedProfile {
 pub const MAX_PROFILE_NAME_LEN: usize = 32;
 /// Maximum character length of `profiles.<name>.thinking_label`.
 pub const MAX_THINKING_LABEL_CHARS: usize = 64;
+/// Maximum character length of a single tool/MCP icon string.
+pub const MAX_TOOL_ICON_CHARS: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -175,6 +187,12 @@ pub struct Agent {
     /// Start the agent with the daemon, so the first request does not pay
     /// for its start (about a second). Off starts it on the first request.
     pub warm_start: bool,
+    /// Wait for the Freedesktop Secret Service (`org.freedesktop.secrets`
+    /// `/org/freedesktop/secrets/aliases/default`) to report `Locked == false`
+    /// before spawning the agent, avoiding a hidden `gcr-prompter` timeout
+    /// behind a boot lock screen. Degrades cleanly when no Secret Service is
+    /// present on the session bus.
+    pub wait_for_keyring: bool,
     /// Stop the agent after this long without a request. Zero keeps it up.
     pub idle_stop_secs: f64,
     /// A request is cancelled when the agent sends nothing for this long.
@@ -475,6 +493,36 @@ impl Default for Speak {
     }
 }
 
+/// Sequential Nerd Font tool/MCP icon settings (`[present.tool_icons]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolIcons {
+    /// Append sequential Nerd Font icons for tools and MCP servers used during
+    /// a turn to notification titles.
+    pub enabled: bool,
+    /// Maximum distinct icons shown in a notification title before appending `…`.
+    pub max_icons: usize,
+    /// Overrides for built-in tool kinds (`execute`, `read`, `edit`, `search`,
+    /// `fetch`, `mcp_ui`, `vault`). Set a value to `""` to hide that kind.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub kinds: BTreeMap<String, String>,
+    /// Overrides for `execute` command basenames (e.g. `gh`, `openhue`).
+    /// Set a value to `""` to suppress that command's icon.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub commands: BTreeMap<String, String>,
+}
+
+impl Default for ToolIcons {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_icons: 8,
+            kinds: BTreeMap::new(),
+            commands: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Present {
@@ -506,6 +554,9 @@ pub struct Present {
     /// Optional spoken answers and earcon hooks.
     #[serde(default)]
     pub speak: Speak,
+    /// Sequential Nerd Font tool/MCP icons in notification titles.
+    #[serde(default)]
+    pub tool_icons: ToolIcons,
 }
 
 impl Default for Agent {
@@ -517,6 +568,7 @@ impl Default for Agent {
             model: "gemini-4-hydrogen".to_string(),
             thought_level: "low".to_string(),
             warm_start: true,
+            wait_for_keyring: false,
             idle_stop_secs: 0.0,
             inactivity_timeout_secs: 45.0,
             max_turn_secs: 300.0,
@@ -562,6 +614,7 @@ impl Default for Present {
             clipboard: vec!["wl-copy".to_string()],
             keep_answers: 20,
             speak: Speak::default(),
+            tool_icons: ToolIcons::default(),
         }
     }
 }
@@ -683,6 +736,32 @@ impl Config {
         }
         if self.present.max_lines == 0 || self.present.max_chars == 0 {
             bail!("present.max_lines and present.max_chars must be positive");
+        }
+        if !(1..=16).contains(&self.present.tool_icons.max_icons) {
+            bail!(
+                "present.tool_icons.max_icons must be between 1 and 16, not {}",
+                self.present.tool_icons.max_icons
+            );
+        }
+        for (kind, icon) in &self.present.tool_icons.kinds {
+            if !crate::icons::VALID_ICON_KINDS.contains(&kind.as_str()) {
+                bail!(
+                    "present.tool_icons.kinds.{kind}: unknown kind (expected one of: {})",
+                    crate::icons::VALID_ICON_KINDS.join(", ")
+                );
+            }
+            validate_icon_value(&format!("present.tool_icons.kinds.{kind}"), icon)?;
+        }
+        for (cmd, icon) in &self.present.tool_icons.commands {
+            if cmd.is_empty()
+                || cmd.contains('/')
+                || cmd.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
+                bail!(
+                    "present.tool_icons.commands.{cmd:?}: command key must be a non-empty command basename without '/' or whitespace"
+                );
+            }
+            validate_icon_value(&format!("present.tool_icons.commands.{cmd}"), icon)?;
         }
         if !self.agent.mcp_oauth_tokens_file.as_os_str().is_empty()
             && !self.agent.mcp_oauth_tokens_file.is_absolute()
@@ -842,6 +921,17 @@ impl Config {
                 if !path.is_absolute() {
                     bail!("mcp.{name}.header_files.{k} must be an absolute path");
                 }
+            }
+            if let Some(icon) = &server.icon {
+                validate_icon_value(&format!("mcp.{name}.icon"), icon)?;
+            }
+            for (pattern, icon) in &server.tool_icons {
+                if pattern.trim().is_empty() || pattern.chars().any(char::is_control) {
+                    bail!(
+                        "mcp.{name}.tool_icons.{pattern:?}: pattern must be non-empty printable characters"
+                    );
+                }
+                validate_icon_value(&format!("mcp.{name}.tool_icons.{pattern}"), icon)?;
             }
         }
         if !(1..=8).contains(&self.tasks.max_concurrent) {
@@ -1076,6 +1166,22 @@ pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+fn validate_icon_value(key_path: &str, raw: &str) -> Result<()> {
+    if raw.is_empty() {
+        return Ok(());
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || raw.chars().any(char::is_control)
+        || trimmed.chars().count() > MAX_TOOL_ICON_CHARS
+    {
+        bail!(
+            "{key_path} must be empty (to suppress) or 1..={MAX_TOOL_ICON_CHARS} printable characters"
+        );
+    }
+    Ok(())
 }
 
 fn is_allowed_mcp_url(url: &str) -> bool {
@@ -1467,6 +1573,67 @@ mod tests {
             "[present]\nreply_command = [\"\"]\n",
             "[present.speak]\ncommand = [\"\"]\n",
             "[present.speak]\nearcon_cancel = [\"\"]\n",
+        ] {
+            let cfg: Config = toml::from_str(bad).unwrap();
+            assert!(cfg.validate().is_err(), "{bad} should fail validation");
+        }
+    }
+
+    #[test]
+    fn keyring_wait_and_tool_icons_defaults_and_validation() {
+        let cfg = Config::default();
+        assert!(!cfg.agent.wait_for_keyring);
+        assert!(!cfg.present.tool_icons.enabled);
+        assert_eq!(cfg.present.tool_icons.max_icons, 8);
+        assert!(cfg.present.tool_icons.kinds.is_empty());
+        assert!(cfg.present.tool_icons.commands.is_empty());
+        cfg.validate().unwrap();
+
+        let parsed: Config = toml::from_str(
+            r#"
+            [agent]
+            wait_for_keyring = true
+
+            [mcp.slack]
+            command = "/bin/true"
+            icon = "\ue8a4"
+
+            [mcp.google-workspace]
+            command = "/bin/true"
+            icon = ""
+            [mcp.google-workspace.tool_icons]
+            "*gmail*" = "\uf42f"
+            "exact_tool" = ""
+
+            [present.tool_icons]
+            enabled = true
+            max_icons = 12
+            [present.tool_icons.kinds]
+            fetch = "\U000f059f"
+            read = ""
+            [present.tool_icons.commands]
+            gh = "\ue709"
+            openhue = ""
+            "#,
+        )
+        .unwrap();
+        assert!(parsed.agent.wait_for_keyring);
+        assert!(parsed.present.tool_icons.enabled);
+        assert_eq!(parsed.present.tool_icons.max_icons, 12);
+        parsed.validate().unwrap();
+
+        for bad in [
+            "[present.tool_icons]\nmax_icons = 0\n",
+            "[present.tool_icons]\nmax_icons = 17\n",
+            "[present.tool_icons.kinds]\nbogus = \"x\"\n",
+            "[present.tool_icons.kinds]\nread = \"a\\nb\"\n",
+            "[present.tool_icons.kinds]\nread = \"   \"\n",
+            "[present.tool_icons.kinds]\nread = \"12345678901234567\"\n",
+            "[present.tool_icons.commands]\n\"/usr/bin/gh\" = \"x\"\n",
+            "[present.tool_icons.commands]\n\"gh pr\" = \"x\"\n",
+            "[mcp.s]\ncommand = \"/bin/true\"\nicon = \"a\\nb\"\n",
+            "[mcp.s]\ncommand = \"/bin/true\"\n[mcp.s.tool_icons]\n\"   \" = \"x\"\n",
+            "[mcp.s]\ncommand = \"/bin/true\"\n[mcp.s.tool_icons]\n\"*a*\" = \"12345678901234567\"\n",
         ] {
             let cfg: Config = toml::from_str(bad).unwrap();
             assert!(cfg.validate().is_err(), "{bad} should fail validation");

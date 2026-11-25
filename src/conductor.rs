@@ -3078,6 +3078,7 @@ fn deliver(
                             denied,
                             profile,
                             widgets,
+                            icons: Vec::new(),
                         });
                     } else {
                         presenter.present(Presentation::Answer {
@@ -3086,6 +3087,7 @@ fn deliver(
                             denied,
                             profile,
                             widgets,
+                            icons: Vec::new(),
                         });
                     }
                 }
@@ -3099,6 +3101,7 @@ fn deliver(
                         message,
                         profile,
                         background: ask.background,
+                        icons: Vec::new(),
                     });
                 }
             }
@@ -3274,6 +3277,7 @@ async fn turn(
             presenter.present(Presentation::ProgressUpdate {
                 id,
                 status: status.clone(),
+                icons: Vec::new(),
             });
         }
         if let Some(tx) = ctx.stream_tx {

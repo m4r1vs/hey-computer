@@ -261,6 +261,7 @@ async fn without_wait_the_daemon_presents_progress_then_the_answer() {
                 denied: vec![],
                 profile: None,
                 widgets: vec![],
+                icons: vec![],
             },
         ]
     );
@@ -711,6 +712,7 @@ async fn a_shutdown_replaces_the_progress_popup() {
             message: "The daemon is shutting down.".to_string(),
             profile: None,
             background: false,
+            icons: vec![],
         }),
         "{items:?}"
     );
@@ -752,6 +754,7 @@ async fn a_correction_during_a_cold_start_keeps_the_starting_agent() {
             message: "A newer request replaced this one.".to_string(),
             profile: None,
             background: false,
+            icons: vec![],
         }),
         "{items:?}"
     );
@@ -986,10 +989,12 @@ async fn without_wait_tool_calls_emit_progress_updates() {
             Presentation::ProgressUpdate {
                 id,
                 status: "Read today's note".to_string(),
+                icons: vec![],
             },
             Presentation::ProgressUpdate {
                 id,
                 status: "Check Hyprland version".to_string(),
+                icons: vec![],
             },
             Presentation::Answer {
                 id,
@@ -997,6 +1002,7 @@ async fn without_wait_tool_calls_emit_progress_updates() {
                 denied: vec![],
                 profile: None,
                 widgets: vec![],
+                icons: vec![],
             },
         ]
     );

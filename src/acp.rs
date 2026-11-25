@@ -739,6 +739,48 @@ pub fn mcp_tool_name(call: &Value) -> Option<String> {
     })
 }
 
+/// Resolve an ACP MCP tool call (lazy `call_mcp_tool`/`list_resources`/`read_resource`
+/// or eager `mcp_<server>_<tool>`) into `(server_name, optional_tool_name)`.
+pub fn resolve_mcp_call(
+    call: &Value,
+    known_servers: &[String],
+) -> Option<(String, Option<String>)> {
+    let name = call.get("name").and_then(Value::as_str)?;
+    if is_lazy_mcp_tool(Some(name)) {
+        let server = mcp_server_name(call)?;
+        let tool =
+            mcp_tool_name(call).or_else(|| (name != "call_mcp_tool").then(|| name.to_string()));
+        return Some((server, tool));
+    }
+    if let Some(rest) = name.strip_prefix("mcp_") {
+        let ui_prefix = format!("{}_", crate::mcp::INTERNAL_UI_MCP_SERVER);
+        if let Some(tool) = rest.strip_prefix(&ui_prefix) {
+            return Some((
+                crate::mcp::INTERNAL_UI_MCP_SERVER.to_string(),
+                (!tool.is_empty()).then(|| tool.to_string()),
+            ));
+        }
+        if let Some(server) = known_servers
+            .iter()
+            .filter(|s| rest.starts_with(&format!("{s}_")))
+            .max_by_key(|s| s.len())
+        {
+            let suffix = &rest[server.len() + 1..];
+            return Some((
+                server.clone(),
+                (!suffix.is_empty()).then(|| suffix.to_string()),
+            ));
+        }
+        if let Some((server, tool)) = rest.split_once('_')
+            && !server.is_empty()
+            && !tool.is_empty()
+        {
+            return Some((server.to_string(), Some(tool.to_string())));
+        }
+    }
+    None
+}
+
 /// Extracted `mcp-ui` tool invocation (`show_widget` or `propose_widget_template`),
 /// supporting both lazy `call_mcp_tool` and eager `mcp_mcp-ui_*` forms.
 #[derive(Debug, Clone, PartialEq)]
@@ -1472,5 +1514,55 @@ mod tests {
         assert!(got.contains("bad utf8:"), "{got:?}");
         assert!(got.contains("final tail line"), "{got:?}");
         assert!(got.len() <= STDERR_TAIL);
+    }
+
+    #[test]
+    fn resolves_lazy_and_eager_mcp_calls_with_longest_server_prefix() {
+        let known = vec![
+            "my".to_string(),
+            "my_server".to_string(),
+            "google-workspace".to_string(),
+        ];
+
+        assert_eq!(
+            resolve_mcp_call(
+                &json!({
+                    "name": "call_mcp_tool",
+                    "rawInput": {"ServerName": "slack", "ToolName": "post_message"}
+                }),
+                &known
+            ),
+            Some(("slack".to_string(), Some("post_message".to_string())))
+        );
+        assert_eq!(
+            resolve_mcp_call(
+                &json!({
+                    "name": "read_resource",
+                    "rawInput": {"ServerName": "gitlab", "Uri": "gitlab://proj"}
+                }),
+                &known
+            ),
+            Some(("gitlab".to_string(), Some("read_resource".to_string())))
+        );
+        // Argument-less lazy stub returns None.
+        assert_eq!(
+            resolve_mcp_call(&json!({"name": "call_mcp_tool"}), &known),
+            None
+        );
+        // Eager internal mcp-ui.
+        assert_eq!(
+            resolve_mcp_call(&json!({"name": "mcp_mcp-ui_show_widget"}), &known),
+            Some(("mcp-ui".to_string(), Some("show_widget".to_string())))
+        );
+        // Longest server name wins for underscored server names.
+        assert_eq!(
+            resolve_mcp_call(&json!({"name": "mcp_my_server_list_items"}), &known),
+            Some(("my_server".to_string(), Some("list_items".to_string())))
+        );
+        // Non-MCP tool returns None.
+        assert_eq!(
+            resolve_mcp_call(&json!({"name": "run_command"}), &known),
+            None
+        );
     }
 }

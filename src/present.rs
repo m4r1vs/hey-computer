@@ -63,8 +63,12 @@ pub enum Presentation {
         /// Optional custom progress summary overriding `"Thinking…"` / `"Thinking… (<profile>)"`.
         thinking_label: Option<String>,
     },
-    /// Mid-turn status update for an in-flight interactive request.
-    ProgressUpdate { id: u64, status: String },
+    /// Mid-turn status and/or tool-icon update for an in-flight interactive request.
+    ProgressUpdate {
+        id: u64,
+        status: String,
+        icons: Vec<String>,
+    },
     /// Quietly dismiss any active interactive progress popup (e.g. suppressed turn).
     DismissProgress { id: u64 },
     Answer {
@@ -74,6 +78,7 @@ pub enum Presentation {
         denied: Vec<String>,
         profile: Option<String>,
         widgets: Vec<WidgetSpec>,
+        icons: Vec<String>,
     },
     /// A background task finished with a non-suppressed answer.
     TaskComplete {
@@ -83,6 +88,7 @@ pub enum Presentation {
         denied: Vec<String>,
         profile: Option<String>,
         widgets: Vec<WidgetSpec>,
+        icons: Vec<String>,
     },
     /// Start streaming speech/earcons for a voice-originated foreground turn.
     SpeechStart { id: u64 },
@@ -100,6 +106,7 @@ pub enum Presentation {
         message: String,
         profile: Option<String>,
         background: bool,
+        icons: Vec<String>,
     },
     /// A standalone notification (e.g. scheduled reminder, split failure alert,
     /// or background-delegation notice). Replaces an active progress popup only
@@ -1214,25 +1221,45 @@ impl Desktop {
                     break;
                 };
 
-                if let Presentation::ProgressUpdate { id, status } = item {
-                    let mut latest = Some((id, status));
+                if let Presentation::ProgressUpdate { id, status, icons } = item {
+                    let mut latest_id = id;
+                    let mut latest_status = (!status.is_empty()).then_some(status);
+                    let mut latest_icons = icons;
+                    let mut preempted = false;
                     loop {
                         match items.try_recv() {
-                            Ok(Presentation::ProgressUpdate { id, status }) => {
-                                latest = Some((id, status));
+                            Ok(Presentation::ProgressUpdate { id, status, icons }) => {
+                                if id != latest_id {
+                                    latest_id = id;
+                                    latest_status = (!status.is_empty()).then_some(status);
+                                    latest_icons = icons;
+                                } else {
+                                    // Preserve an un-flushed status string if an icon-only
+                                    // update (`status == ""`) is coalesced behind it.
+                                    if !status.is_empty() {
+                                        latest_status = Some(status);
+                                    }
+                                    latest_icons = icons;
+                                }
                             }
                             Ok(other) => {
                                 // A queued Answer, Failure, or newer Progress
                                 // preempts any still-queued ProgressUpdate at once.
                                 deferred = Some(other);
-                                latest = None;
+                                preempted = true;
                                 break;
                             }
                             Err(_) => break,
                         }
                     }
-                    if let Some((id, status)) = latest {
-                        worker.progress_update(id, status).await;
+                    if !preempted {
+                        worker
+                            .progress_update(
+                                latest_id,
+                                latest_status.unwrap_or_default(),
+                                latest_icons,
+                            )
+                            .await;
                     }
                     continue;
                 }
@@ -1439,8 +1466,10 @@ enum ProgressSlot {
     Active {
         request_id: u64,
         notif_id: u32,
-        /// Notification summary (e.g. `"Thinking…"` or `"Thinking… (deep)"`).
-        summary: String,
+        /// Base notification summary without icons (e.g. `"Thinking…"` or `"Thinking… (deep)"`).
+        base_summary: String,
+        /// Tool icons currently shown in the active progress popup.
+        icons: Vec<String>,
         /// Already truncated & Pango-escaped request preview.
         request_body: String,
         last_status: Option<String>,
@@ -1458,9 +1487,23 @@ fn with_profile(base: &str, profile: Option<&str>) -> String {
     }
 }
 
+/// Append sequential Nerd Font tool icons to a notification summary (`"  "`
+/// separator + space-separated icons, capped at `max_icons` with `" …"`).
+pub fn format_summary_with_icons(base: &str, icons: &[String], max_icons: usize) -> String {
+    if icons.is_empty() || max_icons == 0 {
+        return base.to_string();
+    }
+    if icons.len() <= max_icons {
+        format!("{base}  {}", icons.join(" "))
+    } else {
+        format!("{base}  {} …", icons[..max_icons].join(" "))
+    }
+}
+
 struct PendingUpdate {
     request_id: u64,
-    status: String,
+    status: Option<String>,
+    icons: Vec<String>,
     due: Instant,
 }
 
@@ -1508,6 +1551,14 @@ pub enum Urgency {
 }
 
 impl Worker {
+    fn with_icons(&self, base: &str, icons: &[String]) -> String {
+        if !self.config.tool_icons.enabled || icons.is_empty() {
+            base.to_string()
+        } else {
+            format_summary_with_icons(base, icons, self.config.tool_icons.max_icons)
+        }
+    }
+
     fn pending_due(&self) -> Option<Instant> {
         self.pending.as_ref().map(|p| p.due)
     }
@@ -1593,15 +1644,16 @@ impl Worker {
                     self.progress = Some(ProgressSlot::Active {
                         request_id: id,
                         notif_id,
-                        summary,
+                        base_summary: summary,
+                        icons: Vec::new(),
                         request_body,
                         last_status: None,
                         last_sent: None,
                     });
                 }
             }
-            Presentation::ProgressUpdate { id, status } => {
-                self.progress_update(id, status).await;
+            Presentation::ProgressUpdate { id, status, icons } => {
+                self.progress_update(id, status, icons).await;
             }
             Presentation::DismissProgress { id } => {
                 let matches = matches!(
@@ -1620,8 +1672,9 @@ impl Worker {
                 denied,
                 profile,
                 widgets,
+                icons,
             } => {
-                self.answer(id, &text, &denied, profile.as_deref(), &widgets)
+                self.answer(id, &text, &denied, profile.as_deref(), &widgets, &icons)
                     .await;
             }
             Presentation::TaskComplete {
@@ -1630,9 +1683,10 @@ impl Worker {
                 denied,
                 profile,
                 widgets,
+                icons,
                 ..
             } => {
-                self.task_complete(id, &text, &denied, profile.as_deref(), &widgets)
+                self.task_complete(id, &text, &denied, profile.as_deref(), &widgets, &icons)
                     .await;
             }
             Presentation::SpeechStart { .. }
@@ -1643,13 +1697,16 @@ impl Worker {
                 message,
                 profile,
                 background: true,
+                icons,
                 ..
             } => {
                 if reason == FailReason::Cancelled {
                     return;
                 }
-                let summary =
-                    with_profile(&format!("Task: {}", reason.headline()), profile.as_deref());
+                let summary = self.with_icons(
+                    &with_profile(&format!("Task: {}", reason.headline()), profile.as_deref()),
+                    &icons,
+                );
                 self.notify(
                     &summary,
                     &escape_markup(&message),
@@ -1717,10 +1774,12 @@ impl Worker {
                 message,
                 profile,
                 background: false,
+                icons,
                 ..
             } => {
                 let replaces = self.take_progress_id();
-                let summary = with_profile(reason.headline(), profile.as_deref());
+                let summary =
+                    self.with_icons(&with_profile(reason.headline(), profile.as_deref()), &icons);
                 self.notify(
                     &summary,
                     &escape_markup(&message),
@@ -1733,12 +1792,25 @@ impl Worker {
         }
     }
 
-    async fn progress_update(&mut self, id: u64, status: String) {
-        if !self.config.progress || status.is_empty() {
+    async fn progress_update(&mut self, id: u64, status: String, icons: Vec<String>) {
+        if !self.config.progress || (status.is_empty() && icons.is_empty()) {
             return;
         }
+        let new_status = (!status.is_empty()).then_some(status);
+        let merged_status = new_status.or_else(|| {
+            self.pending
+                .as_ref()
+                .filter(|p| p.request_id == id)
+                .and_then(|p| p.status.clone())
+        });
+        let effective_icons = if self.config.tool_icons.enabled {
+            icons
+        } else {
+            Vec::new()
+        };
         let Some(ProgressSlot::Active {
             request_id,
+            icons: current_icons,
             last_status,
             last_sent,
             ..
@@ -1749,7 +1821,11 @@ impl Worker {
         if *request_id != id {
             return;
         }
-        if last_status.as_deref() == Some(status.as_str()) {
+        let status_changed = merged_status
+            .as_deref()
+            .is_some_and(|s| last_status.as_deref() != Some(s));
+        let icons_changed = self.config.tool_icons.enabled && effective_icons != *current_icons;
+        if !status_changed && !icons_changed {
             self.pending = None;
             return;
         }
@@ -1758,14 +1834,16 @@ impl Worker {
             if Instant::now() < due {
                 self.pending = Some(PendingUpdate {
                     request_id: id,
-                    status,
+                    status: merged_status,
+                    icons: effective_icons,
                     due,
                 });
                 return;
             }
         }
         self.pending = None;
-        self.send_progress_update(id, status).await;
+        self.send_progress_update(id, merged_status, effective_icons)
+            .await;
     }
 
     async fn flush_pending(&mut self) {
@@ -1776,23 +1854,29 @@ impl Worker {
             &self.progress,
             Some(ProgressSlot::Active {
                 request_id,
+                icons,
                 last_status,
                 ..
             }) if *request_id == pending.request_id
-                && last_status.as_deref() != Some(pending.status.as_str())
+                && (pending
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| last_status.as_deref() != Some(s))
+                    || (self.config.tool_icons.enabled && pending.icons != *icons))
         );
         if matches_active {
-            self.send_progress_update(pending.request_id, pending.status)
+            self.send_progress_update(pending.request_id, pending.status, pending.icons)
                 .await;
         }
     }
 
-    async fn send_progress_update(&mut self, id: u64, status: String) {
+    async fn send_progress_update(&mut self, id: u64, status: Option<String>, icons: Vec<String>) {
         let Some(ProgressSlot::Active {
             request_id,
             notif_id,
-            summary,
+            base_summary,
             request_body,
+            last_status,
             ..
         }) = &self.progress
         else {
@@ -1802,8 +1886,12 @@ impl Worker {
             return;
         }
         let replaces = *notif_id;
-        let summary = summary.clone();
-        let body = format_progress_body(request_body, &status);
+        let summary = self.with_icons(base_summary, &icons);
+        let effective_status = status.as_deref().or(last_status.as_deref());
+        let body = match effective_status {
+            Some(s) => format_progress_body(request_body, s),
+            None => request_body.clone(),
+        };
         let shown = self
             .notify(
                 &summary,
@@ -1817,6 +1905,7 @@ impl Worker {
         if let Some(ProgressSlot::Active {
             request_id,
             notif_id,
+            icons: slot_icons,
             last_status,
             last_sent,
             ..
@@ -1826,7 +1915,10 @@ impl Worker {
             *last_sent = Some(now);
             if let Some(new_id) = shown {
                 *notif_id = new_id;
-                *last_status = Some(status);
+                if let Some(s) = status {
+                    *last_status = Some(s);
+                }
+                *slot_icons = icons;
             }
         }
     }
@@ -1838,6 +1930,7 @@ impl Worker {
         denied: &[String],
         profile: Option<&str>,
         widgets: &[WidgetSpec],
+        icons: &[String],
     ) {
         let replaces = self.take_progress_id();
         let refused = if denied.is_empty() {
@@ -1852,7 +1945,7 @@ impl Worker {
                 body.push_str("\n\n");
                 body.push_str(&escape_markup(&refused));
             }
-            let summary = with_profile("Answer", profile);
+            let summary = self.with_icons(&with_profile("Answer", profile), icons);
             let actions = short_answer_actions(&self.config);
             if actions.is_empty() {
                 self.notify(&summary, &body, Urgency::Normal, 0, replaces)
@@ -1909,7 +2002,7 @@ impl Worker {
         let answer_head = answer_headline(text, widgets);
         if self.config.viewer.is_empty() {
             let body = format!("{answer_head}\n{}", file.display());
-            let summary = with_profile("Answer saved", profile);
+            let summary = self.with_icons(&with_profile("Answer saved", profile), icons);
             self.notify(
                 &summary,
                 &escape_markup(&body),
@@ -1928,7 +2021,7 @@ impl Worker {
                 return;
             }
         };
-        let summary = with_profile("Answer opened", profile);
+        let summary = self.with_icons(&with_profile("Answer opened", profile), icons);
         let opened_id = self
             .notify(
                 &summary,
@@ -1953,11 +2046,12 @@ impl Worker {
         denied: &[String],
         profile: Option<&str>,
         widgets: &[WidgetSpec],
+        icons: &[String],
     ) {
         if !self.config.notifications || self.config.notifier.is_empty() {
             return;
         }
-        let summary = with_profile("Task complete", profile);
+        let summary = self.with_icons(&with_profile("Task complete", profile), icons);
         let refused = if denied.is_empty() {
             String::new()
         } else {
@@ -2012,6 +2106,10 @@ impl Worker {
     }
 }
 
+fn is_notify_send(program: &str) -> bool {
+    Path::new(program).file_name().and_then(|n| n.to_str()) == Some("notify-send")
+}
+
 /// Run the notifier once. `body` is Pango markup and must be escaped.
 /// Returns the notification's id, so a later one can replace it.
 pub async fn notify(
@@ -2035,6 +2133,9 @@ pub async fn notify(
                 Urgency::Normal => "--urgency=normal",
             })
             .arg("--print-id");
+        if is_notify_send(&config.notifier[0]) {
+            command.arg("--hint=boolean:x-hey-computer:true");
+        }
         if expire_ms > 0 {
             command.arg(format!("--expire-time={expire_ms}"));
         }
@@ -2172,6 +2273,9 @@ fn build_action_notifier_command(
         .arg(format!("--app-name={APP_NAME}"))
         .arg("--urgency=normal")
         .arg("--print-id");
+    if is_notify_send(&config.notifier[0]) {
+        command.arg("--hint=boolean:x-hey-computer:true");
+    }
     for (key, label) in actions {
         command.arg(format!("--action={key}={label}"));
     }
@@ -4639,6 +4743,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![],
+            icons: vec![],
         });
         desktop.finish().await;
         let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -4682,6 +4787,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![],
+            icons: vec![],
         });
         desktop.finish().await;
         let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -4717,6 +4823,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![],
+            icons: vec![],
         });
         desktop.present(Presentation::Progress {
             id: 2,
@@ -4781,6 +4888,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![],
+            icons: vec![],
         });
         desktop.finish().await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -5005,6 +5113,7 @@ mod tests {
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
             status: "Check <a&b>".to_string(),
+            icons: vec![],
         });
         // Let the immediate update run before sending Answer.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -5023,6 +5132,7 @@ mod tests {
             denied: vec![],
             profile: Some("deep".to_string()),
             widgets: vec![],
+            icons: vec![],
         });
         desktop.finish().await;
         let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -5061,6 +5171,7 @@ mod tests {
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
             status: "step 1".to_string(),
+            icons: vec![],
         });
         // Wait for step 1 to be sent immediately.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -5077,14 +5188,17 @@ mod tests {
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
             status: "step 2".to_string(),
+            icons: vec![],
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
             status: "step 3".to_string(),
+            icons: vec![],
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
             status: "step 4".to_string(),
+            icons: vec![],
         });
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
@@ -5128,6 +5242,7 @@ mod tests {
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
             status: "step 1".to_string(),
+            icons: vec![],
         });
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
@@ -5143,6 +5258,7 @@ mod tests {
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
             status: "should be dropped".to_string(),
+            icons: vec![],
         });
         desktop.present(Presentation::Answer {
             id: 1,
@@ -5150,10 +5266,12 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![],
+            icons: vec![],
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
             status: "late zombie".to_string(),
+            icons: vec![],
         });
         // Superseded keeps Reusable(id), which must NOT accept ProgressUpdate.
         desktop.present(Presentation::Progress {
@@ -5168,10 +5286,12 @@ mod tests {
             message: "replaced".to_string(),
             profile: None,
             background: false,
+            icons: vec![],
         });
         desktop.present(Presentation::ProgressUpdate {
             id: 2,
             status: "after superseded".to_string(),
+            icons: vec![],
         });
         tokio::time::sleep(Duration::from_millis(250)).await;
         desktop.finish().await;
@@ -5215,6 +5335,7 @@ mod tests {
         desktop.present(Presentation::ProgressUpdate {
             id: 1,
             status: "Reading file…".to_string(),
+            icons: vec![],
         });
         desktop.present(Presentation::Answer {
             id: 1,
@@ -5222,6 +5343,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![],
+            icons: vec![],
         });
         desktop.finish().await;
         let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -5261,6 +5383,7 @@ mod tests {
         desktop2.present(Presentation::ProgressUpdate {
             id: 1,
             status: "Running curl…".to_string(),
+            icons: vec![],
         });
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
@@ -5278,6 +5401,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![],
+            icons: vec![],
         });
         desktop2.finish().await;
         let recorded2 = std::fs::read_to_string(&calls2).unwrap_or_default();
@@ -5462,6 +5586,7 @@ mod tests {
             denied: vec![],
             profile: Some("deep".to_string()),
             widgets: vec![],
+            icons: vec![],
         });
         desktop.present(Presentation::Answer {
             id: 1,
@@ -5469,6 +5594,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![],
+            icons: vec![],
         });
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -5509,6 +5635,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![],
+            icons: vec![],
         });
         let t0 = Instant::now();
         desktop2.finish().await;
@@ -5628,6 +5755,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![],
+            icons: vec![],
         });
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -5659,6 +5787,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![],
+            icons: vec![],
         });
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline
@@ -5691,6 +5820,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![],
+            icons: vec![],
         });
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline
@@ -5714,6 +5844,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![],
+            icons: vec![],
         });
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline
@@ -5787,6 +5918,7 @@ mod tests {
                 denied: vec![],
                 profile: None,
                 widgets: vec![],
+                icons: vec![],
             });
         }
 
@@ -5883,6 +6015,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![widget.clone()],
+            icons: vec![],
         });
         // TaskComplete with short text + widget uses `#id · headline` and offers `Open`.
         desktop.present(Presentation::TaskComplete {
@@ -5892,6 +6025,7 @@ mod tests {
             denied: vec![],
             profile: None,
             widgets: vec![widget],
+            icons: vec![],
         });
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
@@ -6401,6 +6535,204 @@ Here is the first sentence. Second sentence with *emphasis* and [image: chart](h
         let completed = task.await.unwrap().unwrap();
         assert!(!completed);
         assert!(t0.elapsed() < Duration::from_secs(2));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn format_summary_with_icons_uses_two_space_separator_and_caps_overflow() {
+        assert_eq!(format_summary_with_icons("Thinking…", &[], 8), "Thinking…");
+        assert_eq!(
+            format_summary_with_icons("Thinking…", &["\u{e8a4}".to_string()], 8),
+            "Thinking…  \u{e8a4}"
+        );
+        assert_eq!(
+            format_summary_with_icons(
+                "Answer (deep)",
+                &["a".to_string(), "b".to_string(), "c".to_string()],
+                3
+            ),
+            "Answer (deep)  a b c"
+        );
+        assert_eq!(
+            format_summary_with_icons(
+                "Answer (deep)",
+                &["a".to_string(), "b".to_string(), "c".to_string()],
+                2
+            ),
+            "Answer (deep)  a b …"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_icons_render_on_progress_answer_task_failure_and_preserve_coalesced_status() {
+        let dir = std::env::temp_dir().join(format!("hc-tool-icons-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let mut config = recording_config(&calls, &[]);
+        config.clipboard.clear();
+        config.tool_icons.enabled = true;
+        config.tool_icons.max_icons = 2;
+
+        let desktop = Desktop::spawn_with_options(
+            &config,
+            dir.join("answers"),
+            VIEWER_GRACE,
+            Duration::from_millis(120),
+        );
+        desktop.present(Presentation::Progress {
+            id: 1,
+            request: "check sprint".to_string(),
+            profile: Some("deep".to_string()),
+            thinking_label: Some("Pondering Hard…".to_string()),
+        });
+        // First status + icon flushes immediately; second status + icon-only update
+        // coalesce inside the throttle window without dropping the status text.
+        desktop.present(Presentation::ProgressUpdate {
+            id: 1,
+            status: "slack: list".to_string(),
+            icons: vec!["\u{e8a4}".to_string()],
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .contains("slack: list")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        desktop.present(Presentation::ProgressUpdate {
+            id: 1,
+            status: "linear: issues".to_string(),
+            icons: vec!["\u{e8a4}".to_string()],
+        });
+        desktop.present(Presentation::ProgressUpdate {
+            id: 1,
+            status: String::new(),
+            icons: vec!["\u{e8a4}".to_string(), "\u{f145}".to_string()],
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .contains("\u{e8a4} \u{f145}")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        desktop.present(Presentation::Answer {
+            id: 1,
+            text: "Done.".to_string(),
+            denied: vec![],
+            profile: Some("deep".to_string()),
+            widgets: vec![],
+            icons: vec![
+                "\u{e8a4}".to_string(),
+                "\u{f145}".to_string(),
+                "\u{e7eb}".to_string(),
+            ],
+        });
+        desktop.present(Presentation::TaskComplete {
+            id: 2,
+            request: "brief".to_string(),
+            text: "Ready.".to_string(),
+            denied: vec![],
+            profile: Some("deep".to_string()),
+            widgets: vec![],
+            icons: vec!["\u{f455}".to_string(), "\u{f42f}".to_string()],
+        });
+        desktop.present(Presentation::Failure {
+            id: 3,
+            reason: FailReason::Timeout,
+            message: "timed out".to_string(),
+            profile: Some("deep".to_string()),
+            background: false,
+            icons: vec!["\u{e8a4}".to_string()],
+        });
+        desktop.finish().await;
+
+        let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(
+            recorded
+                .contains("Pondering Hard…  \u{e8a4} \u{f145} check sprint\n<b>linear: issues</b>"),
+            "{recorded}"
+        );
+        assert!(
+            recorded.contains("Answer (deep)  \u{e8a4} \u{f145} … Done."),
+            "{recorded}"
+        );
+        assert!(
+            recorded.contains("Task complete (deep)  \u{f455} \u{f42f} Ready."),
+            "{recorded}"
+        );
+        assert!(
+            recorded.contains("Request timed out (deep)  \u{e8a4} timed out"),
+            "{recorded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_send_basename_receives_hey_computer_boolean_hint() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("hc-notify-hint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let fake_notify_send = dir.join("notify-send");
+        std::fs::write(
+            &fake_notify_send,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\necho 11\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_notify_send, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let mut config = PresentConfig {
+            notifier: vec![fake_notify_send.to_string_lossy().into_owned()],
+            clipboard: vec!["/bin/true".to_string()],
+            ..PresentConfig::default()
+        };
+        let id = notify(&config, "Title", "Body", Urgency::Normal, 0, None).await;
+        assert_eq!(id, Some(11));
+
+        // Action notifier path also passes the hint when basename is `notify-send`.
+        let desktop = Desktop::spawn(&config, dir.join("answers"));
+        desktop.present(Presentation::Answer {
+            id: 1,
+            text: "Short.".to_string(),
+            denied: vec![],
+            profile: None,
+            widgets: vec![],
+            icons: vec![],
+        });
+        desktop.finish().await;
+
+        let recorded = std::fs::read_to_string(&calls).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(lines.len(), 2, "{recorded}");
+        for line in &lines {
+            assert!(
+                line.contains("--hint=boolean:x-hey-computer:true"),
+                "missing hint: {line}"
+            );
+        }
+
+        // Non-notify-send recording script does NOT get the hint.
+        let calls2 = dir.join("notify2.log");
+        config = recording_config(&calls2, &[]);
+        let _ = notify(&config, "Title", "Body", Urgency::Normal, 0, None).await;
+        let recorded2 = std::fs::read_to_string(&calls2).unwrap();
+        assert!(
+            !recorded2.contains("--hint=boolean:x-hey-computer:true"),
+            "{recorded2}"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
