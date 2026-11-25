@@ -25,6 +25,7 @@ pub mod keyring;
 pub mod lines;
 pub mod mcp;
 pub mod mock;
+pub mod notify_filter;
 pub mod policy;
 pub mod present;
 pub mod protocol;

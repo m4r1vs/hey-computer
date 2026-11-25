@@ -7,7 +7,7 @@
 //! and still accepted as a read-only fallback when `history.db` does not exist.
 
 use std::fmt;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,14 +21,14 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::attachments::AttachmentMeta;
 use crate::config::History as HistoryConfig;
-pub use crate::protocol::WidgetSpec;
+pub use crate::protocol::{DraftAction, WidgetSpec};
 use crate::protocol::{FailReason, InputSource};
 
 pub const DB_FILE: &str = "history.db";
 pub const LAST_FILE: &str = "last.json";
 pub const SPEAK_STATE_FILE: &str = "speak_enabled";
 pub const SCHEMA_VERSION: u32 = 1;
-pub const DB_SCHEMA_VERSION: i32 = 4;
+pub const DB_SCHEMA_VERSION: i32 = 5;
 
 const PRUNE_EVERY_TURNS: u64 = 100;
 
@@ -324,6 +324,31 @@ enum StoreCmd {
         message: String,
         finished_at_ms: i64,
     },
+    CreateDraftCheckpoint {
+        spec: NewDraftCheckpoint,
+        reply: oneshot::Sender<Result<DraftCheckpoint>>,
+    },
+    ClaimDraftCheckpoint {
+        token_or_id: String,
+        action: DraftAction,
+        now_ms: i64,
+        reply: oneshot::Sender<Result<CheckpointClaim>>,
+    },
+    DismissDraftsForChat {
+        channel: String,
+        chat_target: String,
+        now_ms: i64,
+        reply: oneshot::Sender<Result<usize>>,
+    },
+    ListDraftCheckpoints {
+        include_all: bool,
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<DraftCheckpoint>>>,
+    },
+    GetDraftCheckpoint {
+        token_or_id: String,
+        reply: oneshot::Sender<Result<Option<DraftCheckpoint>>>,
+    },
     Flush(oneshot::Sender<()>),
     Shutdown,
 }
@@ -518,6 +543,46 @@ impl Store {
                                 maybe_prune(&conn, &mut turns_since_prune);
                             }
                         }
+                        StoreCmd::CreateDraftCheckpoint { spec, reply } => {
+                            let _ = reply.send(insert_draft_checkpoint(&conn, &spec));
+                        }
+                        StoreCmd::ClaimDraftCheckpoint {
+                            token_or_id,
+                            action,
+                            now_ms,
+                            reply,
+                        } => {
+                            let _ = reply.send(claim_draft_checkpoint_conn(
+                                &mut conn,
+                                &token_or_id,
+                                action,
+                                now_ms,
+                            ));
+                        }
+                        StoreCmd::DismissDraftsForChat {
+                            channel,
+                            chat_target,
+                            now_ms,
+                            reply,
+                        } => {
+                            let _ = reply.send(dismiss_drafts_for_chat_conn(
+                                &conn,
+                                &channel,
+                                &chat_target,
+                                now_ms,
+                            ));
+                        }
+                        StoreCmd::ListDraftCheckpoints {
+                            include_all,
+                            limit,
+                            reply,
+                        } => {
+                            let _ =
+                                reply.send(list_draft_checkpoints_conn(&conn, include_all, limit));
+                        }
+                        StoreCmd::GetDraftCheckpoint { token_or_id, reply } => {
+                            let _ = reply.send(lookup_draft_checkpoint(&conn, &token_or_id));
+                        }
                         StoreCmd::Flush(ack) => {
                             let _ = ack.send(());
                         }
@@ -627,6 +692,93 @@ impl Store {
         });
     }
 
+    /// Persist a new stateless notification draft checkpoint with a fresh
+    /// 128-bit single-use token (`hc_d_<32hex>`).
+    pub async fn create_draft_checkpoint(
+        &self,
+        spec: NewDraftCheckpoint,
+    ) -> Result<DraftCheckpoint> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StoreCmd::CreateDraftCheckpoint { spec, reply })
+            .map_err(|_| anyhow::anyhow!("history store actor stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("history store actor dropped reply"))?
+    }
+
+    /// Atomically claim a draft checkpoint by token or numeric ID (`#12` / `12`)
+    /// inside an `IMMEDIATE` transaction.
+    pub async fn claim_draft_checkpoint(
+        &self,
+        token_or_id: String,
+        action: DraftAction,
+        now_ms: i64,
+    ) -> Result<CheckpointClaim> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StoreCmd::ClaimDraftCheckpoint {
+                token_or_id,
+                action,
+                now_ms,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("history store actor stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("history store actor dropped reply"))?
+    }
+
+    /// Dismiss all pending draft checkpoints for `(channel, chat_target)` (for
+    /// example when the user answers directly on their phone).
+    pub async fn dismiss_drafts_for_chat(
+        &self,
+        channel: String,
+        chat_target: String,
+        now_ms: i64,
+    ) -> Result<usize> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StoreCmd::DismissDraftsForChat {
+                channel,
+                chat_target,
+                now_ms,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("history store actor stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("history store actor dropped reply"))?
+    }
+
+    /// List draft checkpoints (pending only unless `include_all` is true), newest first.
+    pub async fn list_draft_checkpoints(
+        &self,
+        include_all: bool,
+        limit: usize,
+    ) -> Result<Vec<DraftCheckpoint>> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StoreCmd::ListDraftCheckpoints {
+                include_all,
+                limit,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("history store actor stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("history store actor dropped reply"))?
+    }
+
+    /// Look up one draft checkpoint by token or numeric ID (`#12` / `12`).
+    pub async fn get_draft_checkpoint(
+        &self,
+        token_or_id: String,
+    ) -> Result<Option<DraftCheckpoint>> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StoreCmd::GetDraftCheckpoint { token_or_id, reply })
+            .map_err(|_| anyhow::anyhow!("history store actor stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("history store actor dropped reply"))?
+    }
+
     /// Wait until all previously queued writes have committed.
     pub async fn flush(&self) {
         let (tx, rx) = oneshot::channel();
@@ -655,6 +807,7 @@ fn fail_reason_str(reason: FailReason) -> &'static str {
         FailReason::Timeout => "timeout",
         FailReason::LimitReached => "limit_reached",
         FailReason::AgentDown => "agent_down",
+        FailReason::KeyringLocked => "keyring_locked",
         FailReason::AgentError => "agent_error",
         FailReason::Denied => "denied",
         FailReason::Empty => "empty",
@@ -890,6 +1043,45 @@ CREATE INDEX IF NOT EXISTS idx_turns_schedule_id ON turns(schedule_id, id DESC)
     WHERE schedule_id IS NOT NULL;
 "#;
 
+const SCHEMA_V5: &str = r#"
+CREATE TABLE draft_checkpoints (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_id          INTEGER,
+    token            TEXT    NOT NULL UNIQUE,
+    channel          TEXT    NOT NULL,
+    app_name         TEXT    NOT NULL,
+    sender           TEXT    NOT NULL,
+    chat_target      TEXT    NOT NULL DEFAULT '',
+    source_notif_id  INTEGER,
+    window_class     TEXT    NOT NULL DEFAULT '',
+    context_note     TEXT    NOT NULL DEFAULT '',
+    draft_text       TEXT    NOT NULL DEFAULT '',
+    status           TEXT    NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'consumed', 'dismissed', 'expired')),
+    consumed_action  TEXT
+                     CHECK (consumed_action IS NULL OR consumed_action IN ('copy', 'paste', 'edit', 'dismiss')),
+    created_at       INTEGER NOT NULL,
+    expires_at       INTEGER NOT NULL,
+    consumed_at      INTEGER
+) STRICT;
+
+CREATE INDEX idx_draft_checkpoints_expires
+    ON draft_checkpoints(expires_at ASC)
+    WHERE status = 'pending';
+
+CREATE INDEX idx_draft_checkpoints_turn_id
+    ON draft_checkpoints(turn_id)
+    WHERE turn_id IS NOT NULL;
+
+CREATE INDEX idx_draft_checkpoints_chat
+    ON draft_checkpoints(channel, chat_target)
+    WHERE status = 'pending';
+
+CREATE INDEX idx_draft_checkpoints_source_notif
+    ON draft_checkpoints(source_notif_id)
+    WHERE source_notif_id IS NOT NULL;
+"#;
+
 const IDX_TURNS_SCHEDULE_ID: &str = "CREATE INDEX IF NOT EXISTS idx_turns_schedule_id \
     ON turns(schedule_id, id DESC) WHERE schedule_id IS NOT NULL;";
 
@@ -926,6 +1118,11 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tx.execute_batch(SCHEMA_V4)
             .context("migrating history database schema v3 -> v4")?;
         version = 4;
+    }
+    if version == 4 {
+        tx.execute_batch(SCHEMA_V5)
+            .context("migrating history database schema v4 -> v5")?;
+        version = 5;
     }
     tx.pragma_update(None, "user_version", version)?;
     tx.commit()?;
@@ -1093,6 +1290,39 @@ fn prune_connection(conn: &Connection, history: &HistoryConfig, now_ms: i64) -> 
                    LIMIT ?1
                )",
             params![history.max_entries as i64],
+        )?;
+    }
+    if has_draft_checkpoints_table(conn).unwrap_or(false) {
+        // Expire overdue pending draft checkpoints and prune aged/excess terminal rows.
+        let _ = conn.execute(
+            "UPDATE draft_checkpoints
+             SET status = 'expired'
+             WHERE status = 'pending' AND expires_at <= ?1",
+            params![now_ms],
+        );
+        let age_days = if history.suppressed_days > 0.0 && history.suppressed_days.is_finite() {
+            history.suppressed_days
+        } else {
+            history.retention_days
+        };
+        if age_days > 0.0 && age_days.is_finite() {
+            let cutoff = now_ms - (age_days * 86_400_000.0) as i64;
+            deleted += conn.execute(
+                "DELETE FROM draft_checkpoints
+                 WHERE status != 'pending' AND created_at < ?1",
+                params![cutoff],
+            )?;
+        }
+        deleted += conn.execute(
+            "DELETE FROM draft_checkpoints
+             WHERE status != 'pending'
+               AND id NOT IN (
+                   SELECT id FROM draft_checkpoints
+                   WHERE status != 'pending'
+                   ORDER BY id DESC
+                   LIMIT 1000
+               )",
+            [],
         )?;
     }
     if deleted > 0 {
@@ -1453,6 +1683,7 @@ pub fn query_distill_candidates(
            AND status IN ('completed', 'suppressed')
            AND (schedule_id IS NOT NULL
                 OR origin IN ('schedule', 'schedule_script', 'distill')
+                OR lane = 'restricted'
                 OR suppressed_token IS NOT NULL
                 OR status = 'suppressed')",
         params![since_ms],
@@ -1465,6 +1696,7 @@ pub fn query_distill_candidates(
            AND length(trim(answer)) > 0
            AND schedule_id IS NULL
            AND origin NOT IN ('schedule', 'schedule_script', 'distill')
+           AND lane != 'restricted'
            AND suppressed_token IS NULL
            AND (?1 IS NULL OR created_at >= ?1)
          ORDER BY created_at DESC, id DESC
@@ -1685,7 +1917,7 @@ pub fn recall(state_dir: &Path, opts: &RecallOptions) -> Result<Vec<RecallHit>> 
                AND (?1 IS NULL OR lane = ?1)
                AND (?2 IS NULL OR created_at >= ?2)
                AND (?3 IS NULL OR created_at < ?3)
-               AND (?4 = 0 OR (schedule_id IS NULL AND origin NOT IN ('schedule', 'schedule_script', 'distill')))
+               AND (?4 = 0 OR (schedule_id IS NULL AND origin NOT IN ('schedule', 'schedule_script', 'distill') AND lane != 'restricted'))
              ORDER BY created_at DESC, id DESC
              LIMIT ?5",
         )?;
@@ -1771,7 +2003,7 @@ pub fn recall(state_dir: &Path, opts: &RecallOptions) -> Result<Vec<RecallHit>> 
            AND (?3 IS NULL OR t.lane = ?3)
            AND (?4 IS NULL OR t.created_at >= ?4)
            AND (?5 IS NULL OR t.created_at < ?5)
-           AND (?6 = 0 OR (t.schedule_id IS NULL AND t.origin NOT IN ('schedule', 'schedule_script', 'distill')))
+           AND (?6 = 0 OR (t.schedule_id IS NULL AND t.origin NOT IN ('schedule', 'schedule_script', 'distill') AND t.lane != 'restricted'))
          ORDER BY {order}
          LIMIT ?7"
     );
@@ -3526,6 +3758,433 @@ pub fn record_schedule_outcome(
     Ok(new_failures.max(0) as u64)
 }
 
+/// Lifecycle state of a persisted stateless notification draft checkpoint (schema v5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftStatus {
+    Pending,
+    Consumed,
+    Dismissed,
+    Expired,
+}
+
+impl DraftStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Consumed => "consumed",
+            Self::Dismissed => "dismissed",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "consumed" => Some(Self::Consumed),
+            "dismissed" => Some(Self::Dismissed),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for DraftStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One row from the `draft_checkpoints` table (schema v5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftCheckpoint {
+    pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<u64>,
+    pub token: String,
+    pub channel: String,
+    pub app_name: String,
+    pub sender: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub chat_target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_notif_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub window_class: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context_note: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub draft_text: String,
+    pub status: DraftStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumed_action: Option<DraftAction>,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumed_at_ms: Option<i64>,
+}
+
+/// Fields needed to create a new stateless draft checkpoint row.
+#[derive(Debug, Clone)]
+pub struct NewDraftCheckpoint {
+    pub turn_id: Option<u64>,
+    pub channel: String,
+    pub app_name: String,
+    pub sender: String,
+    pub chat_target: String,
+    pub source_notif_id: Option<u32>,
+    pub window_class: String,
+    pub context_note: String,
+    pub draft_text: String,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+/// Outcome of an atomic single-use draft checkpoint claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointClaim {
+    /// Transitioned from `pending` -> `consumed`/`dismissed` in this call.
+    Claimed(DraftCheckpoint),
+    /// Already consumed/dismissed earlier (idempotent replay / double-click).
+    AlreadyUsed(DraftCheckpoint),
+    /// Past `expires_at_ms` (transitioned to `expired` if still `pending`).
+    Expired(DraftCheckpoint),
+    /// Unknown token or ID.
+    NotFound,
+}
+
+const DRAFT_CHECKPOINT_COLUMNS: &str = "id, turn_id, token, channel, app_name, sender, \
+    chat_target, source_notif_id, window_class, context_note, draft_text, status, \
+    consumed_action, created_at, expires_at, consumed_at";
+
+fn has_draft_checkpoints_table(conn: &Connection) -> Result<bool> {
+    let version: i32 = conn.query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+    Ok(version >= 5)
+}
+
+fn fill_random_bytes(buf: &mut [u8]) -> Result<()> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let rc =
+            unsafe { libc::getrandom(buf[filled..].as_mut_ptr().cast(), buf.len() - filled, 0) };
+        if rc > 0 {
+            filled += rc as usize;
+        } else if rc == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        } else {
+            break;
+        }
+    }
+    if filled < buf.len() {
+        let mut urandom = std::fs::File::open("/dev/urandom")
+            .context("opening /dev/urandom fallback for draft token")?;
+        urandom
+            .read_exact(&mut buf[filled..])
+            .context("reading random bytes from /dev/urandom")?;
+    }
+    Ok(())
+}
+
+/// Generate a 128-bit single-use draft resume token (`hc_d_<32hex>`).
+pub fn generate_draft_token() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    fill_random_bytes(&mut bytes)?;
+    let mut token = String::with_capacity(5 + 32);
+    token.push_str("hc_d_");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(token, "{byte:02x}");
+    }
+    Ok(token)
+}
+
+fn row_to_draft_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<DraftCheckpoint> {
+    let id: i64 = row.get(0)?;
+    let turn_id: Option<i64> = row.get(1)?;
+    let token: String = row.get(2)?;
+    let channel: String = row.get(3)?;
+    let app_name: String = row.get(4)?;
+    let sender: String = row.get(5)?;
+    let chat_target: String = row.get(6)?;
+    let source_notif_id: Option<i64> = row.get(7)?;
+    let window_class: String = row.get(8)?;
+    let context_note: String = row.get(9)?;
+    let draft_text: String = row.get(10)?;
+    let status_str: String = row.get(11)?;
+    let consumed_action_str: Option<String> = row.get(12)?;
+    let created_at_ms: i64 = row.get(13)?;
+    let expires_at_ms: i64 = row.get(14)?;
+    let consumed_at_ms: Option<i64> = row.get(15)?;
+
+    Ok(DraftCheckpoint {
+        id: id.max(0) as u64,
+        turn_id: turn_id.map(|v| v.max(0) as u64),
+        token,
+        channel,
+        app_name,
+        sender,
+        chat_target,
+        source_notif_id: source_notif_id.and_then(|v| u32::try_from(v).ok()),
+        window_class,
+        context_note,
+        draft_text,
+        status: DraftStatus::parse(&status_str).unwrap_or(DraftStatus::Expired),
+        consumed_action: consumed_action_str.as_deref().and_then(DraftAction::parse),
+        created_at_ms,
+        expires_at_ms,
+        consumed_at_ms,
+    })
+}
+
+fn insert_draft_checkpoint(
+    conn: &Connection,
+    spec: &NewDraftCheckpoint,
+) -> Result<DraftCheckpoint> {
+    let token = generate_draft_token()?;
+    conn.execute(
+        "INSERT INTO draft_checkpoints (
+            turn_id, token, channel, app_name, sender, chat_target,
+            source_notif_id, window_class, context_note, draft_text,
+            status, created_at, expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12)",
+        params![
+            spec.turn_id.map(|v| v as i64),
+            token,
+            spec.channel,
+            spec.app_name,
+            spec.sender,
+            spec.chat_target,
+            spec.source_notif_id.map(i64::from),
+            spec.window_class,
+            spec.context_note,
+            spec.draft_text,
+            spec.created_at_ms,
+            spec.expires_at_ms,
+        ],
+    )
+    .context("inserting draft checkpoint")?;
+    let id = conn.last_insert_rowid().max(0) as u64;
+    Ok(DraftCheckpoint {
+        id,
+        turn_id: spec.turn_id,
+        token,
+        channel: spec.channel.clone(),
+        app_name: spec.app_name.clone(),
+        sender: spec.sender.clone(),
+        chat_target: spec.chat_target.clone(),
+        source_notif_id: spec.source_notif_id,
+        window_class: spec.window_class.clone(),
+        context_note: spec.context_note.clone(),
+        draft_text: spec.draft_text.clone(),
+        status: DraftStatus::Pending,
+        consumed_action: None,
+        created_at_ms: spec.created_at_ms,
+        expires_at_ms: spec.expires_at_ms,
+        consumed_at_ms: None,
+    })
+}
+
+fn lookup_draft_checkpoint(
+    conn: &Connection,
+    token_or_id: &str,
+) -> Result<Option<DraftCheckpoint>> {
+    let trimmed = token_or_id.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if let Some(row) = conn
+        .query_row(
+            &format!("SELECT {DRAFT_CHECKPOINT_COLUMNS} FROM draft_checkpoints WHERE token = ?1"),
+            params![trimmed],
+            row_to_draft_checkpoint,
+        )
+        .optional()?
+    {
+        return Ok(Some(row));
+    }
+    let numeric = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if let Ok(id) = numeric.parse::<u64>() {
+        let row = conn
+            .query_row(
+                &format!("SELECT {DRAFT_CHECKPOINT_COLUMNS} FROM draft_checkpoints WHERE id = ?1"),
+                params![id as i64],
+                row_to_draft_checkpoint,
+            )
+            .optional()?;
+        return Ok(row);
+    }
+    Ok(None)
+}
+
+fn claim_draft_checkpoint_conn(
+    conn: &mut Connection,
+    token_or_id: &str,
+    action: DraftAction,
+    now_ms: i64,
+) -> Result<CheckpointClaim> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let Some(mut row) = lookup_draft_checkpoint(&tx, token_or_id)? else {
+        tx.commit()?;
+        return Ok(CheckpointClaim::NotFound);
+    };
+    let outcome = match row.status {
+        DraftStatus::Pending if now_ms >= row.expires_at_ms => {
+            tx.execute(
+                "UPDATE draft_checkpoints
+                 SET status = 'expired'
+                 WHERE id = ?1 AND status = 'pending'",
+                params![row.id as i64],
+            )?;
+            row.status = DraftStatus::Expired;
+            CheckpointClaim::Expired(row)
+        }
+        DraftStatus::Pending => {
+            let next_status = if action == DraftAction::Dismiss {
+                DraftStatus::Dismissed
+            } else {
+                DraftStatus::Consumed
+            };
+            tx.execute(
+                "UPDATE draft_checkpoints
+                 SET status = ?2, consumed_action = ?3, consumed_at = ?4
+                 WHERE id = ?1 AND status = 'pending'",
+                params![row.id as i64, next_status.as_str(), action.as_str(), now_ms],
+            )?;
+            row.status = next_status;
+            row.consumed_action = Some(action);
+            row.consumed_at_ms = Some(now_ms);
+            CheckpointClaim::Claimed(row)
+        }
+        DraftStatus::Expired => CheckpointClaim::Expired(row),
+        DraftStatus::Consumed | DraftStatus::Dismissed => CheckpointClaim::AlreadyUsed(row),
+    };
+    tx.commit()?;
+    Ok(outcome)
+}
+
+fn dismiss_drafts_for_chat_conn(
+    conn: &Connection,
+    channel: &str,
+    chat_target: &str,
+    now_ms: i64,
+) -> Result<usize> {
+    let ch = channel.trim();
+    let target = chat_target.trim();
+    if ch.is_empty() || target.is_empty() {
+        return Ok(0);
+    }
+    let updated = conn.execute(
+        "UPDATE draft_checkpoints
+         SET status = 'dismissed',
+             consumed_action = 'dismiss',
+             consumed_at = ?3
+         WHERE status = 'pending'
+           AND lower(channel) = lower(?1)
+           AND (
+               (chat_target != '' AND lower(chat_target) = lower(?2))
+               OR (chat_target = '' AND lower(sender) = lower(?2))
+           )",
+        params![ch, target, now_ms],
+    )?;
+    Ok(updated)
+}
+
+fn list_draft_checkpoints_conn(
+    conn: &Connection,
+    include_all: bool,
+    limit: usize,
+) -> Result<Vec<DraftCheckpoint>> {
+    let cap = limit.clamp(1, 200) as i64;
+    let sql = if include_all {
+        format!(
+            "SELECT {DRAFT_CHECKPOINT_COLUMNS}
+             FROM draft_checkpoints
+             ORDER BY id DESC
+             LIMIT ?1"
+        )
+    } else {
+        format!(
+            "SELECT {DRAFT_CHECKPOINT_COLUMNS}
+             FROM draft_checkpoints
+             WHERE status = 'pending'
+             ORDER BY id DESC
+             LIMIT ?1"
+        )
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![cap], row_to_draft_checkpoint)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Offline helper: persist a new stateless draft checkpoint directly in `history.db`.
+pub fn create_draft_checkpoint(
+    state_dir: &Path,
+    spec: &NewDraftCheckpoint,
+) -> Result<DraftCheckpoint> {
+    let conn = open_migrated_writer(state_dir)?;
+    insert_draft_checkpoint(&conn, spec)
+}
+
+/// Offline helper: atomically claim a draft checkpoint by token or `#id` / `id`
+/// inside an `IMMEDIATE` transaction (works even when the daemon is stopped).
+pub fn claim_draft_checkpoint(
+    state_dir: &Path,
+    token_or_id: &str,
+    action: DraftAction,
+    now_ms: i64,
+) -> Result<CheckpointClaim> {
+    let mut conn = open_migrated_writer(state_dir)?;
+    claim_draft_checkpoint_conn(&mut conn, token_or_id, action, now_ms)
+}
+
+/// Offline helper: dismiss all pending draft checkpoints for `(channel, chat_target)`.
+pub fn dismiss_drafts_for_chat(
+    state_dir: &Path,
+    channel: &str,
+    chat_target: &str,
+    now_ms: i64,
+) -> Result<usize> {
+    let conn = open_migrated_writer(state_dir)?;
+    dismiss_drafts_for_chat_conn(&conn, channel, chat_target, now_ms)
+}
+
+/// Offline read-only helper: list draft checkpoints from `history.db`, newest first.
+pub fn list_draft_checkpoints(
+    state_dir: &Path,
+    include_all: bool,
+    limit: usize,
+) -> Result<Vec<DraftCheckpoint>> {
+    let Some(conn) = open_reader_connection(state_dir)? else {
+        return Ok(Vec::new());
+    };
+    if !has_draft_checkpoints_table(&conn)? {
+        return Ok(Vec::new());
+    }
+    list_draft_checkpoints_conn(&conn, include_all, limit)
+}
+
+/// Offline read-only helper: look up one draft checkpoint by token or `#id` / `id`.
+pub fn get_draft_checkpoint(
+    state_dir: &Path,
+    token_or_id: &str,
+) -> Result<Option<DraftCheckpoint>> {
+    let Some(conn) = open_reader_connection(state_dir)? else {
+        return Ok(None);
+    };
+    if !has_draft_checkpoints_table(&conn)? {
+        return Ok(None);
+    }
+    lookup_draft_checkpoint(&conn, token_or_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4371,6 +5030,288 @@ mod tests {
         assert!(parse_day_range("24h", now).is_err());
 
         store.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn schema_v5_draft_checkpoints_atomic_claims_pruning_and_restricted_exclusion() {
+        let dir = scratch("v4-to-v5-drafts");
+        // Seed a schema v4 database directly to verify v4 -> v5 migration.
+        {
+            let conn = open_writer_connection(&dir).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            conn.execute_batch(SCHEMA_V4).unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+        }
+
+        let (store, _) = Store::open(&dir, &HistoryConfig::default()).unwrap();
+        let now = unix_timestamp_ms();
+
+        // 1. Token format (`hc_d_<32hex>`) and uniqueness.
+        let tok1 = generate_draft_token().unwrap();
+        let tok2 = generate_draft_token().unwrap();
+        assert!(tok1.starts_with("hc_d_"));
+        assert_eq!(tok1.len(), 37);
+        assert!(
+            tok1[5..]
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        assert_ne!(tok1, tok2);
+
+        // 2. Create draft checkpoints via Store actor + offline helper.
+        let cp1 = store
+            .create_draft_checkpoint(NewDraftCheckpoint {
+                turn_id: Some(10),
+                channel: "signal".to_string(),
+                app_name: "Signal".to_string(),
+                sender: "Alice".to_string(),
+                chat_target: "+15550101".to_string(),
+                source_notif_id: Some(77),
+                window_class: "signal".to_string(),
+                context_note: "Asking about dinner".to_string(),
+                draft_text: "Ja gerne, 19:00 passt!".to_string(),
+                created_at_ms: now,
+                expires_at_ms: now + 60_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(cp1.status, DraftStatus::Pending);
+        assert!(cp1.token.starts_with("hc_d_"));
+        assert_eq!(cp1.source_notif_id, Some(77));
+        assert_eq!(cp1.context_note, "Asking about dinner");
+
+        let cp2 = create_draft_checkpoint(
+            &dir,
+            &NewDraftCheckpoint {
+                turn_id: Some(11),
+                channel: "whatsapp".to_string(),
+                app_name: "Whatsapp".to_string(),
+                sender: "Bob".to_string(),
+                chat_target: "bob@s.whatsapp.net".to_string(),
+                source_notif_id: Some(78),
+                window_class: "whatsapp-electron".to_string(),
+                context_note: String::new(),
+                draft_text: "Bin gleich da!".to_string(),
+                created_at_ms: now,
+                expires_at_ms: now + 10_000,
+            },
+        )
+        .unwrap();
+
+        let cp3 = store
+            .create_draft_checkpoint(NewDraftCheckpoint {
+                turn_id: Some(12),
+                channel: "whatsapp".to_string(),
+                app_name: "Whatsapp".to_string(),
+                sender: "Bob".to_string(),
+                chat_target: "bob@s.whatsapp.net".to_string(),
+                source_notif_id: Some(79),
+                window_class: "whatsapp-electron".to_string(),
+                context_note: "Follow-up".to_string(),
+                draft_text: "Alles klar".to_string(),
+                created_at_ms: now,
+                expires_at_ms: now + 60_000,
+            })
+            .await
+            .unwrap();
+
+        // Lookup by token, `#id`, and numeric id.
+        assert_eq!(
+            store.get_draft_checkpoint(cp1.token.clone()).await.unwrap(),
+            Some(cp1.clone())
+        );
+        assert_eq!(
+            get_draft_checkpoint(&dir, &format!("#{}", cp1.id)).unwrap(),
+            Some(cp1.clone())
+        );
+        assert_eq!(
+            get_draft_checkpoint(&dir, &cp1.id.to_string()).unwrap(),
+            Some(cp1.clone())
+        );
+        assert_eq!(list_draft_checkpoints(&dir, false, 20).unwrap().len(), 3);
+
+        // 3. Atomic claim: first claim succeeds, replay returns `AlreadyUsed`.
+        let first_claim = store
+            .claim_draft_checkpoint(cp1.token.clone(), DraftAction::Copy, now + 1_000)
+            .await
+            .unwrap();
+        match first_claim {
+            CheckpointClaim::Claimed(claimed) => {
+                assert_eq!(claimed.id, cp1.id);
+                assert_eq!(claimed.status, DraftStatus::Consumed);
+                assert_eq!(claimed.consumed_action, Some(DraftAction::Copy));
+                assert_eq!(claimed.consumed_at_ms, Some(now + 1_000));
+            }
+            other => panic!("expected Claimed, got {other:?}"),
+        }
+        let replay =
+            claim_draft_checkpoint(&dir, &cp1.token, DraftAction::Paste, now + 2_000).unwrap();
+        assert!(matches!(
+            replay,
+            CheckpointClaim::AlreadyUsed(row) if row.consumed_action == Some(DraftAction::Copy)
+        ));
+        assert_eq!(
+            claim_draft_checkpoint(&dir, "hc_d_doesnotexist", DraftAction::Copy, now).unwrap(),
+            CheckpointClaim::NotFound
+        );
+
+        // 4. Claim after `expires_at_ms` transitions to `Expired` and never runs side effects.
+        let expired_claim =
+            claim_draft_checkpoint(&dir, &cp2.token, DraftAction::Copy, now + 15_000).unwrap();
+        assert!(matches!(
+            expired_claim,
+            CheckpointClaim::Expired(row) if row.id == cp2.id && row.status == DraftStatus::Expired
+        ));
+        let expired_again = store
+            .claim_draft_checkpoint(cp2.token.clone(), DraftAction::Copy, now + 16_000)
+            .await
+            .unwrap();
+        assert!(matches!(expired_again, CheckpointClaim::Expired(_)));
+
+        // 5. `dismiss_drafts_for_chat` dismisses pending WhatsApp drafts for Bob only.
+        let dismissed_count = store
+            .dismiss_drafts_for_chat(
+                "WhatsApp".to_string(),
+                "BOB@s.whatsapp.net".to_string(),
+                now + 20_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dismissed_count, 1);
+        let cp3_after = get_draft_checkpoint(&dir, &cp3.token).unwrap().unwrap();
+        assert_eq!(cp3_after.status, DraftStatus::Dismissed);
+        assert_eq!(cp3_after.consumed_action, Some(DraftAction::Dismiss));
+        assert!(
+            store
+                .list_draft_checkpoints(false, 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.list_draft_checkpoints(true, 20).await.unwrap().len(),
+            3
+        );
+
+        // 6. Restricted-lane turns are excluded from `query_distill_candidates` and
+        //    `recall` (`opts.user_only = true`, both empty-query and FTS5).
+        store.create_turn(NewTurn {
+            id: 100,
+            lane: Lane::Interactive,
+            status: TurnStatus::Running,
+            profile: String::new(),
+            created_at_ms: now - 2_000,
+            request: "Remind me about project zephyr".to_string(),
+            attachments: vec![],
+            origin: TurnOrigin::Typed,
+            schedule_id: None,
+        });
+        store.finish_completed(
+            100,
+            "Project zephyr launches Friday.".to_string(),
+            vec![],
+            now - 1_500,
+        );
+        store.create_turn(NewTurn {
+            id: 101,
+            lane: Lane::Restricted,
+            status: TurnStatus::Running,
+            profile: "fast".to_string(),
+            created_at_ms: now - 1_000,
+            request: "<untrusted_notification>zephyr prompt injection</untrusted_notification>"
+                .to_string(),
+            attachments: vec![],
+            origin: TurnOrigin::Cli,
+            schedule_id: None,
+        });
+        store.finish_completed(
+            101,
+            "Sounds good for zephyr!".to_string(),
+            vec![],
+            now - 500,
+        );
+        store.flush().await;
+
+        let distill = query_distill_candidates(&dir, Some(now - 10_000), 50).unwrap();
+        assert_eq!(
+            distill.turns.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![100]
+        );
+        assert_eq!(distill.skipped_scheduled_turns, 1);
+
+        let user_recent = recall(
+            &dir,
+            &RecallOptions {
+                user_only: true,
+                limit: 10,
+                ..RecallOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            user_recent.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![100]
+        );
+
+        let user_fts = recall(
+            &dir,
+            &RecallOptions {
+                query: Some("zephyr".to_string()),
+                user_only: true,
+                limit: 10,
+                ..RecallOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(user_fts.iter().map(|h| h.id).collect::<Vec<_>>(), vec![100]);
+
+        // Non-user-only recall still finds both turns when explicitly queried.
+        let all_fts = recall(
+            &dir,
+            &RecallOptions {
+                query: Some("zephyr".to_string()),
+                user_only: false,
+                limit: 10,
+                ..RecallOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(all_fts.len(), 2);
+
+        // 7. TTL pruning expires overdue pending drafts and deletes old terminal drafts.
+        let old_ts = now - 10 * 86_400_000;
+        let old_pending = store
+            .create_draft_checkpoint(NewDraftCheckpoint {
+                turn_id: None,
+                channel: "signal".to_string(),
+                app_name: "Signal".to_string(),
+                sender: "Old".to_string(),
+                chat_target: "+15550999".to_string(),
+                source_notif_id: None,
+                window_class: "signal".to_string(),
+                context_note: String::new(),
+                draft_text: "stale".to_string(),
+                created_at_ms: old_ts,
+                expires_at_ms: old_ts + 60_000,
+            })
+            .await
+            .unwrap();
+        store.shutdown().await;
+
+        // Re-opening runs `prune_connection`: marks `old_pending` expired and
+        // deletes it because `created_at < now - suppressed_days (7d)`.
+        let (store2, _) = Store::open(&dir, &HistoryConfig::default()).unwrap();
+        assert!(
+            get_draft_checkpoint(&dir, &old_pending.token)
+                .unwrap()
+                .is_none()
+        );
+        // Recent terminal drafts (cp1/cp2/cp3) are retained within 7 days.
+        assert!(get_draft_checkpoint(&dir, &cp1.token).unwrap().is_some());
+        store2.shutdown().await;
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -88,6 +88,43 @@ pub enum SpeakAction {
     Status,
 }
 
+/// Action applied when resuming a persisted notification draft checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftAction {
+    Copy,
+    Paste,
+    Edit,
+    Dismiss,
+}
+
+impl DraftAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Paste => "paste",
+            Self::Edit => "edit",
+            Self::Dismiss => "dismiss",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "copy" => Some(Self::Copy),
+            "paste" => Some(Self::Paste),
+            "edit" => Some(Self::Edit),
+            "dismiss" => Some(Self::Dismiss),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DraftAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -255,6 +292,8 @@ pub enum FailReason {
     LimitReached,
     /// The agent could not be started, or exited mid-request.
     AgentDown,
+    /// `agent.wait_for_keyring` is enabled and the login keyring is still locked.
+    KeyringLocked,
     /// The agent refused the request; the message is what it said.
     AgentError,
     /// The only thing the agent tried was refused by the deny list.
@@ -272,6 +311,7 @@ impl FailReason {
             Self::Timeout => "Request timed out",
             Self::LimitReached => "Limit reached",
             Self::AgentDown => "The assistant is not running",
+            Self::KeyringLocked => "Keyring is locked",
             Self::AgentError => "The assistant refused the request",
             Self::Denied => "Command refused",
             Self::Empty => "No answer",
@@ -315,6 +355,9 @@ pub struct Status {
 #[serde(rename_all = "snake_case")]
 pub enum AgentState {
     Down,
+    /// Waiting for `org.freedesktop.secrets` default collection to unlock
+    /// before starting the ACP agent (`agent.wait_for_keyring = true`).
+    Locked,
     Starting,
     Ready,
 }
@@ -323,6 +366,7 @@ impl std::fmt::Display for AgentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Down => "down",
+            Self::Locked => "locked",
             Self::Starting => "starting",
             Self::Ready => "ready",
         })
@@ -559,6 +603,30 @@ mod tests {
             encode(&Reply::SpeakFinished { id: 11 }),
             r#"{"type":"speak_finished","id":11}"#
         );
+        assert_eq!(
+            encode(&Reply::Failed {
+                id: 12,
+                reason: FailReason::KeyringLocked,
+                message: "locked".to_string(),
+            }),
+            r#"{"type":"failed","id":12,"reason":"keyring_locked","message":"locked"}"#
+        );
+        assert_eq!(FailReason::KeyringLocked.headline(), "Keyring is locked");
+        assert_eq!(AgentState::Locked.to_string(), "locked");
+        assert_eq!(encode(&AgentState::Locked), r#""locked""#);
+        for action in [
+            DraftAction::Copy,
+            DraftAction::Paste,
+            DraftAction::Edit,
+            DraftAction::Dismiss,
+        ] {
+            let encoded = encode(&action);
+            assert_eq!(
+                serde_json::from_str::<DraftAction>(&encoded).unwrap(),
+                action
+            );
+            assert_eq!(DraftAction::parse(action.as_str()), Some(action));
+        }
     }
 
     #[test]
