@@ -34,6 +34,7 @@ use crate::bridge::protocol::{
 };
 use crate::conductor::{AskParams, Handle as ConductorHandle, Sink};
 use crate::config::{Config, SelfChatLane};
+use crate::icons::IconResolver;
 use crate::lines::{self, Line};
 use crate::notify_filter::{
     self, ChatContextMessage, EnrichmentResult, LocalTime, PreparedNotification,
@@ -480,6 +481,13 @@ async fn handle_event(
                 return;
             }
             let background = config.messenger.self_chat_lane == SelfChatLane::Background;
+            let initial_icons = IconResolver::from_config(config, None)
+                .command_icon(match platform {
+                    Platform::Whatsapp => "whatsapp",
+                    Platform::Signal => "signal",
+                })
+                .into_iter()
+                .collect();
             let params = AskParams {
                 text: prompt,
                 new: true,
@@ -495,6 +503,7 @@ async fn handle_event(
                 distill: false,
                 schedule_id: None,
                 schedule_has_script: false,
+                initial_icons,
             };
             match conductor.ask(params, Sink::Present) {
                 Ok(id) => tracing::info!(
@@ -562,6 +571,8 @@ async fn handle_event(
                 window_class: channel.clone(),
                 source_notif_id: None,
                 readonly: true,
+                is_group: false,
+                group_name: None,
             };
             let ctx = convert_context_messages(&recent_messages);
             let prompt = notify_filter::build_enrichment_prompt(&prepared, &ctx);
@@ -586,6 +597,7 @@ async fn handle_event(
                     distill: false,
                     schedule_id: None,
                     schedule_has_script: false,
+                    initial_icons: Vec::new(),
                 },
                 Sink::Client(tx),
             ) {

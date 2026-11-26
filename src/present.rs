@@ -1514,6 +1514,29 @@ pub fn format_summary_with_icons(base: &str, icons: &[String], max_icons: usize)
     }
 }
 
+fn draft_ready_summary(
+    tool_icons: &crate::config::ToolIcons,
+    channel: &str,
+    sender: &str,
+) -> String {
+    let lower = channel.trim().to_ascii_lowercase();
+    let icon_key = if lower == "whatsapp" || lower.starts_with("whatsapp-") {
+        Some("whatsapp")
+    } else if lower == "signal" || lower.starts_with("signal-") {
+        Some("signal")
+    } else {
+        None
+    };
+    if let Some(key) = icon_key
+        && let Some(glyph) =
+            crate::icons::resolve_command_glyph(tool_icons.enabled, &tool_icons.commands, key)
+    {
+        format!("Draft reply  {glyph} · {sender}")
+    } else {
+        format!("Draft reply ({channel}) · {sender}")
+    }
+}
+
 struct PendingUpdate {
     request_id: u64,
     status: Option<String>,
@@ -2142,7 +2165,7 @@ impl Worker {
         if !self.config.notifications || self.config.notifier.is_empty() {
             return;
         }
-        let summary = format!("Draft reply ({channel}) · {sender}");
+        let summary = draft_ready_summary(&self.config.tool_icons, channel, sender);
         let mut body = String::new();
         let ctx = context_note.trim();
         let draft = draft_text.trim();
@@ -6918,5 +6941,41 @@ Here is the first sentence. Second sentence with *emphasis* and [image: chart](h
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn draft_ready_summary_uses_platform_glyph_when_enabled_and_falls_back_cleanly() {
+        let mut icons = crate::config::ToolIcons::default();
+        assert_eq!(
+            draft_ready_summary(&icons, "whatsapp", "Alice"),
+            "Draft reply (whatsapp) · Alice"
+        );
+
+        icons.enabled = true;
+        assert_eq!(
+            draft_ready_summary(&icons, "whatsapp", "Alice"),
+            "Draft reply  \u{f232} · Alice"
+        );
+        assert_eq!(
+            draft_ready_summary(&icons, "Signal", "Carol"),
+            "Draft reply  \u{f0b7b} · Carol"
+        );
+        assert_eq!(
+            draft_ready_summary(&icons, "slack", "Dave"),
+            "Draft reply (slack) · Dave"
+        );
+
+        icons
+            .commands
+            .insert("whatsapp".to_string(), "W".to_string());
+        icons.commands.insert("signal".to_string(), String::new());
+        assert_eq!(
+            draft_ready_summary(&icons, "whatsapp", "Alice"),
+            "Draft reply  W · Alice"
+        );
+        assert_eq!(
+            draft_ready_summary(&icons, "signal", "Carol"),
+            "Draft reply (signal) · Carol"
+        );
     }
 }

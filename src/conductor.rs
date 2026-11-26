@@ -84,6 +84,7 @@ pub struct AskParams {
     pub distill: bool,
     pub schedule_id: Option<u64>,
     pub schedule_has_script: bool,
+    pub initial_icons: Vec<String>,
 }
 
 /// What became of a request.
@@ -210,12 +211,13 @@ pub struct Ask {
     pub speech_started: bool,
     pub captured_ambient: Option<Option<String>>,
     pub escalated_once: bool,
+    pub initial_icons: Vec<String>,
     pub sink: Sink,
     pub token: Arc<CancelToken>,
 }
 
 enum Message {
-    Ask(Ask),
+    Ask(Box<Ask>),
     Wake,
     Shutdown,
 }
@@ -438,12 +440,14 @@ impl Handle {
             speech_started: false,
             captured_ambient: None,
             escalated_once: false,
+            initial_icons: params.initial_icons,
             sink,
             token,
         };
         if let Err(mpsc::error::SendError(Message::Ask(ask))) =
-            self.messages.send(Message::Ask(ask))
+            self.messages.send(Message::Ask(Box::new(ask)))
         {
+            let ask = *ask;
             if let Ok(mut shared) = self.shared.lock()
                 && ask.background
             {
@@ -826,6 +830,7 @@ struct Budgets {
 struct TurnContext<'a> {
     policy: &'a LanePolicy,
     icons: &'a IconResolver,
+    initial_icons: &'a [String],
     budgets: Budgets,
     progress: Option<&'a Arc<dyn Presenter>>,
     speech: Option<&'a Arc<dyn Presenter>>,
@@ -1344,7 +1349,8 @@ impl Conductor {
                     }
                 }
                 message = self.inbox.recv() => match message {
-                    Some(Message::Ask(mut ask)) => {
+                    Some(Message::Ask(ask)) => {
+                        let mut ask = *ask;
                         if ask.auto_backgrounded && ask.token.reason().is_none() {
                             if matches!(ask.sink, Sink::Present) {
                                 let preview = attachments::progress_label(&ask.text, &ask.attachments);
@@ -1435,6 +1441,7 @@ impl Conductor {
         }
         while let Ok(message) = self.inbox.try_recv() {
             if let Message::Ask(ask) = message {
+                let ask = *ask;
                 let profile = self.effective_display_profile(&ask);
                 let was_queued_bg = ask.background;
                 self.finish_request(
@@ -1999,6 +2006,7 @@ impl Conductor {
             let ctx = TurnContext {
                 policy: &policy,
                 icons: &icon_resolver,
+                initial_icons: &ask.initial_icons,
                 budgets,
                 progress: presenter.as_ref(),
                 speech: speech_presenter.as_ref(),
@@ -2412,6 +2420,7 @@ impl Conductor {
         let ctx = TurnContext {
             policy: &restricted,
             icons: &no_icons,
+            initial_icons: &[],
             budgets,
             progress: None,
             speech: None,
@@ -3555,7 +3564,11 @@ async fn turn(
     let mut widgets: Vec<WidgetSpec> = Vec::new();
     let mut widget_seq: usize = 0;
     let mut tracker = ToolTracker::new(ctx.agent_dir.map(Path::to_path_buf));
-    let mut icon_tracker = IconTracker::new();
+    let mut icon_tracker = if ctx.icons.is_enabled() {
+        IconTracker::with_initial(ctx.initial_icons)
+    } else {
+        IconTracker::new()
+    };
     let mut denied_call_ids: HashSet<String> = HashSet::new();
     let mut last_progress: Option<String> = None;
     let mut last_emitted_icons_len: usize = 0;
@@ -3602,6 +3615,14 @@ async fn turn(
             });
         }
     };
+    if !icon_tracker.icons().is_empty() {
+        emit_progress(
+            &mut last_progress,
+            &mut last_emitted_icons_len,
+            None,
+            icon_tracker.icons(),
+        );
+    }
     let stage_widget = |call: &Value,
                         ui_calls: &mut HashMap<String, (String, bool)>,
                         pending_widgets: &mut HashMap<String, WidgetSpec>,
@@ -4151,6 +4172,7 @@ pub async fn ask_once(
                 distill: false,
                 schedule_id: None,
                 schedule_has_script: false,
+                initial_icons: Vec::new(),
             },
             Sink::Client(tx),
         )
@@ -4560,6 +4582,7 @@ mod tests {
                     distill: false,
                     schedule_id: None,
                     schedule_has_script: false,
+                    initial_icons: Vec::new(),
                 },
                 Sink::Present,
             )
@@ -4582,6 +4605,7 @@ mod tests {
                     distill: false,
                     schedule_id: None,
                     schedule_has_script: false,
+                    initial_icons: Vec::new(),
                 },
                 Sink::Present,
             )
@@ -4601,6 +4625,7 @@ mod tests {
                     distill: true,
                     schedule_id: None,
                     schedule_has_script: false,
+                    initial_icons: Vec::new(),
                 },
                 Sink::Present,
             )
@@ -4620,6 +4645,7 @@ mod tests {
                     distill: false,
                     schedule_id: Some(42),
                     schedule_has_script: true,
+                    initial_icons: Vec::new(),
                 },
                 Sink::Present,
             )

@@ -40,6 +40,7 @@
       ++ lib.optionals cfg.schedule.enable ["${cfg.package}/share/hey-computer/skills/schedule"]
       ++ lib.optionals cfg.obsidian.enable obsidianSkillDirs
       ++ lib.optionals cfg.openhue.enable ["${cfg.package}/share/hey-computer/skills/openhue"]
+      ++ lib.optionals cfg.messengerBridge.enable ["${cfg.package}/share/hey-computer/skills/messenger"]
     )
     ++ map toString cfg.skills.extra;
 
@@ -69,6 +70,7 @@
         lib.optional cfg.obsidian.enable obsidianShim
         ++ lib.optional cfg.openhue.enable cfg.openhue.package
         ++ lib.optional cfg.tmux.enable cfg.tmux.package
+        ++ lib.optional cfg.messengerBridge.enable cfg.messengerBridge.package
         ++ lib.optional (cfg.agent.package != null) cfg.agent.package
         ++ [cfg.package]
         ++ cfg.extraPackages
@@ -203,13 +205,22 @@
   configFile = checkedConfig cfg.settings;
 
   bridgeSettings =
-    {
-      read_only = true;
-      state_dir = cfg.messengerBridge.stateDir;
-    }
-    // cfg.messengerBridge.settings;
+    lib.recursiveUpdate (
+      {
+        read_only = true;
+        state_dir = cfg.messengerBridge.stateDir;
+      }
+      // lib.optionalAttrs (cfg.messengerBridge.signalDesktopDir != null) {
+        signal.desktop_dir = cfg.messengerBridge.signalDesktopDir;
+      }
+    )
+    cfg.messengerBridge.settings;
 
   bridgeConfigFile = tomlFormat.generate "hey-computer-bridge.toml" bridgeSettings;
+
+  bridgeReadOnlyPaths =
+    cfg.messengerBridge.extraBindReadOnlyPaths
+    ++ lib.optional (cfg.messengerBridge.signalDesktopDir != null) cfg.messengerBridge.signalDesktopDir;
 in {
   options.programs.hey-computer = {
     enable = mkEnableOption "hey-computer, a voice assistant daemon that keeps one ACP agent warm";
@@ -742,6 +753,17 @@ in {
         description = "Private `0700` state directory holding WhatsApp/Signal linked-device credentials.";
       };
 
+      signalDesktopDir = mkOption {
+        type = types.nullOr types.str;
+        default = "${config.xdg.configHome}/Signal";
+        defaultText = literalExpression ''"''${config.xdg.configHome}/Signal"'';
+        description = ''
+          Optional path to a local Signal Desktop data directory (`config.json` +
+          `sql/db.sqlite`) bound read-only into `hey-computer-messenger-bridge`
+          for historical message & group backfill. Set `null` to disable.
+        '';
+      };
+
       extraBindReadOnlyPaths = mkOption {
         type = types.listOf types.str;
         default = [];
@@ -933,8 +955,8 @@ in {
         ProtectSystem = "strict";
         ProtectHome = "tmpfs";
         BindPaths = ["-${cfg.messengerBridge.stateDir}" "%t"];
-        BindReadOnlyPaths = mkIf (cfg.messengerBridge.extraBindReadOnlyPaths != []) (
-          map (p: "-${p}") cfg.messengerBridge.extraBindReadOnlyPaths
+        BindReadOnlyPaths = mkIf (bridgeReadOnlyPaths != []) (
+          map (p: "-${p}") bridgeReadOnlyPaths
         );
       };
       Install.WantedBy = ["graphical-session.target"];

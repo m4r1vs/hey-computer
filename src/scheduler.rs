@@ -1076,6 +1076,7 @@ async fn run_agent_job(
             distill: false,
             schedule_id: Some(job.id),
             schedule_has_script: !job.script.trim().is_empty(),
+            initial_icons: Vec::new(),
         },
         Sink::Client(tx),
     ) {

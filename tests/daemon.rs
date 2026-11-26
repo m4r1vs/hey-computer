@@ -4013,3 +4013,279 @@ async fn notify_hold_enrichment_disconnect_cancel_draft_resume_restart_and_restr
     task2.await.unwrap().unwrap();
     let _ = std::fs::remove_dir_all(&h.dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_chat_initial_icons_survive_escalation_and_group_notify_hold_uses_group_target() {
+    use hey_computer::bridge::protocol::{
+        BridgeEvent, BridgeRequest, ContextAuthor, ContextMessage, MessageKind, Platform,
+        PlatformState, encode as encode_bridge,
+    };
+    use hey_computer::config::{Profile, SelfChatLane};
+    use hey_computer::notify_filter::NotificationAppRule;
+    use hey_computer::protocol::NotifyReleaseAction;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let bridge_dir = std::env::temp_dir().join(format!("hc-br-it-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&bridge_dir);
+    std::fs::create_dir_all(&bridge_dir).unwrap();
+    let bridge_sock = bridge_dir.join("bridge.sock");
+    let listener = UnixListener::bind(&bridge_sock).unwrap();
+
+    let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel::<BridgeEvent>();
+    let sub_rx = Arc::new(tokio::sync::Mutex::new(sub_rx));
+    let (sub_ready_tx, sub_ready_rx) = oneshot::channel::<()>();
+    let sub_ready_tx = Arc::new(std::sync::Mutex::new(Some(sub_ready_tx)));
+    let observed_ctx_targets = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_clone = Arc::clone(&observed_ctx_targets);
+
+    let bridge_server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let observed = Arc::clone(&observed_clone);
+            let sub_rx = Arc::clone(&sub_rx);
+            let sub_ready_tx = Arc::clone(&sub_ready_tx);
+            tokio::spawn(async move {
+                let (read, mut write) = stream.into_split();
+                let mut reader = BufReader::new(read);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let Ok(req) = serde_json::from_str::<BridgeRequest>(line.trim()) else {
+                    return;
+                };
+                match req {
+                    BridgeRequest::Subscribe => {
+                        let ready = encode_bridge(&BridgeEvent::Ready {
+                            version: 1,
+                            read_only: true,
+                            whatsapp: PlatformState::Connected,
+                            signal: PlatformState::Connected,
+                        });
+                        let _ = write.write_all(format!("{ready}\n").as_bytes()).await;
+                        let _ = write.flush().await;
+                        if let Some(tx) = sub_ready_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        let mut guard = sub_rx.lock().await;
+                        while let Some(ev) = guard.recv().await {
+                            let raw = encode_bridge(&ev);
+                            if write
+                                .write_all(format!("{raw}\n").as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            let _ = write.flush().await;
+                        }
+                    }
+                    BridgeRequest::GetContext {
+                        platform,
+                        sender_or_chat,
+                        ..
+                    } => {
+                        observed
+                            .lock()
+                            .unwrap()
+                            .push((platform, sender_or_chat.clone()));
+                        let ctx_ev = BridgeEvent::Context {
+                            platform,
+                            chat_id: Some("group-hike".to_string()),
+                            sender_name: Some(sender_or_chat),
+                            messages: vec![ContextMessage {
+                                author: ContextAuthor::Them,
+                                sender_name: "Carol".to_string(),
+                                text: "Who brings trail mix?".to_string(),
+                                timestamp_ms: 1_700_000_000_000,
+                            }],
+                        };
+                        let raw = encode_bridge(&ctx_ev);
+                        let _ = write.write_all(format!("{raw}\n").as_bytes()).await;
+                        let _ = write.flush().await;
+                    }
+                    _ => {}
+                }
+            });
+        }
+    });
+
+    let script = r##"{
+      "turns": [
+        {
+          "match": "selfchat_wa_escalate",
+          "steps": [
+            {"permission": {"command": "hey-computer-bridge messages --platform signal Carol", "kind": "execute"}},
+            {"permission": {"command": "gh pr list", "kind": "execute"}},
+            {"chunk": "Checked PRs from phone."}
+          ]
+        },
+        {
+          "match": "group: Hiking Crew",
+          "steps": [
+            {"chunk": "CONTEXT: Saturday hike logistics\nDRAFT: I'll bring trail mix and meet at 8!"}
+          ]
+        }
+      ],
+      "default": [{"chunk": "ok"}]
+    }"##;
+
+    let bridge_sock_cfg = bridge_sock.clone();
+    let h = Harness::start(script, move |cfg| {
+        cfg.present.tool_icons.enabled = true;
+        cfg.messenger.enabled = true;
+        cfg.messenger.socket = bridge_sock_cfg.clone();
+        cfg.messenger.self_chat_enabled = true;
+        cfg.messenger.self_chat_lane = SelfChatLane::Interactive;
+        cfg.profiles.insert(
+            "fast".to_string(),
+            Profile {
+                thought_level: Some("low".to_string()),
+                max_tool_calls: Some(1),
+                ..Profile::default()
+            },
+        );
+        cfg.profiles.insert(
+            "deep".to_string(),
+            Profile {
+                thought_level: Some("high".to_string()),
+                max_tool_calls: Some(5),
+                ..Profile::default()
+            },
+        );
+        cfg.routing.enabled = true;
+        cfg.routing.fast_profile = "fast".to_string();
+        cfg.routing.deep_profile = "deep".to_string();
+        cfg.routing.triage_non_voice = false;
+        cfg.routing.escalate_on_failure = true;
+        cfg.routing.auto_background = false;
+
+        cfg.notifications.enabled = true;
+        cfg.notifications.per_sender_cooldown_secs = 0.0;
+        cfg.notifications.dedupe_window_secs = 0.0;
+        cfg.notifications.apps.insert(
+            "signal".to_string(),
+            NotificationAppRule {
+                match_apps: vec!["signal".to_string()],
+                allow_groups: false,
+                allow_senders: vec!["Carol".to_string()],
+                allow_group_names: vec!["Hiking Crew".to_string()],
+                ..NotificationAppRule::default()
+            },
+        );
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+    tokio::time::timeout(Duration::from_secs(5), sub_ready_rx)
+        .await
+        .expect("messenger subscriber connected")
+        .unwrap();
+
+    // 1. Group `NotifyHold` fetches context by `group_name` (`"Hiking Crew"`), not member `"Dave"`.
+    let mut c_grp = Client::send(
+        &h.socket,
+        &Request::NotifyHold {
+            noti_id: 77,
+            replaces_id: 0,
+            app_name: "Signal".to_string(),
+            desktop_entry: "signal".to_string(),
+            summary: "Hiking Crew (2 messages)".to_string(),
+            body: "Dave: Are we meeting at 8?".to_string(),
+            category: "im.received".to_string(),
+            urgency: "normal".to_string(),
+            has_default_action: true,
+            dnd: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c_grp.next(Some(Duration::from_secs(5))).await.unwrap(),
+        Reply::NotifyAccepted { .. }
+    ));
+    let grp_release = c_grp.next(Some(Duration::from_secs(10))).await.unwrap();
+    match grp_release {
+        Reply::NotifyRelease {
+            action: NotifyReleaseAction::ShowEnriched,
+            draft_text: Some(draft),
+            token: Some(tok),
+            ..
+        } => {
+            assert_eq!(draft, "I'll bring trail mix and meet at 8!");
+            let (st, _) =
+                hey_computer::store::Store::open(&h.dir.join("state"), &Config::default().history)
+                    .unwrap();
+            let cp = st
+                .get_draft_checkpoint(tok)
+                .await
+                .unwrap()
+                .expect("persisted group draft checkpoint");
+            st.shutdown().await;
+            assert_eq!(cp.sender, "Dave");
+            assert_eq!(cp.chat_target, "Hiking Crew");
+        }
+        other => panic!("expected group ShowEnriched, got {other:?}"),
+    }
+    assert_eq!(
+        *observed_ctx_targets.lock().unwrap(),
+        vec![(Some(Platform::Signal), "Hiking Crew".to_string())]
+    );
+
+    // 2. WhatsApp SelfChat interactive turn fails on `fast` (`max_tool_calls = 0`),
+    //    escalates via Tier 2 to `deep`, runs `gh pr list`, and preserves initial `` icon!
+    sub_tx
+        .send(BridgeEvent::Message {
+            id: "m1".to_string(),
+            platform: Platform::Whatsapp,
+            kind: MessageKind::SelfChat,
+            chat_id: "self-wa".to_string(),
+            sender_id: "me".to_string(),
+            sender_name: "Me".to_string(),
+            text: "selfchat_wa_escalate".to_string(),
+            timestamp_ms: 1_700_000_001_000,
+            quoted_text: None,
+            media_placeholder: None,
+            recent_messages: Vec::new(),
+        })
+        .unwrap();
+
+    let items = h
+        .recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items.iter().any(|i| {
+                matches!(
+                    i,
+                    Presentation::Answer { text, .. } if text == "Checked PRs from phone."
+                )
+            })
+        })
+        .await
+        .expect("escalated WhatsApp self-chat Answer presented");
+
+    let wa_answer = items.iter().find_map(|i| match i {
+        Presentation::Answer {
+            text,
+            profile,
+            icons,
+            ..
+        } if text == "Checked PRs from phone." => Some((profile.clone(), icons.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        wa_answer,
+        Some((
+            Some("deep".to_string()),
+            vec![
+                "\u{f232}".to_string(),
+                "\u{f0b7b}".to_string(),
+                "\u{e709}".to_string()
+            ]
+        ))
+    );
+
+    drop(sub_tx);
+    bridge_server.abort();
+    h.stop().await;
+    let _ = std::fs::remove_dir_all(&bridge_dir);
+}

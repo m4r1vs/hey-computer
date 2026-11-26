@@ -58,7 +58,29 @@ pub const DEFAULT_COMMAND_ICONS: &[(&str, &str)] = &[
     ("yt-dlp", "\u{f16a}"),        // nf-fa-youtube_play
     ("gcalcli", "\u{f455}"),       // nf-oct-calendar
     ("swaync-client", "\u{f0f3}"), // nf-fa-bell
+    ("whatsapp", "\u{f232}"),      // nf-fa-whatsapp
+    ("signal", "\u{f0b7b}"),       // nf-md-chat_processing (Signal)
 ];
+
+/// Resolve a single command icon key (`"whatsapp"`, `"signal"`, etc.) against
+/// `enabled` and `[present.tool_icons.commands]` overrides (`""` suppresses).
+pub fn resolve_command_glyph(
+    enabled: bool,
+    overrides: &BTreeMap<String, String>,
+    key: &str,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    if let Some(ov) = overrides.get(key) {
+        let trimmed = ov.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+    DEFAULT_COMMAND_ICONS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, v)| (!v.is_empty()).then(|| (*v).to_string()))
+}
 
 /// Default Nerd Font v3 glyphs for built-in tool kinds.
 pub const DEFAULT_KIND_ICONS: &[(&str, &str)] = &[
@@ -180,6 +202,19 @@ impl IconResolver {
         self.enabled
     }
 
+    /// Look up a single command icon glyph by key (e.g. `"whatsapp"`, `"signal"`),
+    /// returning `None` when tool icons are disabled, the key is unknown, or the
+    /// user suppressed it with `""`.
+    pub fn command_icon(&self, key: &str) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        self.command_icons
+            .get(key)
+            .filter(|g| !g.is_empty())
+            .cloned()
+    }
+
     fn kind_icon(&self, kind: &str) -> Vec<String> {
         match self.kind_icons.get(kind).map(String::as_str) {
             Some("") | None => Vec::new(),
@@ -219,9 +254,38 @@ impl IconResolver {
 
     fn resolve_command(&self, cmd: &str) -> Vec<String> {
         let words = policy::command_words(cmd, 0);
+        let bridge_targets = extract_bridge_targets(cmd, 0);
+        let mut bridge_idx = 0usize;
         let mut matched_any = false;
         let mut icons = Vec::new();
         for word in words {
+            if word == "hey-computer-bridge" {
+                matched_any = true;
+                let target = bridge_targets
+                    .get(bridge_idx)
+                    .copied()
+                    .unwrap_or(BridgeTarget::Unfiltered);
+                bridge_idx += 1;
+                match target {
+                    BridgeTarget::Whatsapp => self.push_command_icon("whatsapp", &mut icons),
+                    BridgeTarget::Signal => self.push_command_icon("signal", &mut icons),
+                    BridgeTarget::Both => {
+                        self.push_command_icon("whatsapp", &mut icons);
+                        self.push_command_icon("signal", &mut icons);
+                    }
+                    BridgeTarget::Unfiltered => {
+                        if let Some(ov) = self.command_icons.get("hey-computer-bridge") {
+                            if !ov.is_empty() && !icons.contains(ov) {
+                                icons.push(ov.clone());
+                            }
+                        } else {
+                            self.push_command_icon("whatsapp", &mut icons);
+                            self.push_command_icon("signal", &mut icons);
+                        }
+                    }
+                }
+                continue;
+            }
             if let Some(glyph) = self.command_icons.get(&word) {
                 matched_any = true;
                 if !glyph.is_empty() && !icons.contains(glyph) {
@@ -233,6 +297,15 @@ impl IconResolver {
             icons
         } else {
             self.kind_icon("execute")
+        }
+    }
+
+    fn push_command_icon(&self, key: &str, icons: &mut Vec<String>) {
+        if let Some(glyph) = self.command_icons.get(key)
+            && !glyph.is_empty()
+            && !icons.contains(glyph)
+        {
+            icons.push(glyph.clone());
         }
     }
 
@@ -412,6 +485,14 @@ pub struct IconTracker {
 impl IconTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an [`IconTracker`] pre-seeded with origin/turn icons (deduplicated
+    /// in order, ignoring empty strings).
+    pub fn with_initial(initial: &[String]) -> Self {
+        let mut tracker = Self::default();
+        tracker.record_glyphs(initial.to_vec());
+        tracker
     }
 
     /// Observe an initial `tool_call` update. Returns `true` if a new icon was added.
@@ -673,6 +754,496 @@ fn extract_file_path(call: &Value) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgeTarget {
+    Whatsapp,
+    Signal,
+    Both,
+    Unfiltered,
+}
+
+const BRIDGE_WRAPPERS: &[&str] = &[
+    "env",
+    "command",
+    "exec",
+    "nohup",
+    "time",
+    "nice",
+    "ionice",
+    "stdbuf",
+    "timeout",
+    "xargs",
+    "setsid",
+    "chrt",
+    "taskset",
+    "unbuffer",
+    "builtin",
+    "systemd-run",
+];
+
+const BRIDGE_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "ksh"];
+
+/// Extract the target platform of each `hey-computer-bridge` invocation in `line`
+/// in the same traversal order as [`policy::command_words`].
+fn extract_bridge_targets(line: &str, depth: usize) -> Vec<BridgeTarget> {
+    let mut out = Vec::new();
+    if depth > 4 {
+        return out;
+    }
+    let (segments, subs) = tokenize_shell_segments(line);
+    for words in segments {
+        let mut i = 0usize;
+        while i < words.len() && is_shell_assignment(&words[i]) {
+            i += 1;
+        }
+        while i < words.len() {
+            let name = cmd_basename(&words[i]);
+            if !BRIDGE_WRAPPERS.contains(&name) {
+                break;
+            }
+            i += 1;
+            while i < words.len()
+                && (words[i].starts_with('-')
+                    || is_shell_assignment(&words[i])
+                    || looks_like_wrapper_duration(&words[i]))
+            {
+                if words[i] == "--" {
+                    i += 1;
+                    break;
+                }
+                if name == "env" {
+                    if words[i] == "-S" || words[i] == "--split-string" {
+                        if let Some(split_arg) = words.get(i + 1) {
+                            out.extend(extract_bridge_targets(split_arg, depth + 1));
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if let Some(rest) = words[i]
+                        .strip_prefix("--split-string=")
+                        .or_else(|| words[i].strip_prefix("-S").filter(|r| !r.is_empty()))
+                    {
+                        out.extend(extract_bridge_targets(rest, depth + 1));
+                        i += 1;
+                        continue;
+                    }
+                }
+                if wrapper_takes_value(name, &words[i]) {
+                    i += 1;
+                }
+                i += 1;
+            }
+        }
+        let Some(cmd_word) = words.get(i) else {
+            continue;
+        };
+        let name = cmd_basename(cmd_word);
+        if BRIDGE_SHELLS.contains(&name) {
+            for script in extract_shell_c_scripts(name, &words[i + 1..]) {
+                out.extend(extract_bridge_targets(script, depth + 1));
+            }
+        } else if name == "hey-computer-bridge" {
+            out.push(classify_bridge_args(&words[i + 1..]));
+        }
+    }
+    for sub in subs {
+        out.extend(extract_bridge_targets(&sub, depth + 1));
+    }
+    out
+}
+
+fn classify_bridge_args(args: &[String]) -> BridgeTarget {
+    let mut wa = false;
+    let mut sig = false;
+    let mut subcommand: Option<&str> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(val) = arg
+            .strip_prefix("--platform=")
+            .or_else(|| arg.strip_prefix("-p="))
+        {
+            if val.eq_ignore_ascii_case("whatsapp") {
+                wa = true;
+            } else if val.eq_ignore_ascii_case("signal") {
+                sig = true;
+            }
+            i += 1;
+            continue;
+        }
+        if arg == "--platform" || arg == "-p" {
+            if let Some(val) = args.get(i + 1) {
+                if val.eq_ignore_ascii_case("whatsapp") {
+                    wa = true;
+                } else if val.eq_ignore_ascii_case("signal") {
+                    sig = true;
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if subcommand.is_none() && matches!(arg, "--config" | "--socket") {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if subcommand.is_none() {
+            subcommand = Some(arg);
+            if arg.eq_ignore_ascii_case("fetch-history") {
+                wa = true;
+            } else if arg.eq_ignore_ascii_case("sync-signal-desktop") {
+                sig = true;
+            } else if arg.eq_ignore_ascii_case("pair")
+                && let Some(platform) = args.get(i + 1)
+            {
+                if platform.eq_ignore_ascii_case("whatsapp") {
+                    wa = true;
+                } else if platform.eq_ignore_ascii_case("signal") {
+                    sig = true;
+                }
+            }
+        }
+        i += 1;
+    }
+    match (wa, sig) {
+        (true, true) => BridgeTarget::Both,
+        (true, false) => BridgeTarget::Whatsapp,
+        (false, true) => BridgeTarget::Signal,
+        (false, false) => BridgeTarget::Unfiltered,
+    }
+}
+
+fn cmd_basename(word: &str) -> &str {
+    Path::new(word)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(word)
+}
+
+fn is_shell_assignment(word: &str) -> bool {
+    match word.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+fn looks_like_wrapper_duration(word: &str) -> bool {
+    let digits = word.strip_suffix(['s', 'm', 'h', 'd']).unwrap_or(word);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+fn wrapper_takes_value(wrapper: &str, option: &str) -> bool {
+    let options: &[&str] = match wrapper {
+        "env" => &["-u", "--unset", "-C", "--chdir"],
+        "timeout" => &["-s", "--signal", "-k", "--kill-after"],
+        "nice" => &["-n", "--adjustment"],
+        "ionice" => &["-c", "--class", "-n", "--classdata", "-p", "--pid"],
+        "stdbuf" => &["-i", "-o", "-e"],
+        "xargs" => &[
+            "-a",
+            "-d",
+            "-E",
+            "-I",
+            "-L",
+            "-n",
+            "-P",
+            "-s",
+            "--arg-file",
+            "--delimiter",
+        ],
+        "systemd-run" => &[
+            "-u",
+            "--unit",
+            "-p",
+            "--property",
+            "-E",
+            "--setenv",
+            "-H",
+            "--host",
+            "-M",
+            "--machine",
+            "--description",
+            "--slice",
+            "--uid",
+            "--gid",
+            "--nice",
+            "--working-directory",
+            "--service-type",
+            "--on-active",
+            "--on-boot",
+            "--on-startup",
+            "--on-unit-active",
+            "--on-unit-inactive",
+            "--on-calendar",
+            "--timer-property",
+            "--path-property",
+            "--socket-property",
+            "--json",
+        ],
+        _ => &[],
+    };
+    options.contains(&option)
+}
+
+fn extract_shell_c_scripts<'a>(shell: &str, args: &'a [String]) -> Vec<&'a str> {
+    if shell == "fish" {
+        let mut scripts = Vec::new();
+        let mut j = 0usize;
+        while j < args.len() {
+            let arg = args[j].as_str();
+            if arg == "--" || arg == "-" {
+                break;
+            }
+            if let Some(s) = arg
+                .strip_prefix("--command=")
+                .or_else(|| arg.strip_prefix("--init-command="))
+            {
+                scripts.push(s);
+                j += 1;
+                continue;
+            }
+            if matches!(arg, "--command" | "--init-command") {
+                if let Some(s) = args.get(j + 1) {
+                    scripts.push(s.as_str());
+                }
+                j += 2;
+                continue;
+            }
+            if let Some(flags) = arg.strip_prefix('-')
+                && !arg.starts_with("--")
+                && !flags.is_empty()
+            {
+                let mut consumed_next = false;
+                for (idx, ch) in flags.char_indices() {
+                    let rest = &flags[idx + ch.len_utf8()..];
+                    if matches!(ch, 'c' | 'C') {
+                        if !rest.is_empty() {
+                            scripts.push(rest);
+                        } else if let Some(s) = args.get(j + 1) {
+                            scripts.push(s.as_str());
+                            consumed_next = true;
+                        }
+                        break;
+                    }
+                    if matches!(ch, 'f' | 'p' | 'd' | 'o') {
+                        if rest.is_empty() {
+                            consumed_next = true;
+                        }
+                        break;
+                    }
+                }
+                j += if consumed_next { 2 } else { 1 };
+                continue;
+            }
+            j += 1;
+        }
+        return scripts;
+    }
+    let mut saw_c = false;
+    let mut j = 0usize;
+    while j < args.len() {
+        let arg = args[j].as_str();
+        if arg == "--" || arg == "-" {
+            j += 1;
+            break;
+        }
+        if arg.starts_with("--") {
+            if matches!(arg, "--rcfile" | "--init-file") {
+                j += 1;
+            }
+            j += 1;
+            continue;
+        }
+        if (arg.starts_with('-') || arg.starts_with('+')) && arg.len() > 1 {
+            let flags = &arg[1..];
+            if arg.starts_with('-') && flags.contains('c') {
+                saw_c = true;
+            }
+            let takes_opt_name = flags.contains('o') || (shell == "bash" && flags.contains('O'));
+            if takes_opt_name
+                && let Some(next) = args.get(j + 1)
+                && !next.starts_with(['-', '+'])
+            {
+                j += 1;
+            }
+            j += 1;
+            continue;
+        }
+        break;
+    }
+    if saw_c && let Some(script) = args.get(j) {
+        vec![script.as_str()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Tokenize a shell command into `(segments_of_words, command_substitutions)`.
+fn tokenize_shell_segments(line: &str) -> (Vec<Vec<String>>, Vec<String>) {
+    let mut segments: Vec<Vec<String>> = Vec::new();
+    let mut cur_seg: Vec<String> = Vec::new();
+    let mut cur_word = String::new();
+    let mut in_word = false;
+    let mut subs: Vec<String> = Vec::new();
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    let mut idx = 0usize;
+
+    let flush_word = |cur_word: &mut String, in_word: &mut bool, cur_seg: &mut Vec<String>| {
+        if *in_word {
+            cur_seg.push(std::mem::take(cur_word));
+            *in_word = false;
+        }
+    };
+    let flush_seg = |cur_word: &mut String,
+                     in_word: &mut bool,
+                     cur_seg: &mut Vec<String>,
+                     segments: &mut Vec<Vec<String>>| {
+        flush_word(cur_word, in_word, cur_seg);
+        if !cur_seg.is_empty() {
+            segments.push(std::mem::take(cur_seg));
+        }
+    };
+
+    while idx < chars.len() {
+        let (_, ch) = chars[idx];
+        match ch {
+            '\'' => {
+                in_word = true;
+                idx += 1;
+                while idx < chars.len() && chars[idx].1 != '\'' {
+                    cur_word.push(chars[idx].1);
+                    idx += 1;
+                }
+                if idx < chars.len() {
+                    idx += 1;
+                }
+            }
+            '"' => {
+                in_word = true;
+                idx += 1;
+                while idx < chars.len() && chars[idx].1 != '"' {
+                    if chars[idx].1 == '\\' && idx + 1 < chars.len() {
+                        cur_word.push(chars[idx + 1].1);
+                        idx += 2;
+                    } else if chars[idx].1 == '$'
+                        && idx + 1 < chars.len()
+                        && chars[idx + 1].1 == '('
+                    {
+                        let (inner, next_idx) = collect_paren_sub(&chars, idx + 2);
+                        subs.push(inner);
+                        idx = next_idx;
+                    } else if chars[idx].1 == '`' {
+                        let (inner, next_idx) = collect_backtick_sub(&chars, idx + 1);
+                        subs.push(inner);
+                        idx = next_idx;
+                    } else {
+                        cur_word.push(chars[idx].1);
+                        idx += 1;
+                    }
+                }
+                if idx < chars.len() {
+                    idx += 1;
+                }
+            }
+            '$' if idx + 1 < chars.len() && chars[idx + 1].1 == '(' => {
+                in_word = true;
+                let (inner, next_idx) = collect_paren_sub(&chars, idx + 2);
+                subs.push(inner);
+                idx = next_idx;
+            }
+            '`' => {
+                in_word = true;
+                let (inner, next_idx) = collect_backtick_sub(&chars, idx + 1);
+                subs.push(inner);
+                idx = next_idx;
+            }
+            '\\' if idx + 1 < chars.len() => {
+                in_word = true;
+                cur_word.push(chars[idx + 1].1);
+                idx += 2;
+            }
+            ';' | '|' | '&' | '\n' | '(' | ')' => {
+                flush_seg(&mut cur_word, &mut in_word, &mut cur_seg, &mut segments);
+                idx += 1;
+            }
+            c if c.is_whitespace() => {
+                flush_word(&mut cur_word, &mut in_word, &mut cur_seg);
+                idx += 1;
+            }
+            c => {
+                in_word = true;
+                cur_word.push(c);
+                idx += 1;
+            }
+        }
+    }
+    flush_seg(&mut cur_word, &mut in_word, &mut cur_seg, &mut segments);
+    (segments, subs)
+}
+
+fn collect_paren_sub(chars: &[(usize, char)], mut idx: usize) -> (String, usize) {
+    let mut depth = 1usize;
+    let mut inner = String::new();
+    while idx < chars.len() {
+        let ch = chars[idx].1;
+        if ch == '\\' && idx + 1 < chars.len() {
+            inner.push(ch);
+            inner.push(chars[idx + 1].1);
+            idx += 2;
+            continue;
+        }
+        if ch == '\'' {
+            inner.push(ch);
+            idx += 1;
+            while idx < chars.len() {
+                inner.push(chars[idx].1);
+                if chars[idx].1 == '\'' {
+                    idx += 1;
+                    break;
+                }
+                idx += 1;
+            }
+            continue;
+        }
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return (inner, idx + 1);
+            }
+        }
+        inner.push(ch);
+        idx += 1;
+    }
+    (inner, idx)
+}
+
+fn collect_backtick_sub(chars: &[(usize, char)], mut idx: usize) -> (String, usize) {
+    let mut inner = String::new();
+    while idx < chars.len() {
+        let ch = chars[idx].1;
+        if ch == '`' {
+            return (inner, idx + 1);
+        }
+        if ch == '\\' && idx + 1 < chars.len() {
+            inner.push(chars[idx + 1].1);
+            idx += 2;
+            continue;
+        }
+        inner.push(ch);
+        idx += 1;
+    }
+    (inner, idx)
 }
 
 #[cfg(test)]
@@ -1009,5 +1580,141 @@ mod tests {
             })
         ));
         assert_eq!(tracker.icons(), &["X", "W"]);
+    }
+
+    #[test]
+    fn whatsapp_and_signal_bridge_icons_with_initial_and_overrides() {
+        let cfg = enabled_config();
+        let resolver = IconResolver::from_config(&cfg, None);
+
+        assert_eq!(
+            resolver.command_icon("whatsapp").as_deref(),
+            Some("\u{f232}")
+        );
+        assert_eq!(
+            resolver.command_icon("signal").as_deref(),
+            Some("\u{f0b7b}")
+        );
+        assert_eq!(resolver.command_icon("unknown"), None);
+
+        let mut disabled_cfg = enabled_config();
+        disabled_cfg.present.tool_icons.enabled = false;
+        let disabled_resolver = IconResolver::from_config(&disabled_cfg, None);
+        assert_eq!(disabled_resolver.command_icon("whatsapp"), None);
+
+        // Platform-specific bridge invocations resolve to the single platform glyph.
+        for cmd in [
+            r#"hey-computer-bridge messages --platform whatsapp "Alice""#,
+            "hey-computer-bridge --config /tmp/bridge.toml search --platform=whatsapp dinner",
+            "hey-computer-bridge pair whatsapp",
+            r#"hey-computer-bridge fetch-history --chat "Alice" --limit 50"#,
+        ] {
+            assert_eq!(
+                resolver.resolve_command(cmd),
+                vec!["\u{f232}".to_string()],
+                "expected WhatsApp glyph for `{cmd}`"
+            );
+        }
+
+        for cmd in [
+            r#"hey-computer-bridge messages --platform signal "Carol""#,
+            "bash -lc 'env FOO=1 /nix/store/hash/bin/hey-computer-bridge search --platform=signal hike'",
+            "hey-computer-bridge pair signal --name desktop",
+            "hey-computer-bridge sync-signal-desktop",
+        ] {
+            assert_eq!(
+                resolver.resolve_command(cmd),
+                vec!["\u{f0b7b}".to_string()],
+                "expected Signal glyph for `{cmd}`"
+            );
+        }
+
+        // Unfiltered bridge queries emit both WhatsApp and Signal in order (never terminal fallback).
+        for cmd in [
+            "hey-computer-bridge chats",
+            "hey-computer-bridge groups",
+            r#"hey-computer-bridge messages "Alice""#,
+            r#"hey-computer-bridge search "fetch-history""#,
+        ] {
+            assert_eq!(
+                resolver.resolve_command(cmd),
+                vec!["\u{f232}".to_string(), "\u{f0b7b}".to_string()],
+                "expected both messenger glyphs for `{cmd}`"
+            );
+        }
+
+        // Pre-seeded `IconTracker::with_initial` deduplicates the origin icon and appends subsequent tools.
+        let mut seeded = IconTracker::with_initial(&[
+            "\u{f232}".to_string(),
+            String::new(),
+            "\u{f232}".to_string(),
+        ]);
+        assert_eq!(seeded.icons(), &["\u{f232}"]);
+        assert!(seeded.observe_update(
+            &resolver,
+            &json!({
+                "toolCallId": "b1",
+                "name": "run_command",
+                "kind": "execute",
+                "rawInput": {"CommandLine": "hey-computer-bridge search dinner"}
+            })
+        ));
+        assert!(seeded.observe_update(
+            &resolver,
+            &json!({
+                "toolCallId": "b2",
+                "name": "run_command",
+                "kind": "execute",
+                "rawInput": {"CommandLine": "gh pr list"}
+            })
+        ));
+        assert_eq!(seeded.icons(), &["\u{f232}", "\u{f0b7b}", "\u{e709}"]);
+
+        // Explicit `hey-computer-bridge` override applies to unfiltered calls; `""` suppresses without terminal fallback.
+        let mut custom_cfg = enabled_config();
+        custom_cfg
+            .present
+            .tool_icons
+            .commands
+            .insert("hey-computer-bridge".to_string(), "M".to_string());
+        let custom_resolver = IconResolver::from_config(&custom_cfg, None);
+        assert_eq!(
+            custom_resolver.resolve_command("hey-computer-bridge groups"),
+            vec!["M".to_string()]
+        );
+        assert_eq!(
+            custom_resolver.resolve_command("hey-computer-bridge chats --platform whatsapp"),
+            vec!["\u{f232}".to_string()]
+        );
+
+        let mut suppressed_cfg = enabled_config();
+        suppressed_cfg
+            .present
+            .tool_icons
+            .commands
+            .insert("signal".to_string(), String::new());
+        let suppressed_resolver = IconResolver::from_config(&suppressed_cfg, None);
+        assert_eq!(suppressed_resolver.command_icon("signal"), None);
+        assert!(
+            suppressed_resolver
+                .resolve_command("hey-computer-bridge messages --platform signal Carol")
+                .is_empty()
+        );
+        assert_eq!(
+            suppressed_resolver.resolve_command("hey-computer-bridge chats"),
+            vec!["\u{f232}".to_string()]
+        );
+
+        suppressed_cfg
+            .present
+            .tool_icons
+            .commands
+            .insert("hey-computer-bridge".to_string(), String::new());
+        let all_suppressed = IconResolver::from_config(&suppressed_cfg, None);
+        assert!(
+            all_suppressed
+                .resolve_command("hey-computer-bridge chats")
+                .is_empty()
+        );
     }
 }

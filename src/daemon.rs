@@ -454,6 +454,7 @@ async fn connection(svc: &DaemonServices, stream: UnixStream) -> Result<()> {
                 distill,
                 schedule_id,
                 schedule_has_script: false,
+                initial_icons: Vec::new(),
             };
             if stream {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -600,7 +601,11 @@ async fn handle_notify_hold(
     };
 
     svc.messenger
-        .record_notify_hold(&prepared.channel, &prepared.sender, &prepared.body);
+        .record_notify_hold(&prepared.channel, &prepared.chat_target, &prepared.body);
+    if !prepared.chat_target.eq_ignore_ascii_case(&prepared.sender) {
+        svc.messenger
+            .record_notify_hold(&prepared.channel, &prepared.sender, &prepared.body);
+    }
 
     let max_hold_ms = (svc.config.notifications.max_hold_secs * 1000.0).round() as u64;
     send(write, &Reply::NotifyAccepted { max_hold_ms }).await?;
@@ -611,7 +616,8 @@ async fn handle_notify_hold(
         && (svc.config.messenger.enabled || !svc.config.messenger.socket.as_os_str().is_empty())
         && let Some(bridge_sock) = messenger::resolve_bridge_socket(&svc.config)
     {
-        messenger::fetch_recent_context(&bridge_sock, Some(platform), &prepared.sender, 10).await
+        messenger::fetch_recent_context(&bridge_sock, Some(platform), &prepared.chat_target, 10)
+            .await
     } else {
         Vec::new()
     };
@@ -632,6 +638,7 @@ async fn handle_notify_hold(
             distill: false,
             schedule_id: None,
             schedule_has_script: false,
+            initial_icons: Vec::new(),
         },
         Sink::Client(tx),
     ) {
