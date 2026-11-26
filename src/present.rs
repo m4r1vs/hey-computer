@@ -2302,6 +2302,9 @@ pub async fn notify(
                 .arg("--print-id");
             if is_notify_send(&config.notifier[0]) {
                 command.arg("--hint=boolean:x-hey-computer:true");
+                if config.transient {
+                    command.arg("--hint=boolean:transient:true");
+                }
             }
             if expire_ms > 0 {
                 command.arg(format!("--expire-time={expire_ms}"));
@@ -2461,6 +2464,9 @@ fn build_action_notifier_command(
         .arg("--print-id");
     if is_notify_send(&config.notifier[0]) {
         command.arg("--hint=boolean:x-hey-computer:true");
+        if config.transient {
+            command.arg("--hint=boolean:transient:true");
+        }
     }
     for (key, label) in actions {
         command.arg(format!("--action={key}={label}"));
@@ -6928,7 +6934,36 @@ Here is the first sentence. Second sentence with *emphasis* and [image: chart](h
                 line.contains("--hint=boolean:x-hey-computer:true"),
                 "missing hint: {line}"
             );
+            assert!(
+                line.contains("--hint=boolean:transient:true"),
+                "missing transient hint by default: {line}"
+            );
         }
+
+        // Setting `present.transient = false` omits the transient hint while keeping x-hey-computer.
+        let calls_persist = dir.join("notify_persist.log");
+        let fake_notify_send_persist = dir.join("sub").join("notify-send");
+        std::fs::create_dir_all(fake_notify_send_persist.parent().unwrap()).unwrap();
+        std::fs::write(
+            &fake_notify_send_persist,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\necho 12\n",
+                calls_persist.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &fake_notify_send_persist,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let mut persist_cfg = config.clone();
+        persist_cfg.notifier = vec![fake_notify_send_persist.to_string_lossy().into_owned()];
+        persist_cfg.transient = false;
+        let _ = notify(&persist_cfg, "Title", "Body", Urgency::Normal, 0, None).await;
+        let recorded_persist = std::fs::read_to_string(&calls_persist).unwrap();
+        assert!(recorded_persist.contains("--hint=boolean:x-hey-computer:true"));
+        assert!(!recorded_persist.contains("--hint=boolean:transient:true"));
 
         // Non-notify-send recording script does NOT get the hint.
         let calls2 = dir.join("notify2.log");

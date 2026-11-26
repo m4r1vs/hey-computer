@@ -4627,3 +4627,180 @@ async fn notify_hold_bypasses_saturated_background_task_pool() {
 
     h.stop().await;
 }
+
+#[tokio::test]
+async fn notify_hold_two_stage_triage_skips_banter_and_enriches_date_questions_with_readonly_mcp() {
+    use hey_computer::config::{McpServer, Profile};
+    use hey_computer::notify_filter::NotificationAppRule;
+    use hey_computer::protocol::NotifyReleaseAction;
+
+    let script = r##"{
+      "turns": [
+        {
+          "match": "<notification_task>",
+          "steps": [
+            {
+              "permission": {
+                "command": "get_events",
+                "server": "google-workspace",
+                "kind": "other"
+              }
+            },
+            {"chunk": "CONTEXT: Samstag ab 19:00 frei (nur Brunch 11:00–13:00)\nDRAFT: Ja, Samstag 19 Uhr passt mir super!"}
+          ]
+        },
+        {
+          "match": "preview: Niiiceee:))",
+          "steps": [
+            {"chunk": "false"}
+          ]
+        },
+        {
+          "match": "preview: Hast du am Samstag um 19 Uhr Zeit?",
+          "steps": [
+            {"chunk": "true"}
+          ]
+        }
+      ],
+      "default": [{"chunk": "false"}]
+    }"##;
+
+    let h = Harness::start(script, |cfg| {
+        cfg.mcp.insert(
+            "google-workspace".to_string(),
+            McpServer {
+                enabled: true,
+                command: "/bin/echo".to_string(),
+                ..McpServer::default()
+            },
+        );
+        cfg.profiles.insert(
+            "notify-triage".to_string(),
+            Profile {
+                model: Some("gemini-3.8-flash".to_string()),
+                thought_level: Some("low".to_string()),
+                ..Profile::default()
+            },
+        );
+        cfg.profiles.insert(
+            "notify-enrich".to_string(),
+            Profile {
+                model: Some("gemini-4-hydrogen".to_string()),
+                thought_level: Some("medium".to_string()),
+                mcp_servers: Some(vec!["google-workspace".to_string()]),
+                ..Profile::default()
+            },
+        );
+        cfg.notifications.enabled = true;
+        cfg.notifications.triage_profile = Some("notify-triage".to_string());
+        cfg.notifications.profile = Some("notify-enrich".to_string());
+        cfg.notifications.max_tool_calls = 4;
+        cfg.notifications.allowed_mcp_tools = vec!["google-workspace/get_events".to_string()];
+        cfg.notifications.per_sender_cooldown_secs = 0.0;
+        cfg.notifications.dedupe_window_secs = 0.0;
+        cfg.notifications.apps.insert(
+            "whatsapp".to_string(),
+            NotificationAppRule {
+                match_apps: vec!["whatsapp-electron".to_string()],
+                allow_senders: vec!["*".to_string()],
+                ..NotificationAppRule::default()
+            },
+        );
+    })
+    .await;
+
+    // 1. Casual banter -> Stage 1 returns `false` -> immediate ShowRaw("triage_skip") and zero DB turns!
+    let mut c1 = Client::send(
+        &h.socket,
+        &Request::NotifyHold {
+            noti_id: 201,
+            replaces_id: 0,
+            app_name: "whatsapp-electron".to_string(),
+            desktop_entry: "whatsapp-electron".to_string(),
+            summary: "Bob".to_string(),
+            body: "Niiiceee:))".to_string(),
+            category: "im.received".to_string(),
+            urgency: "normal".to_string(),
+            has_default_action: true,
+            dnd: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c1.next(Some(Duration::from_secs(5))).await.unwrap(),
+        Reply::NotifyAccepted { .. }
+    ));
+    let r1 = c1.next(Some(Duration::from_secs(5))).await.unwrap();
+    assert!(
+        matches!(
+            r1,
+            Reply::NotifyRelease {
+                action: NotifyReleaseAction::ShowRaw,
+                reason: Some(ref why),
+                ..
+            } if why == "triage_skip"
+        ),
+        "expected ShowRaw(triage_skip), got {r1:?}"
+    );
+    let turns_after_skip = hey_computer::store::list_turns(
+        &h.dir.join("state"),
+        &hey_computer::store::ListFilter {
+            lane: None,
+            status: None,
+            include_suppressed: true,
+            limit: 10,
+        },
+    )
+    .unwrap();
+    assert!(
+        turns_after_skip.is_empty(),
+        "skipped Stage 1 triage must not create history.db rows: {turns_after_skip:?}"
+    );
+
+    // 2. Date/availability question -> Stage 1 returns `true` -> Stage 2 runs on `notify-enrich`,
+    //    allows `google-workspace/get_events`, denies `send_gmail_message`, and returns ShowEnriched!
+    let mut c2 = Client::send(
+        &h.socket,
+        &Request::NotifyHold {
+            noti_id: 202,
+            replaces_id: 0,
+            app_name: "whatsapp-electron".to_string(),
+            desktop_entry: "whatsapp-electron".to_string(),
+            summary: "Alice".to_string(),
+            body: "Hast du am Samstag um 19 Uhr Zeit?".to_string(),
+            category: "im.received".to_string(),
+            urgency: "normal".to_string(),
+            has_default_action: true,
+            dnd: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c2.next(Some(Duration::from_secs(5))).await.unwrap(),
+        Reply::NotifyAccepted { .. }
+    ));
+    let r2 = c2.next(Some(Duration::from_secs(5))).await.unwrap();
+    match r2 {
+        Reply::NotifyRelease {
+            action: NotifyReleaseAction::ShowEnriched,
+            turn_id: Some(tid),
+            context_note: Some(ctx),
+            draft_text: Some(draft),
+            readonly: Some(true),
+            ..
+        } => {
+            assert_eq!(ctx, "Samstag ab 19:00 frei (nur Brunch 11:00–13:00)");
+            assert_eq!(draft, "Ja, Samstag 19 Uhr passt mir super!");
+            let turn = hey_computer::store::get_turn(&h.dir.join("state"), tid)
+                .unwrap()
+                .expect("persisted Stage 2 turn");
+            assert_eq!(turn.lane, hey_computer::store::Lane::Restricted);
+            assert_eq!(turn.profile, "notify-enrich");
+        }
+        other => panic!("expected ShowEnriched from Stage 2, got {other:?}"),
+    }
+
+    h.stop().await;
+}

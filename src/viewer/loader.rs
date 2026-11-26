@@ -27,6 +27,8 @@ pub struct ViewerTurn {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<u64>,
     pub prompt: String,
+    #[serde(default)]
+    pub hide_prompt: bool,
     pub badge: String,
     pub profile: String,
     pub lane: String,
@@ -251,6 +253,22 @@ fn schedule_name_map(state_dir: Option<&Path>) -> HashMap<u64, String> {
     }
 }
 
+/// Whether the viewer should hide `.turn-prompt-box` for `turn` (scheduled/repeating
+/// runs and system-generated notification root prompts, while keeping interactive
+/// user follow-up turns visible).
+pub fn should_hide_turn_prompt(turn: &TurnRecord, is_opening: bool) -> bool {
+    if turn.schedule_id.is_some()
+        || matches!(
+            turn.origin,
+            TurnOrigin::Schedule | TurnOrigin::ScheduleScript
+        )
+    {
+        return true;
+    }
+    (is_opening || turn.lane == store::Lane::Restricted)
+        && hey_computer::notify_filter::is_notification_enrichment_prompt(&turn.request)
+}
+
 pub fn turn_record_to_viewer_turn(
     turn: TurnRecord,
     is_opening: bool,
@@ -258,6 +276,7 @@ pub fn turn_record_to_viewer_turn(
     drop_cap_flag: bool,
     schedule_name: Option<String>,
 ) -> ViewerTurn {
+    let hide_prompt = should_hide_turn_prompt(&turn, is_opening);
     let word_count = turn.answer.split_whitespace().count();
     let reading_time = if word_count > 0 {
         format!("{} min read", word_count.div_ceil(210).max(1))
@@ -283,6 +302,7 @@ pub fn turn_record_to_viewer_turn(
         turn_id: Some(turn.id),
         conversation_id: Some(turn.conversation_id.unwrap_or(turn.id)),
         prompt: turn.request,
+        hide_prompt,
         badge,
         profile: turn.profile,
         lane: turn.lane.as_str().to_string(),
@@ -314,8 +334,17 @@ fn build_thread_from_turns(
     let first = &turns[0];
     let last_id = turns.last().map(|t| t.id).unwrap_or(first.id);
     let root_id = first.conversation_id.unwrap_or(first.id);
-    let title =
-        extract_markdown_title(&first.answer).unwrap_or_else(|| headline(&first.request, 68));
+    let first_sched = first.schedule_id.and_then(|sid| sched_names.get(&sid));
+    let title = extract_markdown_title(&first.answer)
+        .or_else(|| {
+            if hey_computer::notify_filter::is_notification_enrichment_prompt(&first.request) {
+                hey_computer::notify_filter::format_notification_title(&first.request, 68)
+            } else {
+                None
+            }
+        })
+        .or_else(|| first_sched.map(|s| humanize_schedule_name(s)))
+        .unwrap_or_else(|| headline(&first.request, 68));
     let badge = if first.profile.trim().is_empty() {
         "default".to_string()
     } else {
@@ -393,6 +422,7 @@ fn build_thread_from_file(md_path: &Path, drop_cap_flag: bool) -> Result<ViewerT
         turn_id: None,
         conversation_id: None,
         prompt: String::new(),
+        hide_prompt: false,
         badge: "file".to_string(),
         profile: String::new(),
         lane: "interactive".to_string(),
@@ -571,8 +601,12 @@ pub fn query_history_entries(
         raw_fts: false,
         user_only: false,
     };
+    let sched_names = schedule_name_map(Some(dir));
     match store::recall(dir, &opts) {
-        Ok(hits) => hits.into_iter().map(recall_hit_to_entry).collect(),
+        Ok(hits) => hits
+            .into_iter()
+            .map(|h| recall_hit_to_entry(h, &sched_names))
+            .collect(),
         Err(err) => {
             tracing::warn!("history recall query failed: {err:#}");
             Vec::new()
@@ -580,13 +614,40 @@ pub fn query_history_entries(
     }
 }
 
-fn recall_hit_to_entry(hit: RecallHit) -> HistoryEntry {
+fn recall_hit_to_entry(hit: RecallHit, sched_names: &HashMap<u64, String>) -> HistoryEntry {
     let badge = if hit.profile.trim().is_empty() {
         hit.lane.as_str().to_string()
     } else {
         hit.profile.clone()
     };
-    let title = headline(&hit.request, 68);
+    let is_notif = hey_computer::notify_filter::is_notification_enrichment_prompt(&hit.request);
+    let sched_title = hit
+        .schedule_id
+        .and_then(|sid| sched_names.get(&sid))
+        .map(|s| humanize_schedule_name(s));
+    let title = extract_markdown_title(&hit.answer)
+        .or_else(|| {
+            if is_notif {
+                hey_computer::notify_filter::format_notification_title(&hit.request, 68)
+            } else {
+                None
+            }
+        })
+        .or(sched_title)
+        .unwrap_or_else(|| headline(&hit.request, 68));
+    let clean_prompt = if is_notif {
+        hey_computer::notify_filter::format_notification_preview(&hit.request, 140)
+            .unwrap_or_else(|| title.clone())
+    } else if hit.schedule_id.is_some()
+        || matches!(
+            hit.origin,
+            TurnOrigin::Schedule | TurnOrigin::ScheduleScript
+        )
+    {
+        String::new()
+    } else {
+        hit.request.clone()
+    };
     let snippet: String = hit
         .ans_snippet
         .split_whitespace()
@@ -596,8 +657,8 @@ fn recall_hit_to_entry(hit: RecallHit) -> HistoryEntry {
         id: format!("turn-{}", hit.id),
         turn_id: hit.id,
         title,
-        prompt: hit.request.clone(),
-        request: hit.request,
+        prompt: clean_prompt.clone(),
+        request: clean_prompt,
         answer_snippet: snippet.clone(),
         snippet,
         badge,
@@ -821,5 +882,90 @@ mod tests {
 
         let agent_only = sample_schedule("pre-daily", "", false);
         assert_eq!(schedule_mode(&agent_only), "agent");
+    }
+
+    #[test]
+    fn hides_scheduled_and_notification_system_prompts_while_keeping_user_followups() {
+        let sched_turn = TurnRecord {
+            id: 10,
+            lane: store::Lane::Background,
+            status: TurnStatus::Completed,
+            profile: "deep".to_string(),
+            session_id: None,
+            conversation_id: Some(10),
+            created_at_ms: 1_700_000_000_000,
+            started_at_ms: Some(1_700_000_000_000),
+            finished_at_ms: Some(1_700_000_005_000),
+            request: "Prepare today's Morning Brief...\n\n<untrusted_collector_output>\ndate: 2026-11-26\n</untrusted_collector_output>".to_string(),
+            answer: "- Standup at 10:00".to_string(),
+            denied: vec![],
+            attachments: vec![],
+            fail_reason: None,
+            error_message: None,
+            suppressed_token: None,
+            widgets: vec![],
+            origin: TurnOrigin::ScheduleScript,
+            schedule_id: Some(2),
+        };
+        let mut sched_names = HashMap::new();
+        sched_names.insert(2, "pre-daily".to_string());
+        let (sched_thread, _) = build_thread_from_turns(vec![sched_turn], true, &sched_names);
+        assert_eq!(sched_thread.title, "Pre-Daily Brief");
+        assert!(sched_thread.turns[0].hide_prompt);
+
+        // Legacy (`origin = Cli`, `lane = Restricted`) notification root + interactive user follow-up:
+        let notif_prompt = "<notification_task>\nYou are helping...\n</notification_task>\n\n\
+            <untrusted_notification>\nchannel: whatsapp\napp: whatsapp-electron\nsender: alice\n\
+            preview: Are we meeting this weekend at the harbor?\n</untrusted_notification>";
+        let root_notif = TurnRecord {
+            id: 20,
+            lane: store::Lane::Restricted,
+            status: TurnStatus::Completed,
+            profile: "notify-enrich".to_string(),
+            session_id: None,
+            conversation_id: Some(20),
+            created_at_ms: 1_700_000_010_000,
+            started_at_ms: Some(1_700_000_010_000),
+            finished_at_ms: Some(1_700_000_012_000),
+            request: notif_prompt.to_string(),
+            answer: "CONTEXT: Saturday free\nDRAFT: Saturday afternoon works!".to_string(),
+            denied: vec![],
+            attachments: vec![],
+            fail_reason: None,
+            error_message: None,
+            suppressed_token: None,
+            widgets: vec![],
+            origin: TurnOrigin::Cli,
+            schedule_id: None,
+        };
+        let followup = TurnRecord {
+            id: 21,
+            lane: store::Lane::Restricted,
+            status: TurnStatus::Completed,
+            profile: "notify-enrich".to_string(),
+            session_id: None,
+            conversation_id: Some(20),
+            created_at_ms: 1_700_000_020_000,
+            started_at_ms: Some(1_700_000_020_000),
+            finished_at_ms: Some(1_700_000_021_000),
+            request: "Make the reply a bit more casual".to_string(),
+            answer: "DRAFT: Saturday works great — see you there!".to_string(),
+            denied: vec![],
+            attachments: vec![],
+            fail_reason: None,
+            error_message: None,
+            suppressed_token: None,
+            widgets: vec![],
+            origin: TurnOrigin::Typed,
+            schedule_id: None,
+        };
+        let (notif_thread, _) =
+            build_thread_from_turns(vec![root_notif, followup], false, &sched_names);
+        assert_eq!(
+            notif_thread.title,
+            "WhatsApp · alice: Are we meeting this weekend at the harbor?"
+        );
+        assert!(notif_thread.turns[0].hide_prompt);
+        assert!(!notif_thread.turns[1].hide_prompt);
     }
 }

@@ -657,10 +657,28 @@ in {
     notifications = {
       enable = mkEnableOption "reactive Hold-and-Enrich incoming desktop notification drafting (`[notifications]`)";
 
+      triageProfile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Optional ultra-fast binary triage profile (`true`/`false` gate deciding whether a notification warrants enrichment).";
+      };
+
+      triageTimeoutSecs = mkOption {
+        type = types.number;
+        default = 4.0;
+        description = "Wall-clock cap in seconds for the Stage 1 binary notification triage turn (0.2..=60).";
+      };
+
       profile = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = "Optional profile name for restricted notification drafting turns.";
+        description = "Optional profile name for Stage 2 restricted notification enrichment turns.";
+      };
+
+      allowedMcpTools = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        description = "Explicit `server/tool` MCP subset permitted on Stage 2 restricted notification enrichment turns (strictly read-only lookups).";
       };
 
       maxConcurrent = mkOption {
@@ -887,7 +905,10 @@ in {
       };
       notifications = mkIf cfg.notifications.enable {
         enabled = mkDefault true;
+        triage_profile = mkIf (cfg.notifications.triageProfile != null) (mkDefault cfg.notifications.triageProfile);
+        triage_timeout_secs = mkDefault cfg.notifications.triageTimeoutSecs;
         profile = mkIf (cfg.notifications.profile != null) (mkDefault cfg.notifications.profile);
+        allowed_mcp_tools = mkIf (cfg.notifications.allowedMcpTools != []) (mkDefault cfg.notifications.allowedMcpTools);
         max_concurrent = mkIf (cfg.notifications.maxConcurrent != null) (mkDefault cfg.notifications.maxConcurrent);
         max_queued = mkIf (cfg.notifications.maxQueued != null) (mkDefault cfg.notifications.maxQueued);
         max_hold_secs = mkDefault cfg.notifications.maxHoldSecs;

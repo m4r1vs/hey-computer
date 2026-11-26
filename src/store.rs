@@ -2681,6 +2681,13 @@ fn extract_markdown_heading(text: &str) -> Option<String> {
     None
 }
 
+fn strip_collector_output_block(text: &str) -> &str {
+    match text.find("<untrusted_collector_output>") {
+        Some(idx) => text[..idx].trim_end(),
+        None => text,
+    }
+}
+
 fn derive_history_title(
     origin: TurnOrigin,
     schedule_name: Option<&str>,
@@ -2700,7 +2707,16 @@ fn derive_history_title(
         }
         return "Memory & Skill Distillation".to_string();
     }
-    let req = compact_single_line(root_request, 84);
+    if crate::notify_filter::is_notification_enrichment_prompt(root_request) {
+        return crate::notify_filter::format_notification_title(root_request, 84)
+            .unwrap_or_else(|| "Notification Draft".to_string());
+    }
+    if matches!(origin, TurnOrigin::Schedule | TurnOrigin::ScheduleScript)
+        && let Some(heading) = extract_markdown_heading(answer)
+    {
+        return heading;
+    }
+    let req = compact_single_line(strip_collector_output_block(root_request), 84);
     if !req.is_empty() {
         return req;
     }
@@ -2812,10 +2828,20 @@ pub fn history_feed(state_dir: &Path, opts: &HistoryFeedOptions) -> Result<Histo
             let origin = TurnOrigin::parse(&origin_str);
             let ref_ms = started_at_ms.unwrap_or(created_at_ms);
             let elapsed_secs = ((now_ms - ref_ms).max(0) / 1000) as u64;
+            let is_notif = crate::notify_filter::is_notification_enrichment_prompt(&request);
             let title = if let Some(ref sname) = schedule_name {
                 crate::scheduler::humanize_schedule_name(sname)
+            } else if is_notif {
+                crate::notify_filter::format_notification_title(&request, 84)
+                    .unwrap_or_else(|| "Notification Draft".to_string())
             } else {
-                compact_single_line(&request, 84)
+                compact_single_line(strip_collector_output_block(&request), 84)
+            };
+            let req_clean = if is_notif {
+                crate::notify_filter::format_notification_preview(&request, 240)
+                    .unwrap_or_else(|| title.clone())
+            } else {
+                compact_single_line(strip_collector_output_block(&request), 240)
             };
             Ok(ActiveTaskItem {
                 id: id.max(0) as u64,
@@ -2826,7 +2852,7 @@ pub fn history_feed(state_dir: &Path, opts: &HistoryFeedOptions) -> Result<Histo
                 started_at_ms,
                 elapsed_secs,
                 title,
-                request: compact_single_line(&request, 240),
+                request: req_clean,
                 origin,
                 schedule_id: schedule_id.map(|v| v.max(0) as u64),
                 schedule_name,
@@ -2984,7 +3010,16 @@ fn row_to_history_item(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Result
         &answer,
         &widgets,
     );
-    let request_preview = compact_single_line(&request, 140);
+    let request_preview = if crate::notify_filter::is_notification_enrichment_prompt(&request) {
+        crate::notify_filter::format_notification_preview(&request, 140)
+            .unwrap_or_else(|| title.clone())
+    } else if schedule_id.is_some()
+        || matches!(origin, TurnOrigin::Schedule | TurnOrigin::ScheduleScript)
+    {
+        compact_single_line(strip_collector_output_block(&request), 140)
+    } else {
+        compact_single_line(&request, 140)
+    };
     let answer_preview = derive_answer_preview(
         status,
         &answer,

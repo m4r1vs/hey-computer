@@ -622,6 +622,28 @@ async fn handle_notify_hold(
         Vec::new()
     };
 
+    // Stage 1 ultra-fast binary triage (`notifications.triage_profile`): decide
+    // quickly whether the notification involves dates, availability, a specific
+    // location, or event proposals/cancellations; otherwise release immediately.
+    if svc.config.notifications.triage_profile.is_some() {
+        let triage_prompt = notify_filter::build_triage_prompt(&prepared, &recent_chat);
+        let triage_cancel = Arc::new(conductor::CancelToken::default());
+        let triage_rx = svc
+            .handle
+            .triage_notification(triage_prompt, Arc::clone(&triage_cancel));
+        let actionable = tokio::select! {
+            res = triage_rx => res.unwrap_or(false),
+            () = hung_up(reader) => {
+                tracing::debug!("notify_hold client disconnected during Stage 1 triage");
+                triage_cancel.cancel(FailReason::Cancelled);
+                return Ok(());
+            }
+        };
+        if !actionable {
+            return send(write, &show_raw_reply("triage_skip")).await;
+        }
+    }
+
     let prompt = notify_filter::build_enrichment_prompt(&prepared, &recent_chat);
     let (tx, rx) = oneshot::channel();
     let turn_id = match svc.handle.ask(

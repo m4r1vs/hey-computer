@@ -121,7 +121,10 @@
     };
     notifications = {
       enable = true;
-      profile = "lean";
+      triageProfile = "lean";
+      triageTimeoutSecs = 3.5;
+      profile = "deep";
+      allowedMcpTools = ["demo/get_events"];
       maxConcurrent = 4;
       maxQueued = 16;
       maxHoldSecs = 60;
@@ -216,6 +219,8 @@
   "mcp.servers.<name>.{icon,toolIcons} forward into settings.mcp";
   assert lib.assertMsg ((settingsOf full).notifications.enabled == true)
   "notifications.enable forwards to settings.notifications";
+  assert lib.assertMsg ((settingsOf full).notifications.triage_profile == "lean" && (settingsOf full).notifications.allowed_mcp_tools == ["demo/get_events"])
+  "notifications.triageProfile and allowedMcpTools forward to settings.notifications";
   assert lib.assertMsg ((settingsOf full).notifications.max_concurrent == 4 && (settingsOf full).notifications.max_queued == 16)
   "notifications.maxConcurrent and maxQueued forward to settings.notifications";
   assert lib.assertMsg ((settingsOf full).messenger.enabled == true)
@@ -285,6 +290,7 @@ in
         test -e "$skills/$skill/SKILL.md" || { echo "missing skill $skill" >&2; exit 1; }
       done
       test -d "$XDG_STATE_HOME/hey-computer/artifacts" || { echo "missing artifacts dir" >&2; exit 1; }
+      test -f "$XDG_STATE_HOME/hey-computer/restricted-workspace/AGENTS.md" || { echo "missing restricted-workspace AGENTS.md" >&2; exit 1; }
       grep -q "Alice's Notes" $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md
       grep -q "Prefer metric units." $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md
       grep -q "report the failure plainly" $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md

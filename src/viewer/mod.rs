@@ -1928,6 +1928,7 @@ fn start_live_stream(
                     turn_id: Some(id),
                     conversation_id: Some(conversation_id),
                     prompt: prompt_for_ui.clone(),
+                    hide_prompt: false,
                     badge: badge.clone(),
                     profile: prof_str,
                     lane: "interactive".to_string(),

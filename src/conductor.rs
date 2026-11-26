@@ -224,6 +224,17 @@ impl Ask {
 
 enum Message {
     Ask(Box<Ask>),
+    TriageNotification {
+        prompt: String,
+        token: Arc<CancelToken>,
+        reply: oneshot::Sender<bool>,
+    },
+    FinishTriage {
+        session: String,
+        alive: bool,
+        wedged: bool,
+        auth_required: bool,
+    },
     Wake,
     Shutdown,
 }
@@ -275,6 +286,31 @@ impl Handle {
     /// active foreground turn).
     pub fn validate_profile(&self, profile: Option<&str>) -> std::result::Result<(), String> {
         self.config.resolve_profile(profile).map(|_| ())
+    }
+
+    /// Run Stage 1 ultra-fast binary notification triage (`true`/`false`) in
+    /// memory without creating a `turns` row in `history.db`. Fails open (`false`)
+    /// on timeout, error, or shutdown.
+    pub fn triage_notification(
+        &self,
+        prompt: String,
+        token: Arc<CancelToken>,
+    ) -> oneshot::Receiver<bool> {
+        let (tx, rx) = oneshot::channel();
+        if self.is_locked() {
+            let _ = tx.send(false);
+            return rx;
+        }
+        if let Err(mpsc::error::SendError(Message::TriageNotification { reply, .. })) =
+            self.messages.send(Message::TriageNotification {
+                prompt,
+                token,
+                reply: tx,
+            })
+        {
+            let _ = reply.send(false);
+        }
+        rx
     }
 
     /// Queue an interactive or background request. Returns its monotonic id,
@@ -709,6 +745,7 @@ pub fn spawn_with_deps(
         state_dir: state_dir.clone(),
         shared: Arc::clone(&shared),
         inbox,
+        inbox_tx: messages.clone(),
         done_tx,
         done_rx,
         stop: Arc::clone(&stop),
@@ -721,6 +758,7 @@ pub fn spawn_with_deps(
         bg_queue: VecDeque::new(),
         restricted_active: HashSet::new(),
         restricted_queue: VecDeque::new(),
+        triage_active: 0,
         failures: 0,
         restart_at: None,
         next_memory_check: None,
@@ -757,6 +795,8 @@ struct Live {
     started: Instant,
     /// A session made ahead of time for the default interactive profile.
     spare: Option<SpareSession>,
+    /// A minimal session made ahead of time for Stage 1 notification triage.
+    spare_restricted: Option<SpareSession>,
     /// Initial `(model, thought_level)` reported by the agent's first `session/new`.
     agent_defaults: (String, String),
     /// Set when one session wedged on cancel while sibling lanes are still active;
@@ -801,6 +841,7 @@ struct Conductor {
     policy: Arc<LanePolicy>,
     shared: Arc<Mutex<Shared>>,
     inbox: mpsc::UnboundedReceiver<Message>,
+    inbox_tx: mpsc::UnboundedSender<Message>,
     done_tx: mpsc::UnboundedSender<TurnFinished>,
     done_rx: mpsc::UnboundedReceiver<TurnFinished>,
     stop: Arc<CancelToken>,
@@ -813,6 +854,7 @@ struct Conductor {
     bg_queue: VecDeque<Ask>,
     restricted_active: HashSet<u64>,
     restricted_queue: VecDeque<Ask>,
+    triage_active: usize,
     /// Agent deaths in a row, for the restart back-off.
     failures: u32,
     restart_at: Option<Instant>,
@@ -1398,6 +1440,22 @@ impl Conductor {
                         self.enqueue(ask);
                         self.dispatch_ready().await;
                     }
+                    Some(Message::TriageNotification {
+                        prompt,
+                        token,
+                        reply,
+                    }) => {
+                        self.start_notification_triage(prompt, token, reply).await;
+                    }
+                    Some(Message::FinishTriage {
+                        session,
+                        alive,
+                        wedged,
+                        auth_required,
+                    }) => {
+                        self.finish_notification_triage(session, alive, wedged, auth_required)
+                            .await;
+                    }
                     Some(Message::Wake) => {
                         self.evict_cancelled_queued();
                         self.dispatch_ready().await;
@@ -1479,24 +1537,33 @@ impl Conductor {
             );
         }
         while let Ok(message) = self.inbox.try_recv() {
-            if let Message::Ask(ask) = message {
-                let ask = *ask;
-                let profile = self.effective_display_profile(&ask);
-                let was_queued_bg = ask.background;
-                self.finish_request(
-                    ask,
-                    cancelled(FailReason::AgentDown),
-                    profile,
-                    was_queued_bg,
-                    Vec::new(),
-                );
+            match message {
+                Message::Ask(ask) => {
+                    let ask = *ask;
+                    let profile = self.effective_display_profile(&ask);
+                    let was_queued_bg = ask.background;
+                    self.finish_request(
+                        ask,
+                        cancelled(FailReason::AgentDown),
+                        profile,
+                        was_queued_bg,
+                        Vec::new(),
+                    );
+                }
+                Message::TriageNotification { reply, .. } => {
+                    let _ = reply.send(false);
+                }
+                Message::FinishTriage { .. } | Message::Wake | Message::Shutdown => {}
             }
         }
         self.stop_agent().await;
     }
 
     fn has_active_turns(&self) -> bool {
-        self.fg_active.is_some() || !self.bg_active.is_empty() || !self.restricted_active.is_empty()
+        self.fg_active.is_some()
+            || !self.bg_active.is_empty()
+            || !self.restricted_active.is_empty()
+            || self.triage_active > 0
     }
 
     fn enqueue(&mut self, ask: Ask) {
@@ -1972,7 +2039,8 @@ impl Conductor {
         let policy = if ask.restricted {
             Arc::new(
                 LanePolicy::restricted()
-                    .with_known_mcp_servers(self.policy.known_mcp_servers.clone()),
+                    .with_known_mcp_servers(self.policy.known_mcp_servers.clone())
+                    .with_allowed_mcp_tools(self.config.notifications.allowed_mcp_tools.clone()),
             )
         } else {
             Arc::new(
@@ -2001,8 +2069,12 @@ impl Conductor {
             &config,
             real_agent_dir.as_deref(),
         ));
-        // Never exempt internal schema reads in `Lane::Restricted` (MCP is disabled).
-        let agent_dir = (!ask.restricted).then_some(real_agent_dir).flatten();
+        // Exempt internal MCP schema reads in `Lane::Restricted` only when an
+        // explicit read-only `allowed_mcp_tools` subset is configured.
+        let agent_dir = (!ask.restricted
+            || !self.config.notifications.allowed_mcp_tools.is_empty())
+        .then_some(real_agent_dir)
+        .flatten();
         let done_tx = self.done_tx.clone();
         let stop = Arc::clone(&self.stop);
 
@@ -2812,6 +2884,201 @@ impl Conductor {
             }
             Err(Outcome::Answer { .. }) => {}
         }
+        self.warm_spare_restricted().await;
+    }
+
+    async fn warm_spare_restricted(&mut self) {
+        if !self.config.notifications.enabled || self.keyring_locked {
+            return;
+        }
+        let Some(triage_prof) = self.config.notifications.triage_profile.clone() else {
+            return;
+        };
+        if self
+            .live
+            .as_ref()
+            .is_none_or(|l| l.spare_restricted.is_some() || l.draining || l.auth_failed)
+        {
+            return;
+        }
+        let Ok(resolved) = self.config.resolve_profile(Some(&triage_prof)) else {
+            return;
+        };
+        let Some(cwd) = self.paths.as_ref().map(|p| p.restricted_workspace.clone()) else {
+            return;
+        };
+        if let Ok(session) = self.new_session_in_dir(&resolved, &cwd).await
+            && let Some(live) = &mut self.live
+        {
+            live.spare_restricted = Some(SpareSession {
+                session,
+                model: resolved.model,
+                thought_level: resolved.thought_level,
+            });
+        }
+    }
+
+    async fn start_notification_triage(
+        &mut self,
+        prompt: String,
+        token: Arc<CancelToken>,
+        reply: oneshot::Sender<bool>,
+    ) {
+        if self.keyring_locked || token.reason().is_some() || self.stop.reason().is_some() {
+            let _ = reply.send(false);
+            return;
+        }
+        let Some(triage_prof) = self.config.notifications.triage_profile.clone() else {
+            let _ = reply.send(true);
+            return;
+        };
+        let Ok(resolved) = self.config.resolve_profile(Some(&triage_prof)) else {
+            let _ = reply.send(false);
+            return;
+        };
+        if self.live.is_none() && self.start_agent().await.is_err() {
+            self.schedule_restart_if_warm();
+            let _ = reply.send(false);
+            return;
+        }
+        if token.reason().is_some() {
+            let _ = reply.send(false);
+            return;
+        }
+
+        let spare_matches = self
+            .live
+            .as_ref()
+            .and_then(|l| l.spare_restricted.as_ref())
+            .is_some_and(|s| {
+                s.model == resolved.model && s.thought_level == resolved.thought_level
+            });
+        let session = if spare_matches {
+            self.live
+                .as_mut()
+                .and_then(|l| l.spare_restricted.take())
+                .expect("checked above")
+                .session
+        } else {
+            let Some(cwd) = self.paths.as_ref().map(|p| p.restricted_workspace.clone()) else {
+                let _ = reply.send(false);
+                return;
+            };
+            match self.new_session_in_dir(&resolved, &cwd).await {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = reply.send(false);
+                    return;
+                }
+            }
+        };
+
+        let Some(live) = &self.live else {
+            let _ = reply.send(false);
+            return;
+        };
+        let client = live.conn.client();
+        let sub = client.subscribe(&session);
+        let timeout =
+            Duration::from_secs_f64(self.config.notifications.triage_timeout_secs.max(0.2));
+        let stop = Arc::clone(&self.stop);
+        let inbox_tx = self.inbox_tx.clone();
+        let config = Arc::clone(&self.config);
+        let context_provider = Arc::clone(&self.context);
+        self.triage_active += 1;
+        self.last_used = Instant::now();
+
+        tokio::spawn(async move {
+            let interrupts = Interrupts {
+                request: &token,
+                stop: &stop,
+            };
+            let full_prompt = if config.context.time {
+                let time_only = crate::config::Context {
+                    time: true,
+                    desktop: false,
+                };
+                match context_provider.gather(&time_only).await {
+                    Some(header) => format!("{header}\n\n{prompt}"),
+                    None => prompt,
+                }
+            } else {
+                prompt
+            };
+            let restricted = LanePolicy::restricted();
+            let no_icons = IconResolver::from_config(&Config::default(), None);
+            let budgets = Budgets {
+                inactivity: timeout,
+                max_turn: Some(timeout),
+                max_tool_calls: Some(0),
+                max_repeat_tool_calls: None,
+            };
+            let ctx = TurnContext {
+                policy: &restricted,
+                icons: &no_icons,
+                initial_icons: &[],
+                budgets,
+                progress: None,
+                speech: None,
+                voice_stop: None,
+                stream_tx: None,
+                agent_dir: None,
+                id: 0,
+            };
+            let blocks = vec![json!({"type": "text", "text": full_prompt})];
+            let end = turn(&client, sub, &session, blocks, interrupts, &ctx).await;
+            let verdict = match &end.outcome {
+                Outcome::Answer { text, .. } => {
+                    crate::notify_filter::parse_triage_verdict(text).unwrap_or(false)
+                }
+                Outcome::Failed { .. } => false,
+            };
+            let _ = reply.send(verdict);
+            let _ = inbox_tx.send(Message::FinishTriage {
+                session,
+                alive: end.alive,
+                wedged: end.wedged,
+                auth_required: end.auth_required,
+            });
+        });
+    }
+
+    async fn finish_notification_triage(
+        &mut self,
+        session: String,
+        alive: bool,
+        wedged: bool,
+        auth_required: bool,
+    ) {
+        self.triage_active = self.triage_active.saturating_sub(1);
+        self.last_used = Instant::now();
+        if alive {
+            if let Some(live) = &self.live {
+                drop(
+                    live.conn
+                        .start_call("session/close", json!({"sessionId": session})),
+                );
+            }
+            if auth_required {
+                if !self.has_active_turns() {
+                    self.stop_agent().await;
+                } else if let Some(live) = &mut self.live {
+                    live.auth_failed = true;
+                }
+            } else if wedged {
+                if !self.has_active_turns() {
+                    self.stop_agent().await;
+                    self.schedule_restart_if_warm();
+                } else if let Some(live) = &mut self.live {
+                    live.draining = true;
+                }
+            } else {
+                self.warm_spare_restricted().await;
+            }
+        } else if let Some(live) = self.live.take() {
+            let detail = self.agent_died(live).await;
+            self.last_death_detail = Some(detail);
+        }
     }
 
     async fn start_agent(&mut self) -> Result<()> {
@@ -2880,6 +3147,7 @@ impl Conductor {
             exited: Some(exited),
             started: Instant::now(),
             spare: None,
+            spare_restricted: None,
             agent_defaults: (String::new(), String::new()),
             draining: false,
             auth_failed: false,
@@ -2958,7 +3226,22 @@ impl Conductor {
             .config
             .resolve_profile(requested)
             .map_err(|e| Outcome::failed(FailReason::AgentError, e))?;
-        let session = self.new_session(&resolved, false).await?;
+        let use_full_workspace = self.config.notifications.max_tool_calls > 0
+            || !self.config.notifications.allowed_mcp_tools.is_empty();
+        let cwd = self
+            .paths
+            .as_ref()
+            .map(|p| {
+                if use_full_workspace {
+                    p.workspace.clone()
+                } else {
+                    p.restricted_workspace.clone()
+                }
+            })
+            .ok_or_else(|| {
+                Outcome::failed(FailReason::AgentDown, "the assistant is not running")
+            })?;
+        let session = self.new_session_in_dir(&resolved, &cwd).await?;
         Ok((session, resolved))
     }
 
@@ -3307,8 +3590,23 @@ impl Conductor {
         resolved: &ResolvedProfile,
         _allow_mcp: bool,
     ) -> Result<String, Outcome> {
+        let Some(cwd) = self.paths.as_ref().map(|p| p.workspace.clone()) else {
+            return Err(Outcome::failed(
+                FailReason::AgentDown,
+                "the assistant is not running",
+            ));
+        };
+        self.new_session_in_dir(resolved, &cwd).await
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn new_session_in_dir(
+        &mut self,
+        resolved: &ResolvedProfile,
+        cwd: &Path,
+    ) -> Result<String, Outcome> {
         let started = Instant::now();
-        let (Some(live), Some(paths)) = (&self.live, &self.paths) else {
+        let Some(live) = &self.live else {
             return Err(Outcome::failed(
                 FailReason::AgentDown,
                 "the assistant is not running",
@@ -3320,7 +3618,7 @@ impl Conductor {
         // large tool schemas. Per-profile `mcp_servers` allowlists and
         // restricted-lane blocking are enforced by `LanePolicy` on every
         // `call_mcp_tool` / `mcp_*` permission request.
-        let params = json!({"cwd": paths.workspace, "mcpServers": []});
+        let params = json!({"cwd": cwd, "mcpServers": []});
         let result = live.conn.call("session/new", params, START_TIMEOUT).await;
         let result = match result {
             Ok(result) => result,
@@ -3672,6 +3970,7 @@ async fn turn(
         IconTracker::new()
     };
     let mut denied_call_ids: HashSet<String> = HashSet::new();
+    let mut allowed_call_ids: HashSet<String> = HashSet::new();
     let mut last_progress: Option<String> = None;
     let mut last_emitted_icons_len: usize = 0;
     let mut first_text: Option<Duration> = None;
@@ -3865,6 +4164,9 @@ async fn turn(
                                     break Err(TurnAbort::DeniedTool(detail));
                                 }
                             } else {
+                                if let Some(tc_id) = acp::tool_call_id(&update) {
+                                    allowed_call_ids.insert(tc_id.to_string());
+                                }
                                 stage_widget(
                                     &update,
                                     &mut ui_calls,
@@ -3909,7 +4211,13 @@ async fn turn(
                             }
                             let is_denied_call = acp::tool_call_id(&update)
                                 .is_some_and(|tc_id| denied_call_ids.contains(tc_id));
+                            let is_allowed_status_delta = acp::tool_call_id(&update)
+                                .is_some_and(|tc_id| allowed_call_ids.contains(tc_id))
+                                && update.get("name").is_none()
+                                && update.get("kind").is_none()
+                                && acp::tool_command(&update).is_none();
                             if !is_denied_call
+                                && !is_allowed_status_delta
                                 && let Some((tag, detail)) = policy.denied_update_detail(&update)
                                 && matches!(
                                     update.get("status").and_then(Value::as_str),
@@ -3946,7 +4254,9 @@ async fn turn(
                                 }
                                 _ => {}
                             }
-                            if !is_denied_call && !policy.will_deny_update(&update) {
+                            if !is_denied_call
+                                && (is_allowed_status_delta || !policy.will_deny_update(&update))
+                            {
                                 icon_tracker.observe_followup(ctx.icons, &update);
                                 if !tracker.is_exempt_call(&update) {
                                     emit_progress(
@@ -4010,6 +4320,9 @@ async fn turn(
                             tracing::debug!("request {id}: allowed {command:?}");
                         }
                         if let Some(tc) = params.get("toolCall") {
+                            if let Some(tc_id) = acp::tool_call_id(tc) {
+                                allowed_call_ids.insert(tc_id.to_string());
+                            }
                             stage_widget(tc, &mut ui_calls, &mut pending_widgets, &mut widget_seq);
                         }
                         icon_tracker.observe_permission(ctx.icons, params.get("toolCall"));
@@ -4799,6 +5112,7 @@ mod tests {
             state_dir: None,
             shared,
             inbox,
+            inbox_tx: tx.clone(),
             done_tx,
             done_rx,
             stop: Arc::new(CancelToken::default()),
@@ -4811,6 +5125,7 @@ mod tests {
             bg_queue: VecDeque::new(),
             restricted_active: HashSet::new(),
             restricted_queue: VecDeque::new(),
+            triage_active: 0,
             failures: 0,
             restart_at: None,
             next_memory_check: None,

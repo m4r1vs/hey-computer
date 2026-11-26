@@ -170,6 +170,10 @@ pub struct LanePolicy {
     /// Optional per-turn allowlist of MCP server names (`None` allows all
     /// configured servers when `allow_mcp` is true).
     pub allowed_mcp_servers: Option<Vec<String>>,
+    /// Optional explicit `"server/tool"` allowlist (used by Stage 2 restricted
+    /// notification enrichment to allow strictly read-only calendar/contact
+    /// lookups while still denying every unlisted MCP tool and `mcp-ui`).
+    pub allowed_mcp_tools: Vec<String>,
     /// Configured MCP server names, used to disambiguate `mcp_<server>_<tool>`
     /// prefixes when server names themselves contain underscores.
     pub known_mcp_servers: Vec<String>,
@@ -183,6 +187,7 @@ impl LanePolicy {
             deny_tool_names: Vec::new(),
             allow_mcp: true,
             allowed_mcp_servers: None,
+            allowed_mcp_tools: Vec::new(),
             known_mcp_servers: Vec::new(),
         }
     }
@@ -190,7 +195,8 @@ impl LanePolicy {
     /// Restricted read-only lane: refuses mutating, network, search, and
     /// unknown tool kinds (`RESTRICTED_DENY_KINDS`), blocks risky tool names
     /// (`RESTRICTED_DENY_NAMES`) even if reported as `"read"`, and disables all
-    /// MCP servers (including internal `mcp-ui`).
+    /// MCP servers (including internal `mcp-ui`) unless specific read-only
+    /// `"server/tool"` entries are added via [`Self::with_allowed_mcp_tools`].
     pub fn restricted() -> Self {
         Self {
             deny_commands: Policy::new(&[]),
@@ -204,6 +210,7 @@ impl LanePolicy {
                 .collect(),
             allow_mcp: false,
             allowed_mcp_servers: None,
+            allowed_mcp_tools: Vec::new(),
             known_mcp_servers: Vec::new(),
         }
     }
@@ -213,6 +220,16 @@ impl LanePolicy {
         let mut copy = self.clone();
         copy.allowed_mcp_servers = allowed;
         copy
+    }
+
+    /// Permit an explicit `"server/tool"` MCP subset (e.g. strictly read-only
+    /// calendar lookups on a restricted enrichment turn).
+    pub fn with_allowed_mcp_tools(mut self, tools: Vec<String>) -> Self {
+        if !tools.is_empty() {
+            self.allow_mcp = true;
+        }
+        self.allowed_mcp_tools = tools;
+        self
     }
 
     /// Attach the full set of configured MCP server names for longest-prefix
@@ -264,6 +281,24 @@ impl LanePolicy {
                     detail,
                 };
             }
+            if !self.allowed_mcp_tools.is_empty() {
+                let allowed_exact = name == Some("call_mcp_tool")
+                    && match (&server, &tool) {
+                        (Some(s), Some(t)) => {
+                            let candidate = format!("{s}/{t}");
+                            self.allowed_mcp_tools
+                                .iter()
+                                .any(|entry| entry == &candidate)
+                        }
+                        _ => false,
+                    };
+                if !allowed_exact {
+                    return PermissionDecision::Deny {
+                        tag: "mcp".to_string(),
+                        detail,
+                    };
+                }
+            }
             if server.as_deref() == Some(crate::mcp::INTERNAL_UI_MCP_SERVER) {
                 return PermissionDecision::Allow;
             }
@@ -285,6 +320,19 @@ impl LanePolicy {
                     tag: "mcp".to_string(),
                     detail: mcp_name.to_string(),
                 };
+            }
+            if !self.allowed_mcp_tools.is_empty() {
+                let matched = self.allowed_mcp_tools.iter().any(|entry| {
+                    entry
+                        .split_once('/')
+                        .is_some_and(|(s, t)| mcp_name == format!("mcp_{s}_{t}"))
+                });
+                if !matched {
+                    return PermissionDecision::Deny {
+                        tag: "mcp".to_string(),
+                        detail: mcp_name.to_string(),
+                    };
+                }
             }
             if mcp_name.starts_with(&format!("mcp_{}_", crate::mcp::INTERNAL_UI_MCP_SERVER)) {
                 return PermissionDecision::Allow;
@@ -1343,5 +1391,55 @@ mod tests {
         assert_eq!(p.denied_word("echo $(date) sudo"), None);
         assert_eq!(p.denied_word("echo `date` sudo"), None);
         assert_eq!(p.denied_word("echo $(sudo id)").as_deref(), Some("sudo"));
+
+        // Restricted lane with explicit `allowed_mcp_tools` allows ONLY exact read-only tools.
+        let restricted_cal = LanePolicy::restricted()
+            .with_known_mcp_servers(vec!["google-workspace".to_string()])
+            .with_allowed_mcp_tools(vec!["google-workspace/get_events".to_string()]);
+        assert_eq!(
+            restricted_cal.evaluate_permission(&json!({"toolCall": {
+                "kind": "other",
+                "name": "call_mcp_tool",
+                "rawInput": {"ServerName": "google-workspace", "ToolName": "get_events"}
+            }})),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            restricted_cal.evaluate_permission(&json!({"toolCall": {
+                "kind": "other",
+                "name": "mcp_google-workspace_get_events"
+            }})),
+            PermissionDecision::Allow
+        );
+        for blocked in [
+            json!({"toolCall": {
+                "kind": "other",
+                "name": "call_mcp_tool",
+                "rawInput": {"ServerName": "google-workspace", "ToolName": "send_gmail_message"}
+            }}),
+            json!({"toolCall": {
+                "kind": "execute",
+                "name": "call_mcp_tool",
+                "rawInput": {"ServerName": "mcp-ui", "ToolName": "show_widget"}
+            }}),
+            json!({"toolCall": {
+                "kind": "read",
+                "name": "list_resources",
+                "rawInput": {"ServerName": "google-workspace"}
+            }}),
+            json!({"toolCall": {
+                "kind": "execute",
+                "name": "run_command",
+                "rawInput": {"CommandLine": "id"}
+            }}),
+        ] {
+            assert!(
+                matches!(
+                    restricted_cal.evaluate_permission(&blocked),
+                    PermissionDecision::Deny { .. }
+                ),
+                "expected {blocked} to be denied"
+            );
+        }
     }
 }

@@ -595,6 +595,11 @@ impl Default for ToolIcons {
 pub struct Present {
     /// Master switch for every notification, errors included.
     pub notifications: bool,
+    /// Mark `notify-send` popups transient (`--hint=boolean:transient:true`) so
+    /// ephemeral `hey-computer` toasts do not persist in notification history
+    /// panels (such as SwayNC's Control Center).
+    #[serde(default = "default_true")]
+    pub transient: bool,
     /// A "Thinking…" notification while a request runs (updated with tool
     /// progress), replaced in place by the answer.
     pub progress: bool,
@@ -672,6 +677,7 @@ impl Default for Present {
     fn default() -> Self {
         Self {
             notifications: true,
+            transient: true,
             progress: true,
             max_chars: 230,
             max_lines: 4,
@@ -1098,6 +1104,20 @@ impl Config {
             && let Err(msg) = self.resolve_profile(Some(profile))
         {
             bail!("notifications.profile: {msg}");
+        }
+        if let Some(profile) = self.notifications.triage_profile.as_deref()
+            && let Err(msg) = self.resolve_profile(Some(profile))
+        {
+            bail!("notifications.triage_profile: {msg}");
+        }
+        for spec in &self.notifications.allowed_mcp_tools {
+            if let Some((server, _)) = spec.split_once('/')
+                && !self.mcp.contains_key(server)
+            {
+                bail!(
+                    "notifications.allowed_mcp_tools entry `{spec}` references unknown MCP server `{server}`"
+                );
+            }
         }
         if !self.instructions.vault.as_os_str().is_empty() {
             let vault = normalize_lexical(&self.instructions.vault);

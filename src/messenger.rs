@@ -575,14 +575,14 @@ async fn handle_event(
             let display_sender = if sender_name.trim().is_empty() {
                 chat_id.clone()
             } else {
-                sender_name
+                sender_name.clone()
             };
             let prepared = PreparedNotification {
                 channel: channel.clone(),
                 app_name: app_name.clone(),
                 sender: display_sender.clone(),
                 chat_target: chat_id.clone(),
-                body,
+                body: body.clone(),
                 window_class: channel.clone(),
                 source_notif_id: None,
                 readonly: true,
@@ -590,43 +590,75 @@ async fn handle_event(
                 group_name: None,
             };
             let ctx = convert_context_messages(&recent_messages);
-            let prompt = notify_filter::build_enrichment_prompt(&prepared, &ctx);
             let profile = config
                 .messenger
                 .draft_profile
                 .clone()
                 .or_else(|| config.notifications.profile.clone());
-
-            let (tx, rx) = oneshot::channel();
-            let turn_id = match conductor.ask(
-                AskParams {
-                    text: prompt,
-                    new: true,
-                    profile,
-                    background: true,
-                    restricted: true,
-                    suppress_token: Some("HEARTBEAT_OK".to_string()),
-                    attachments: Vec::new(),
-                    source: InputSource::Cli,
-                    reply_to: None,
-                    distill: false,
-                    schedule_id: None,
-                    schedule_has_script: false,
-                    initial_icons: Vec::new(),
-                },
-                Sink::Client(tx),
-            ) {
-                Ok(id) => id,
-                Err(msg) => {
-                    tracing::debug!("skipping bridge DM draft for {platform}: {msg}");
-                    return;
-                }
-            };
-
+            let settle_for_desktop_hold = config.notifications.enabled;
+            let use_triage = config.notifications.triage_profile.is_some();
+            let draft_ttl_ms = (config.notifications.draft_ttl_secs * 1000.0).round() as i64;
             let store = store.clone();
             let presenter = Arc::clone(presenter);
-            let draft_ttl_ms = (config.notifications.draft_ttl_secs * 1000.0).round() as i64;
+            let conductor = conductor.clone();
+            let handle_clone = handle.clone();
+
             tokio::spawn(async move {
+                // Give desktop chat apps (`whatsapp-electron`, `signal-desktop`)
+                // up to 500 ms to finish icon fetch and deliver SwayNC `NotifyHold`
+                // so we never queue a duplicate restricted turn on the same message.
+                if settle_for_desktop_hold {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if handle_clone.was_recently_held(platform, &sender_name, &chat_id, &body) {
+                        tracing::debug!(
+                            "skipping bridge DM draft for {platform} after settle: handled by NotifyHold"
+                        );
+                        return;
+                    }
+                }
+
+                if use_triage {
+                    let triage_prompt = notify_filter::build_triage_prompt(&prepared, &ctx);
+                    let triage_tok = Arc::new(crate::conductor::CancelToken::default());
+                    let actionable = conductor
+                        .triage_notification(triage_prompt, triage_tok)
+                        .await
+                        .unwrap_or(false);
+                    if !actionable {
+                        return;
+                    }
+                    if handle_clone.was_recently_held(platform, &sender_name, &chat_id, &body) {
+                        return;
+                    }
+                }
+
+                let prompt = notify_filter::build_enrichment_prompt(&prepared, &ctx);
+                let (tx, rx) = oneshot::channel();
+                let turn_id = match conductor.ask(
+                    AskParams {
+                        text: prompt,
+                        new: true,
+                        profile,
+                        background: true,
+                        restricted: true,
+                        suppress_token: Some("HEARTBEAT_OK".to_string()),
+                        attachments: Vec::new(),
+                        source: InputSource::Cli,
+                        reply_to: None,
+                        distill: false,
+                        schedule_id: None,
+                        schedule_has_script: false,
+                        initial_icons: Vec::new(),
+                    },
+                    Sink::Client(tx),
+                ) {
+                    Ok(id) => id,
+                    Err(msg) => {
+                        tracing::debug!("skipping bridge DM draft for {platform}: {msg}");
+                        return;
+                    }
+                };
+
                 let Ok(Reply::Answer {
                     text: answer,
                     suppressed: false,
@@ -635,6 +667,9 @@ async fn handle_event(
                 else {
                     return;
                 };
+                if handle_clone.was_recently_held(platform, &sender_name, &chat_id, &body) {
+                    return;
+                }
                 let EnrichmentResult::Enriched {
                     context_note,
                     draft_text,

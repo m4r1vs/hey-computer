@@ -339,6 +339,7 @@ desktop = false                     # prepend active Hyprland workspace/window, 
 
 [present]
 notifications = true                # every notification, errors included
+transient = true                    # pass --hint=boolean:transient:true to notify-send (skip history panel)
 progress = true                     # "Thinking…" while a request runs (with live tool progress)
 max_chars = 230                     # longer answers go to the viewer
 max_lines = 4                       # so do answers with more lines

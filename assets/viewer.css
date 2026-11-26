@@ -551,6 +551,10 @@ select {
   gap: 0.52rem;
 }
 
+.turn-header.turn-header-no-prompt {
+  gap: 0.35rem;
+}
+
 .turn-meta-row {
   display: flex;
   align-items: center;

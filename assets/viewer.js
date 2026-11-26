@@ -408,6 +408,35 @@
     return /morning[\s-]+(brief|digest)/i.test(combined);
   }
 
+  function isSystemNotificationPrompt(prompt) {
+    if (!prompt) return false;
+    const trimmed = String(prompt).trimStart();
+    return (
+      trimmed.startsWith("<notification_task>") ||
+      trimmed.startsWith("<notification_triage>") ||
+      (trimmed.includes("<untrusted_notification>") &&
+        trimmed.includes("</untrusted_notification>"))
+    );
+  }
+
+  function shouldHideTurnPrompt(turn) {
+    if (!turn) return false;
+    if (turn.hidePrompt || turn.hide_prompt) return true;
+    const origin = String(turn.origin || "").toLowerCase();
+    if (
+      origin === "schedule" ||
+      origin === "schedule_script" ||
+      origin === "notification" ||
+      (turn.scheduleId !== undefined && turn.scheduleId !== null)
+    ) {
+      return true;
+    }
+    return (
+      String(turn.lane || "").toLowerCase() === "restricted" &&
+      isSystemNotificationPrompt(turn.prompt)
+    );
+  }
+
   function normalizeTurn(rawTurn, idx, threadDefaults) {
     const t = rawTurn || {};
     const html =
@@ -442,6 +471,7 @@
         t.userPrompt ||
         threadDefaults.prompt ||
         "",
+      hidePrompt: Boolean(t.hidePrompt || t.hide_prompt),
       badge: t.badge || t.profile || threadDefaults.badge || "default",
       profile: t.profile || "",
       lane: t.lane || threadDefaults.lane || "interactive",
@@ -1446,10 +1476,12 @@
     metaRow.appendChild(metaRight);
     header.appendChild(metaRow);
 
-    if (turn.prompt) {
+    if (turn.prompt && !shouldHideTurnPrompt(turn)) {
       const promptBox = el("div", "turn-prompt-box");
       promptBox.appendChild(el("p", "turn-prompt-text", turn.prompt));
       header.appendChild(promptBox);
+    } else {
+      header.classList.add("turn-header-no-prompt");
     }
 
     const infoStrip = el("div", "turn-info-strip");
