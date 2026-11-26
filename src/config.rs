@@ -427,7 +427,7 @@ impl Default for Routing {
             auto_background: true,
             escalate_on_failure: true,
             triage_non_voice: true,
-            triage_timeout_secs: 4.0,
+            triage_timeout_secs: 8.0,
         }
     }
 }
@@ -1661,6 +1661,8 @@ mod tests {
         assert!(!cfg.routing.enabled);
         assert_eq!(cfg.routing.fast_profile, "default");
         assert_eq!(cfg.routing.deep_profile, "deep");
+        assert_eq!(cfg.routing.triage_timeout_secs, 8.0);
+        assert_eq!(cfg.notifications.triage_timeout_secs, 10.0);
         cfg.validate().unwrap();
 
         let parsed: Config = toml::from_str(

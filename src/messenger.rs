@@ -633,7 +633,11 @@ async fn handle_event(
                     {
                         Ok(Ok(val)) => val,
                         Ok(Err((reason, message))) => {
-                            if !matches!(
+                            if reason == FailReason::Timeout {
+                                tracing::warn!(
+                                    "Stage 1 {platform} bridge triage timed out: {message}"
+                                );
+                            } else if !matches!(
                                 reason,
                                 FailReason::Cancelled
                                     | FailReason::Superseded

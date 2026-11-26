@@ -385,7 +385,7 @@ deep_profile = "deep"               # profile for deep/analytical turns or escal
 auto_background = true              # move long multi-step delegation prompts to background lane
 escalate_on_failure = true          # retry once on deep_profile after retryable fast failure
 triage_non_voice = true             # restricted LLM triage on unsure non-voice turns (never on voice)
-triage_timeout_secs = 4             # timeout for non-voice LLM triage (seconds)
+triage_timeout_secs = 8             # timeout for non-voice LLM triage (seconds)
 
 [history]
 retention_days = 90                 # prune completed/failed/cancelled turns older than this; 0 = keep

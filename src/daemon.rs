@@ -647,7 +647,12 @@ async fn handle_notify_hold(
                 return send(write, &show_raw_reply("triage_skip")).await;
             }
             Ok(Err((reason, message))) => {
-                if !matches!(
+                if reason == FailReason::Timeout {
+                    tracing::warn!(
+                        "Stage 1 {} notification triage timed out: {message}",
+                        prepared.channel
+                    );
+                } else if !matches!(
                     reason,
                     FailReason::Cancelled | FailReason::Superseded | FailReason::KeyringLocked
                 ) {

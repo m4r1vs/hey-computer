@@ -246,7 +246,7 @@ impl NotificationsConfig {
 }
 
 fn default_triage_timeout_secs() -> f64 {
-    4.0
+    10.0
 }
 
 fn check_range(name: &str, value: f64, min: f64, max: f64) -> Result<()> {
@@ -1679,7 +1679,7 @@ pub fn build_triage_prompt(
            2. Asks whether the user has time or is available on a certain date/time,\n\
            3. Mentions a specific location, venue, address, or meeting place, or\n\
            4. Proposes, reschedules, or cancels an event, plan, or meeting.\n\
-         - Reply with ONLY the single word `true` or `false` (lowercase, no punctuation, no explanation).\n\
+         - Do not deliberate or over-analyze conversational subtext; decide immediately and reply with ONLY the single word `true` or `false` (lowercase, no punctuation, no explanation).\n\
          </notification_triage>\n\n",
     );
     append_untrusted_notification_blocks(&mut prompt, notif, recent_chat, 4);
@@ -2975,7 +2975,9 @@ mod tests {
         }];
         let triage = build_triage_prompt(&prep, &chat);
         assert!(triage.contains("<notification_triage>"));
+        assert!(triage.contains("Do not deliberate"));
         assert!(is_notification_enrichment_prompt(&triage));
+        assert_eq!(NotificationsConfig::default().triage_timeout_secs, 10.0);
 
         let enrich = build_enrichment_prompt(&prep, &chat);
         assert!(is_notification_enrichment_prompt(&enrich));

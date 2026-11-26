@@ -665,7 +665,7 @@ in {
 
       triageTimeoutSecs = mkOption {
         type = types.number;
-        default = 4.0;
+        default = 10.0;
         description = "Wall-clock cap in seconds for the Stage 1 binary notification triage turn (0.2..=60).";
       };
 

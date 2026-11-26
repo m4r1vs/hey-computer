@@ -4856,6 +4856,16 @@ async fn notify_hold_stage2_failure_releases_raw_and_emits_persistent_error_noti
           ]
         },
         {
+          "match": "preview: Hang triage",
+          "steps": ["hang"]
+        },
+        {
+          "match": "preview: Crash triage",
+          "steps": [
+            {"error": {"code": -32603, "message": "backend boom"}}
+          ]
+        },
+        {
           "match": "preview: Komme Montag",
           "steps": [
             {"chunk": "true"}
@@ -4884,6 +4894,7 @@ async fn notify_hold_stage2_failure_releases_raw_and_emits_persistent_error_noti
         );
         cfg.notifications.enabled = true;
         cfg.notifications.triage_profile = Some("notify-triage".to_string());
+        cfg.notifications.triage_timeout_secs = 0.25;
         cfg.notifications.profile = Some("notify-enrich".to_string());
         cfg.notifications.max_tool_calls = 4;
         cfg.notifications.per_sender_cooldown_secs = 0.0;
@@ -4898,6 +4909,103 @@ async fn notify_hold_stage2_failure_releases_raw_and_emits_persistent_error_noti
         );
     })
     .await;
+
+    // 1. Stage 1 triage timeout releases raw cleanly WITHOUT popping up a persistent Error alert.
+    let mut timeout_client = Client::send(
+        &h.socket,
+        &Request::NotifyHold {
+            noti_id: 299,
+            replaces_id: 0,
+            app_name: "whatsapp-electron".to_string(),
+            desktop_entry: "whatsapp-electron".to_string(),
+            summary: "Alex Mercer".to_string(),
+            body: "Hang triage".to_string(),
+            category: "im.received".to_string(),
+            urgency: "normal".to_string(),
+            has_default_action: true,
+            dnd: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        timeout_client
+            .next(Some(Duration::from_secs(5)))
+            .await
+            .unwrap(),
+        Reply::NotifyAccepted { .. }
+    ));
+    let timeout_release = timeout_client
+        .next(Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            timeout_release,
+            Reply::NotifyRelease {
+                action: NotifyReleaseAction::ShowRaw,
+                reason: Some(ref why),
+                ..
+            } if why == "triage_failed"
+        ),
+        "expected ShowRaw(triage_failed) on triage timeout, got {timeout_release:?}"
+    );
+    assert!(
+        !h.recorder
+            .items()
+            .iter()
+            .any(|p| matches!(p, Presentation::Error { .. })),
+        "Stage 1 triage timeout must not emit persistent Presentation::Error: {:?}",
+        h.recorder.items()
+    );
+
+    // 2. Genuine Stage 1 RPC failure DOES emit persistent Presentation::Error.
+    let mut err_client = Client::send(
+        &h.socket,
+        &Request::NotifyHold {
+            noti_id: 300,
+            replaces_id: 0,
+            app_name: "whatsapp-electron".to_string(),
+            desktop_entry: "whatsapp-electron".to_string(),
+            summary: "Alex Mercer".to_string(),
+            body: "Crash triage".to_string(),
+            category: "im.received".to_string(),
+            urgency: "normal".to_string(),
+            has_default_action: true,
+            dnd: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        err_client.next(Some(Duration::from_secs(5))).await.unwrap(),
+        Reply::NotifyAccepted { .. }
+    ));
+    let err_release = err_client.next(Some(Duration::from_secs(5))).await.unwrap();
+    assert!(
+        matches!(
+            err_release,
+            Reply::NotifyRelease {
+                action: NotifyReleaseAction::ShowRaw,
+                reason: Some(ref why),
+                ..
+            } if why == "triage_failed"
+        ),
+        "expected ShowRaw(triage_failed) on triage RPC error, got {err_release:?}"
+    );
+    assert!(
+        h.recorder.items().iter().any(|p| matches!(
+            p,
+            Presentation::Error { summary, body, .. }
+                if summary.contains("triage failed")
+                    && summary.contains("Alex Mercer")
+                    && body.contains("backend boom")
+        )),
+        "expected Presentation::Error on genuine Stage 1 failure, got {:?}",
+        h.recorder.items()
+    );
+
+    // 3. Stage 2 denied-tool abort releases raw AND emits persistent Presentation::Error.
 
     let mut client = Client::send(
         &h.socket,
