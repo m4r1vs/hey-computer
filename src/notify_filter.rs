@@ -525,9 +525,12 @@ impl NotificationFilter {
             return FilterDecision::Drop(DropReason::DoNotDisturb);
         }
 
-        // 4. Empty / system / privacy-placeholder skip.
-        let raw_summary = notif.summary.trim();
-        let body_trimmed = notif.body.trim();
+        // 4. Empty / system / privacy-placeholder skip (stripping invisible
+        //    Unicode bidi/LRM marks injected by whatsapp-electron / Chromium).
+        let clean_summary_owned = strip_bidi_controls(&notif.summary);
+        let clean_body_owned = strip_bidi_controls(&notif.body);
+        let raw_summary = clean_summary_owned.trim();
+        let body_trimmed = clean_body_owned.trim();
         if raw_summary.is_empty() || body_trimmed.is_empty() {
             return FilterDecision::Drop(DropReason::EmptyOrSystemBoilerplate);
         }
@@ -1210,10 +1213,16 @@ fn parse_group_notification<'a>(
         stripped
     };
 
-    // 1. `"<Member> @ <Group>"` or `"<Member> in <Group>"` in summary.
-    if let Some((member, group)) = summary_clean
-        .split_once(" @ ")
-        .or_else(|| summary_clean.split_once(" in "))
+    let matches_group_list = known_or_allowed_groups
+        .any(|g| sender_matches_allow(g, summary_clean) || sender_matches_allow(g, raw_sender));
+
+    // 1. `"<Member> @ <Group>"` or `"<Member> in <Group>"` in summary (skipped
+    //    when the full summary already matches a known/allowed group title whose
+    //    own name contains `" in "` or `" @ "`).
+    if !matches_group_list
+        && let Some((member, group)) = summary_clean
+            .split_once(" @ ")
+            .or_else(|| summary_clean.split_once(" in "))
     {
         let m = member.trim();
         let g = group.trim();
@@ -1221,7 +1230,7 @@ fn parse_group_notification<'a>(
             return Some(ParsedGroup {
                 group_name: g.to_string(),
                 member_sender: m.to_string(),
-                message_body: body.to_string(),
+                message_body: strip_reply_to_you_prefix(body).to_string(),
             });
         }
     }
@@ -1230,8 +1239,6 @@ fn parse_group_notification<'a>(
     //    optional `"<Member>: <Message>"` in body.
     let is_cat_group =
         clean_optional_str(category).is_some_and(|c| c.eq_ignore_ascii_case("im.received.group"));
-    let matches_group_list = known_or_allowed_groups
-        .any(|g| sender_matches_allow(g, summary_clean) || sender_matches_allow(g, raw_sender));
     let is_hash_chan = summary_clean.starts_with('#');
     let has_member_prefix =
         is_readonly_channel(channel) && looks_like_group_member_prefix(summary_clean, body);
@@ -1280,11 +1287,45 @@ fn strip_message_counter(summary: &str) -> (&str, bool) {
     }
 }
 
+fn strip_bidi_controls(s: &str) -> String {
+    s.chars()
+        .filter(|&c| {
+            !matches!(
+                c,
+                '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{feff}'
+            )
+        })
+        .collect()
+}
+
+fn strip_reply_to_you_prefix(line: &str) -> &str {
+    let trimmed = line.trim();
+    for prefix in [
+        "Replied to you: ",
+        "Hat dir geantwortet: ",
+        "Antwort an dich: ",
+    ] {
+        if trimmed.len() >= prefix.len()
+            && trimmed
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        {
+            return trimmed[prefix.len()..].trim_start();
+        }
+    }
+    trimmed
+}
+
 fn split_group_member_body(group_name: &str, body: &str) -> Option<(String, String)> {
-    let (first_line, remaining) = match body.split_once('\n') {
+    let (raw_first_line, remaining) = match body.split_once('\n') {
         Some((first, rem)) => (first.trim(), Some(rem)),
         None => (body.trim(), None),
     };
+    let first_line = strip_reply_to_you_prefix(raw_first_line);
     let (prefix, first_rest) = first_line.split_once(": ")?;
     let member = prefix.trim();
     if first_rest.trim().is_empty() && remaining.is_none_or(|r| r.trim().is_empty()) {
@@ -1340,7 +1381,7 @@ fn is_non_member_prefix(prefix_lower: &str) -> bool {
 }
 
 fn looks_like_group_member_prefix(sender: &str, body: &str) -> bool {
-    let first_line = body.lines().next().unwrap_or("").trim();
+    let first_line = strip_reply_to_you_prefix(body.lines().next().unwrap_or(""));
     let Some((prefix, rest)) = first_line.split_once(": ") else {
         return false;
     };
@@ -1376,9 +1417,7 @@ fn sender_matches_deny(pattern: &str, value: &str) -> bool {
     if pat.contains('*') {
         glob_matches_ci(pat, value)
     } else {
-        value
-            .to_ascii_lowercase()
-            .contains(&pat.to_ascii_lowercase())
+        value.to_lowercase().contains(&pat.to_lowercase())
     }
 }
 
@@ -1390,14 +1429,14 @@ fn sender_matches_allow(pattern: &str, value: &str) -> bool {
     if pat.contains('*') {
         glob_matches_ci(pat, value)
     } else {
-        value.trim().eq_ignore_ascii_case(pat)
+        value.trim().to_lowercase() == pat.to_lowercase()
     }
 }
 
-/// Case-insensitive `*`-glob matcher (zero dependencies, linear-ish backtracking).
+/// Case-insensitive `*`-glob matcher (zero dependencies, full Unicode case-folding).
 fn glob_matches_ci(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
-    let t: Vec<char> = text.to_ascii_lowercase().chars().collect();
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let t: Vec<char> = text.to_lowercase().chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     let mut star_pi: Option<usize> = None;
     let mut star_ti = 0usize;
@@ -2498,5 +2537,51 @@ mod tests {
         assert!(group_prompt.contains("[08:10] Carol: Who is driving Saturday?"));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn whatsapp_electron_lrm_reply_prefix_and_unicode_group_titles() {
+        let mut cfg = base_config();
+        let wa = cfg.apps.get_mut("whatsapp").unwrap();
+        wa.allow_groups = false;
+        wa.allow_group_names = vec![
+            "schwimmen und gärtnern".to_string(),
+            "\"in it to int it\"".to_string(),
+            "Party in Berlin".to_string(),
+        ];
+
+        let filter = NotificationFilter::new(cfg);
+        let t = weekday_noon();
+
+        // 1. LRM (`\u{200e}`) + `"Replied to you: "` prefix + German umlaut case-folding.
+        let notif = IncomingNotification {
+            app_name: "whatsapp-electron".to_string(),
+            summary: "Schwimmen und Gärtnern\u{200e}".to_string(),
+            body: "Replied to you: Alice Example\u{200e}: Bin um 18 Uhr da\u{200e}".to_string(),
+            ..IncomingNotification::default()
+        };
+        let FilterDecision::Allow(prep) = filter.evaluate_at(&notif, 1_000, t) else {
+            panic!("expected Allow for whatsapp-electron group reply");
+        };
+        assert!(prep.is_group);
+        assert_eq!(prep.group_name.as_deref(), Some("Schwimmen und Gärtnern"));
+        assert_eq!(prep.chat_target, "Schwimmen und Gärtnern");
+        assert_eq!(prep.sender, "Alice Example");
+        assert_eq!(prep.body, "Bin um 18 Uhr da");
+
+        // 2. Group title containing `" in "` is NOT mis-split into `member = "Party"`, `group = "Berlin"`.
+        let notif_in = IncomingNotification {
+            app_name: "whatsapp-electron".to_string(),
+            summary: "Party in Berlin".to_string(),
+            body: "Bob Member\u{200e}: Wer bringt Eis mit?\u{200e}".to_string(),
+            ..IncomingNotification::default()
+        };
+        let FilterDecision::Allow(prep_in) = filter.evaluate_at(&notif_in, 2_000, t) else {
+            panic!("expected Allow for group title containing ' in '");
+        };
+        assert!(prep_in.is_group);
+        assert_eq!(prep_in.group_name.as_deref(), Some("Party in Berlin"));
+        assert_eq!(prep_in.sender, "Bob Member");
+        assert_eq!(prep_in.body, "Wer bringt Eis mit?");
     }
 }
