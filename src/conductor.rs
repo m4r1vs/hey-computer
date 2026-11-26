@@ -216,6 +216,12 @@ pub struct Ask {
     pub token: Arc<CancelToken>,
 }
 
+impl Ask {
+    fn is_restricted_bg(&self) -> bool {
+        self.restricted && self.background
+    }
+}
+
 enum Message {
     Ask(Box<Ask>),
     Wake,
@@ -235,6 +241,7 @@ struct Shared {
     bg_tasks: HashMap<u64, Arc<CancelToken>>,
     bg_running: usize,
     bg_queued: usize,
+    restricted_queued: usize,
     agent: AgentState,
     /// Currently running interactive request `(id, started, profile)`.
     running: Option<(u64, Instant, Option<String>)>,
@@ -349,7 +356,19 @@ impl Handle {
                     });
                 }
             }
-            if effective_background {
+            if effective_restricted && effective_background {
+                if shared.restricted_queued >= self.config.notifications.max_queued {
+                    return Err(format!(
+                        "too many restricted tasks queued (limit {})",
+                        self.config.notifications.max_queued
+                    ));
+                }
+                shared.next_id += 1;
+                let id = shared.next_id;
+                shared.bg_tasks.insert(id, Arc::clone(&token));
+                shared.restricted_queued += 1;
+                id
+            } else if effective_background {
                 if shared.bg_queued >= self.config.tasks.max_queued {
                     return Err(format!(
                         "too many background tasks queued (limit {})",
@@ -452,7 +471,11 @@ impl Handle {
                 && ask.background
             {
                 shared.bg_tasks.remove(&ask.id);
-                shared.bg_queued = shared.bg_queued.saturating_sub(1);
+                if ask.is_restricted_bg() {
+                    shared.restricted_queued = shared.restricted_queued.saturating_sub(1);
+                } else {
+                    shared.bg_queued = shared.bg_queued.saturating_sub(1);
+                }
                 if shared.last_auto_bg == Some(ask.id) {
                     shared.last_auto_bg = None;
                 }
@@ -655,6 +678,7 @@ pub fn spawn_with_deps(
         bg_tasks: HashMap::new(),
         bg_running: 0,
         bg_queued: 0,
+        restricted_queued: 0,
         agent: AgentState::Down,
         running: None,
         follow_up_until: None,
@@ -695,6 +719,8 @@ pub fn spawn_with_deps(
         fg_pending: None,
         bg_active: HashSet::new(),
         bg_queue: VecDeque::new(),
+        restricted_active: HashSet::new(),
+        restricted_queue: VecDeque::new(),
         failures: 0,
         restart_at: None,
         next_memory_check: None,
@@ -785,6 +811,8 @@ struct Conductor {
     fg_pending: Option<Ask>,
     bg_active: HashSet<u64>,
     bg_queue: VecDeque<Ask>,
+    restricted_active: HashSet<u64>,
+    restricted_queue: VecDeque<Ask>,
     /// Agent deaths in a row, for the restart back-off.
     failures: u32,
     restart_at: Option<Instant>,
@@ -1322,6 +1350,7 @@ impl Conductor {
                         && self.live.is_none()
                         && self.fg_pending.is_none()
                         && self.bg_queue.is_empty()
+                        && self.restricted_queue.is_empty()
                     {
                         tokio::select! {
                             () = self.start_warm() => {}
@@ -1429,6 +1458,16 @@ impl Conductor {
                 Vec::new(),
             );
         }
+        while let Some(ask) = self.restricted_queue.pop_front() {
+            let profile = self.effective_display_profile(&ask);
+            self.finish_request(
+                ask,
+                cancelled(FailReason::AgentDown),
+                profile,
+                true,
+                Vec::new(),
+            );
+        }
         while let Some(ask) = self.bg_queue.pop_front() {
             let profile = self.effective_display_profile(&ask);
             self.finish_request(
@@ -1457,11 +1496,13 @@ impl Conductor {
     }
 
     fn has_active_turns(&self) -> bool {
-        self.fg_active.is_some() || !self.bg_active.is_empty()
+        self.fg_active.is_some() || !self.bg_active.is_empty() || !self.restricted_active.is_empty()
     }
 
     fn enqueue(&mut self, ask: Ask) {
-        if ask.background {
+        if ask.is_restricted_bg() {
+            self.restricted_queue.push_back(ask);
+        } else if ask.background {
             self.bg_queue.push_back(ask);
         } else {
             if let Some(old) = self.fg_pending.replace(ask) {
@@ -1475,6 +1516,19 @@ impl Conductor {
         }
     }
 
+    fn fail_restricted_queue(&mut self, reason: FailReason, message: &str) {
+        while let Some(ask) = self.restricted_queue.pop_front() {
+            let profile = self.effective_display_profile(&ask);
+            self.finish_request(
+                ask,
+                Outcome::failed(reason, message),
+                profile,
+                true,
+                Vec::new(),
+            );
+        }
+    }
+
     fn evict_cancelled_queued(&mut self) {
         if let Some(pending) = &self.fg_pending
             && let Some(reason) = pending.token.reason()
@@ -1484,6 +1538,16 @@ impl Conductor {
             let profile = self.effective_display_profile(&ask);
             self.finish_request(ask, cancelled(reason), profile, false, Vec::new());
         }
+        let mut remaining_restricted = VecDeque::with_capacity(self.restricted_queue.len());
+        while let Some(ask) = self.restricted_queue.pop_front() {
+            if let Some(reason) = ask.token.reason() {
+                let profile = self.effective_display_profile(&ask);
+                self.finish_request(ask, cancelled(reason), profile, true, Vec::new());
+            } else {
+                remaining_restricted.push_back(ask);
+            }
+        }
+        self.restricted_queue = remaining_restricted;
         let mut remaining = VecDeque::with_capacity(self.bg_queue.len());
         while let Some(ask) = self.bg_queue.pop_front() {
             if let Some(reason) = ask.token.reason() {
@@ -1502,14 +1566,28 @@ impl Conductor {
             return;
         }
         // Finish draining a wedged or unauthenticated agent once all sibling
-        // turns have completed.
+        // turns have completed. Fail queued restricted tasks (e.g. NotifyHold)
+        // immediately so held notifications release raw instead of stalling
+        // behind a multi-minute draining turn.
         if let Some(live) = &self.live
             && (live.draining || live.auth_failed)
         {
+            let auth_failed = live.auth_failed;
+            let (reason, message) = if auth_failed {
+                (
+                    FailReason::AgentError,
+                    "The assistant requires sign-in and is restarting.",
+                )
+            } else {
+                (
+                    FailReason::AgentDown,
+                    "The assistant is draining and restarting.",
+                )
+            };
+            self.fail_restricted_queue(reason, message);
             if self.has_active_turns() {
                 return;
             }
-            let auth_failed = live.auth_failed;
             self.stop_agent().await;
             if !auth_failed {
                 self.schedule_restart_if_warm();
@@ -1522,34 +1600,22 @@ impl Conductor {
                 return;
             }
             let can_fg = self.fg_active.is_none() && self.fg_pending.is_some();
+            let can_restricted = self.restricted_active.len()
+                < self.config.notifications.max_concurrent
+                && !self.restricted_queue.is_empty();
             let can_bg = self.bg_active.len() < self.config.tasks.max_concurrent
                 && !self.bg_queue.is_empty();
-            if !can_fg && !can_bg {
+            if !can_fg && !can_restricted && !can_bg {
                 return;
             }
 
             if self.live.is_none() && !self.ensure_keyring_ready().await {
                 // Fail restricted tasks (e.g. notification holds) immediately while
                 // locked; keep regular background/scheduled asks queued until unlock.
-                let mut kept = VecDeque::with_capacity(self.bg_queue.len());
-                while let Some(ask) = self.bg_queue.pop_front() {
-                    if ask.restricted {
-                        let profile = self.effective_display_profile(&ask);
-                        self.finish_request(
-                            ask,
-                            Outcome::failed(
-                                FailReason::KeyringLocked,
-                                "The login keyring is still locked.",
-                            ),
-                            profile,
-                            true,
-                            Vec::new(),
-                        );
-                    } else {
-                        kept.push_back(ask);
-                    }
-                }
-                self.bg_queue = kept;
+                self.fail_restricted_queue(
+                    FailReason::KeyringLocked,
+                    "The login keyring is still locked.",
+                );
                 if self.fg_pending.is_some() && self.fg_lock_deadline.is_none() {
                     self.fg_lock_deadline = Some(Instant::now() + KEYRING_UNLOCK_GRACE);
                 }
@@ -1560,6 +1626,12 @@ impl Conductor {
                 self.fg_lock_deadline = None;
                 let ask = self.fg_pending.take().expect("checked");
                 self.launch_ask(ask).await;
+            } else if can_restricted {
+                let ask = self.restricted_queue.pop_front().expect("checked");
+                if let Ok(mut shared) = self.shared.lock() {
+                    shared.restricted_queued = shared.restricted_queued.saturating_sub(1);
+                }
+                self.launch_ask(ask).await;
             } else if can_bg {
                 let ask = self.bg_queue.pop_front().expect("checked");
                 if let Ok(mut shared) = self.shared.lock() {
@@ -1568,12 +1640,23 @@ impl Conductor {
                 self.launch_ask(ask).await;
             }
 
-            // If a turn aborted early or drained the agent, re-evaluate loop condition.
-            if self
-                .live
-                .as_ref()
-                .is_some_and(|l| l.draining || l.auth_failed)
+            // If a turn aborted early or drained the agent, fail any remaining
+            // restricted holds immediately and wait for active turns to drain.
+            if let Some(live) = &self.live
+                && (live.draining || live.auth_failed)
             {
+                let (reason, message) = if live.auth_failed {
+                    (
+                        FailReason::AgentError,
+                        "The assistant requires sign-in and is restarting.",
+                    )
+                } else {
+                    (
+                        FailReason::AgentDown,
+                        "The assistant is draining and restarting.",
+                    )
+                };
+                self.fail_restricted_queue(reason, message);
                 return;
             }
         }
@@ -1843,7 +1926,9 @@ impl Conductor {
         let client = live.conn.client();
         let subscription = client.subscribe(&session);
 
-        if ask.background {
+        if ask.is_restricted_bg() {
+            self.restricted_active.insert(ask.id);
+        } else if ask.background {
             self.bg_active.insert(ask.id);
             if let Ok(mut shared) = self.shared.lock() {
                 shared.bg_running = self.bg_active.len();
@@ -2037,7 +2122,9 @@ impl Conductor {
             mut end,
         } = finished;
 
-        if ask.background {
+        if ask.is_restricted_bg() {
+            self.restricted_active.remove(&ask.id);
+        } else if ask.background {
             self.bg_active.remove(&ask.id);
             if let Ok(mut shared) = self.shared.lock() {
                 shared.bg_running = self.bg_active.len();
@@ -2502,7 +2589,11 @@ impl Conductor {
             if ask.background {
                 shared.bg_tasks.remove(&ask.id);
                 if was_queued_bg {
-                    shared.bg_queued = shared.bg_queued.saturating_sub(1);
+                    if ask.is_restricted_bg() {
+                        shared.restricted_queued = shared.restricted_queued.saturating_sub(1);
+                    } else {
+                        shared.bg_queued = shared.bg_queued.saturating_sub(1);
+                    }
                 }
             } else if shared
                 .running
@@ -2575,14 +2666,16 @@ impl Conductor {
     }
 
     fn effective_display_profile(&self, ask: &Ask) -> Option<String> {
-        let raw = ask.profile.as_deref().or(if ask.background {
+        let raw = ask.profile.as_deref().or(if ask.restricted {
+            self.config.notifications.profile.as_deref()
+        } else if ask.background {
             self.config.tasks.profile.as_deref()
         } else {
             None
         });
         match raw {
             Some(name) => self.display_profile_name(Some(name)),
-            None if !ask.background => {
+            None if !ask.background && !ask.restricted => {
                 if !ask.new && self.is_in_follow_up_window() {
                     let conv_prof = self
                         .conversation
@@ -2606,7 +2699,11 @@ impl Conductor {
 
     fn memory_check_deadline(&mut self) -> Option<Instant> {
         self.live.as_ref()?;
-        if self.has_active_turns() || self.fg_pending.is_some() || !self.bg_queue.is_empty() {
+        if self.has_active_turns()
+            || self.fg_pending.is_some()
+            || !self.bg_queue.is_empty()
+            || !self.restricted_queue.is_empty()
+        {
             self.next_memory_check = None;
             return None;
         }
@@ -2638,6 +2735,7 @@ impl Conductor {
             || self.has_active_turns()
             || self.fg_pending.is_some()
             || !self.bg_queue.is_empty()
+            || !self.restricted_queue.is_empty()
             || self.is_in_follow_up_window()
         {
             return;
@@ -2662,7 +2760,11 @@ impl Conductor {
     fn idle_deadline(&self) -> Option<Instant> {
         let idle = secs(self.config.agent.idle_stop_secs)?;
         self.live.as_ref()?;
-        if self.has_active_turns() || self.fg_pending.is_some() || !self.bg_queue.is_empty() {
+        if self.has_active_turns()
+            || self.fg_pending.is_some()
+            || !self.bg_queue.is_empty()
+            || !self.restricted_queue.is_empty()
+        {
             return None;
         }
         self.last_used.checked_add(idle)
@@ -4667,5 +4769,310 @@ mod tests {
         let _ = task.await;
         store.shutdown().await;
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn make_test_conductor(config: Config) -> (Conductor, mpsc::UnboundedSender<Message>) {
+        let shared = Arc::new(Mutex::new(Shared {
+            next_id: 0,
+            fg_latest: None,
+            last_auto_bg: None,
+            bg_tasks: HashMap::new(),
+            bg_running: 0,
+            bg_queued: 0,
+            restricted_queued: 0,
+            agent: AgentState::Down,
+            running: None,
+            follow_up_until: None,
+            handled: 0,
+        }));
+        let (tx, inbox) = mpsc::unbounded_channel();
+        let (done_tx, done_rx) = mpsc::unbounded_channel();
+        let conductor = Conductor {
+            policy: Arc::new(LanePolicy::standard(&config.permissions.deny)),
+            config: Arc::new(config),
+            presenter: crate::present::Recorder::new(),
+            context: Arc::new(SystemContext),
+            keyring: Arc::new(DbusKeyringWatcher),
+            keyring_locked: false,
+            fg_lock_deadline: None,
+            store: None,
+            state_dir: None,
+            shared,
+            inbox,
+            done_tx,
+            done_rx,
+            stop: Arc::new(CancelToken::default()),
+            live: None,
+            paths: None,
+            conversation: None,
+            fg_active: None,
+            fg_pending: None,
+            bg_active: HashSet::new(),
+            bg_queue: VecDeque::new(),
+            restricted_active: HashSet::new(),
+            restricted_queue: VecDeque::new(),
+            failures: 0,
+            restart_at: None,
+            next_memory_check: None,
+            last_used: Instant::now(),
+            last_death_detail: None,
+        };
+        (conductor, tx)
+    }
+
+    fn make_test_ask(
+        id: u64,
+        profile: Option<&str>,
+        background: bool,
+        restricted: bool,
+        new: bool,
+    ) -> Ask {
+        Ask {
+            id,
+            text: "test".to_string(),
+            new,
+            profile: profile.map(String::from),
+            background,
+            restricted,
+            suppress_token: None,
+            attachments: Vec::new(),
+            source: InputSource::Typed,
+            reply_to: None,
+            reply_to_root_conv_id: None,
+            auto_routed_fast: false,
+            auto_backgrounded: false,
+            pre_progress_shown: false,
+            speech_started: false,
+            captured_ambient: None,
+            escalated_once: false,
+            initial_icons: Vec::new(),
+            sink: Sink::Present,
+            token: Arc::new(CancelToken::default()),
+        }
+    }
+
+    #[test]
+    fn effective_display_profile_isolates_foreground_background_and_restricted_lanes() {
+        let mut cfg = Config::default();
+        cfg.conversation.follow_up_secs = 120.0;
+        cfg.tasks.profile = Some("deep".to_string());
+        cfg.notifications.profile = Some("lean".to_string());
+
+        let (mut conductor, _tx) = make_test_conductor(cfg);
+        conductor.conversation = Some(Conversation {
+            session: "sess-1".to_string(),
+            conversation_id: 1,
+            last_turn_id: Some(1),
+            profile_name: Some("fg-conv".to_string()),
+            model: String::new(),
+            thought_level: String::new(),
+            last: Instant::now(),
+            turns: 1,
+        });
+
+        // Foreground follow-up inherits the active conversation profile; `--new` does not.
+        let fg_followup = make_test_ask(2, None, false, false, false);
+        assert_eq!(
+            conductor.effective_display_profile(&fg_followup).as_deref(),
+            Some("fg-conv")
+        );
+        let fg_new = make_test_ask(3, None, false, false, true);
+        assert_eq!(conductor.effective_display_profile(&fg_new), None);
+        let fg_explicit = make_test_ask(4, Some("custom"), false, false, false);
+        assert_eq!(
+            conductor.effective_display_profile(&fg_explicit).as_deref(),
+            Some("custom")
+        );
+
+        // Background ask uses `tasks.profile` (or explicit profile), never foreground conversation.
+        let bg_default = make_test_ask(5, None, true, false, false);
+        assert_eq!(
+            conductor.effective_display_profile(&bg_default).as_deref(),
+            Some("deep")
+        );
+        let bg_explicit = make_test_ask(6, Some("custom"), true, false, false);
+        assert_eq!(
+            conductor.effective_display_profile(&bg_explicit).as_deref(),
+            Some("custom")
+        );
+
+        // Restricted background ask uses `notifications.profile`, NOT `tasks.profile`.
+        let restricted_bg = make_test_ask(7, None, true, true, false);
+        assert!(restricted_bg.is_restricted_bg());
+        assert_eq!(
+            conductor
+                .effective_display_profile(&restricted_bg)
+                .as_deref(),
+            Some("lean")
+        );
+
+        // Interactive restricted follow-up (`reply_to` a restricted draft: restricted=true, background=false)
+        // stays off the restricted_bg lane and uses `notifications.profile`.
+        let restricted_fg = make_test_ask(8, None, false, true, false);
+        assert!(!restricted_fg.is_restricted_bg());
+        assert_eq!(
+            conductor
+                .effective_display_profile(&restricted_fg)
+                .as_deref(),
+            Some("lean")
+        );
+
+        // When `tasks.profile = None` and `notifications.profile = None`, neither background
+        // nor restricted asks (even interactive restricted follow-ups inside an active
+        // foreground follow-up window) inherit `self.conversation`'s profile label.
+        let mut cfg_unconfigured = Config::default();
+        cfg_unconfigured.conversation.follow_up_secs = 120.0;
+        cfg_unconfigured.tasks.profile = None;
+        cfg_unconfigured.notifications.profile = None;
+        let (mut conductor_none, _tx2) = make_test_conductor(cfg_unconfigured);
+        conductor_none.conversation = Some(Conversation {
+            session: "sess-2".to_string(),
+            conversation_id: 10,
+            last_turn_id: Some(10),
+            profile_name: Some("fg-conv".to_string()),
+            model: String::new(),
+            thought_level: String::new(),
+            last: Instant::now(),
+            turns: 1,
+        });
+
+        assert_eq!(
+            conductor_none
+                .effective_display_profile(&fg_followup)
+                .as_deref(),
+            Some("fg-conv")
+        );
+        assert_eq!(conductor_none.effective_display_profile(&bg_default), None);
+        assert_eq!(
+            conductor_none.effective_display_profile(&restricted_bg),
+            None
+        );
+        assert_eq!(
+            conductor_none.effective_display_profile(&restricted_fg),
+            None
+        );
+
+        // Even if `tasks.profile` IS set while `notifications.profile = None`, restricted asks
+        // must NOT fall back to `tasks.profile` or `self.conversation`.
+        let mut cfg_tasks_only = Config::default();
+        cfg_tasks_only.conversation.follow_up_secs = 120.0;
+        cfg_tasks_only.tasks.profile = Some("deep".to_string());
+        cfg_tasks_only.notifications.profile = None;
+        let (mut conductor_tasks_only, _tx3) = make_test_conductor(cfg_tasks_only);
+        conductor_tasks_only.conversation = Some(Conversation {
+            session: "sess-3".to_string(),
+            conversation_id: 20,
+            last_turn_id: Some(20),
+            profile_name: Some("fg-conv".to_string()),
+            model: String::new(),
+            thought_level: String::new(),
+            last: Instant::now(),
+            turns: 1,
+        });
+        assert_eq!(
+            conductor_tasks_only.effective_display_profile(&restricted_bg),
+            None
+        );
+        assert_eq!(
+            conductor_tasks_only.effective_display_profile(&restricted_fg),
+            None
+        );
+    }
+
+    #[test]
+    fn restricted_queue_has_isolated_limit_and_fast_fails() {
+        let mut cfg = Config::default();
+        cfg.tasks.max_queued = 1;
+        cfg.notifications.max_queued = 2;
+
+        let (mut conductor, tx) = make_test_conductor(cfg);
+        let handle = Handle {
+            config: Arc::clone(&conductor.config),
+            presenter: Arc::clone(&conductor.presenter),
+            state_dir: None,
+            shared: Arc::clone(&conductor.shared),
+            messages: tx,
+            stop: Arc::clone(&conductor.stop),
+            store: None,
+        };
+
+        let make_params = |background: bool, restricted: bool| AskParams {
+            text: "hello".to_string(),
+            new: true,
+            profile: None,
+            background,
+            restricted,
+            suppress_token: None,
+            attachments: Vec::new(),
+            source: InputSource::Cli,
+            reply_to: None,
+            distill: false,
+            schedule_id: None,
+            schedule_has_script: false,
+            initial_icons: Vec::new(),
+        };
+
+        // Saturate regular background queue (limit 1).
+        let bg_id = handle.ask(make_params(true, false), Sink::Present).unwrap();
+        assert!(handle.ask(make_params(true, false), Sink::Present).is_err());
+
+        // Restricted background tasks use their own queue limit (2) independently.
+        let (r1_tx, mut r1_rx) = oneshot::channel();
+        let (r2_tx, mut r2_rx) = oneshot::channel();
+        let r1_id = handle
+            .ask(make_params(true, true), Sink::Client(r1_tx))
+            .unwrap();
+        let r2_id = handle
+            .ask(make_params(true, true), Sink::Client(r2_tx))
+            .unwrap();
+        let r3_err = handle
+            .ask(make_params(true, true), Sink::Present)
+            .unwrap_err();
+        assert!(
+            r3_err.contains("too many restricted tasks queued (limit 2)"),
+            "{r3_err}"
+        );
+
+        // Both restricted tasks are tracked in `bg_tasks` so cancellation by ID works.
+        assert_eq!(
+            handle.cancel(Some(r1_id), FailReason::Cancelled),
+            Some(r1_id)
+        );
+
+        // Enqueue inbox items into conductor queues and verify routing + eviction + fast-fail.
+        while let Ok(Message::Ask(ask)) = conductor.inbox.try_recv() {
+            conductor.enqueue(*ask);
+        }
+        assert_eq!(conductor.bg_queue.len(), 1);
+        assert_eq!(conductor.bg_queue[0].id, bg_id);
+        assert_eq!(conductor.restricted_queue.len(), 2);
+
+        conductor.evict_cancelled_queued();
+        assert_eq!(conductor.restricted_queue.len(), 1);
+        assert_eq!(conductor.restricted_queue[0].id, r2_id);
+        assert!(matches!(
+            r1_rx.try_recv(),
+            Ok(Reply::Failed {
+                reason: FailReason::Cancelled,
+                ..
+            })
+        ));
+
+        conductor.fail_restricted_queue(FailReason::AgentDown, "draining");
+        assert!(conductor.restricted_queue.is_empty());
+        assert_eq!(conductor.bg_queue.len(), 1);
+        assert!(matches!(
+            r2_rx.try_recv(),
+            Ok(Reply::Failed {
+                reason: FailReason::AgentDown,
+                ..
+            })
+        ));
+        let shared = conductor.shared.lock().unwrap();
+        assert_eq!(shared.restricted_queued, 0);
+        assert_eq!(shared.bg_queued, 1);
+        assert!(shared.bg_tasks.contains_key(&bg_id));
+        assert!(!shared.bg_tasks.contains_key(&r1_id));
+        assert!(!shared.bg_tasks.contains_key(&r2_id));
     }
 }

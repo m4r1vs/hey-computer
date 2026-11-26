@@ -663,6 +663,18 @@ in {
         description = "Optional profile name for restricted notification drafting turns.";
       };
 
+      maxConcurrent = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        description = "Maximum concurrent restricted notification drafting turns (1..=32, default 4).";
+      };
+
+      maxQueued = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        description = "Maximum queued restricted notification drafting turns (1..=256, default 16).";
+      };
+
       maxHoldSecs = mkOption {
         type = types.number;
         default = 60;
@@ -876,6 +888,8 @@ in {
       notifications = mkIf cfg.notifications.enable {
         enabled = mkDefault true;
         profile = mkIf (cfg.notifications.profile != null) (mkDefault cfg.notifications.profile);
+        max_concurrent = mkIf (cfg.notifications.maxConcurrent != null) (mkDefault cfg.notifications.maxConcurrent);
+        max_queued = mkIf (cfg.notifications.maxQueued != null) (mkDefault cfg.notifications.maxQueued);
         max_hold_secs = mkDefault cfg.notifications.maxHoldSecs;
         max_turn_secs = mkDefault cfg.notifications.maxTurnSecs;
         max_tool_calls = mkDefault cfg.notifications.maxToolCalls;

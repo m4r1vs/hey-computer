@@ -26,6 +26,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_max_concurrent() -> usize {
+    4
+}
+
+fn default_max_queued() -> usize {
+    16
+}
+
 fn is_empty_path(path: &Path) -> bool {
     path.as_os_str().is_empty()
 }
@@ -39,6 +47,12 @@ pub struct NotificationsConfig {
     /// Optional profile name for restricted drafting turns (defaults to fast/base).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Maximum restricted notification drafting turns running concurrently.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+    /// Maximum restricted notification drafting turns waiting in the FIFO queue.
+    #[serde(default = "default_max_queued")]
+    pub max_queued: usize,
     /// Maximum time SwayNC holds a matched notification waiting for enrichment (seconds).
     pub max_hold_secs: f64,
     /// Hard wall-clock cap per restricted drafting turn (seconds).
@@ -87,6 +101,8 @@ impl Default for NotificationsConfig {
         Self {
             enabled: false,
             profile: None,
+            max_concurrent: default_max_concurrent(),
+            max_queued: default_max_queued(),
             max_hold_secs: 60.0,
             max_turn_secs: 45.0,
             max_tool_calls: 0,
@@ -109,6 +125,18 @@ impl Default for NotificationsConfig {
 impl NotificationsConfig {
     /// Validate numeric bounds, quiet-hours syntax, and private file paths.
     pub fn validate(&self) -> Result<()> {
+        if !(1..=32).contains(&self.max_concurrent) {
+            bail!(
+                "notifications.max_concurrent must be between 1 and 32 (got {})",
+                self.max_concurrent
+            );
+        }
+        if !(1..=256).contains(&self.max_queued) {
+            bail!(
+                "notifications.max_queued must be between 1 and 256 (got {})",
+                self.max_queued
+            );
+        }
         check_range(
             "notifications.max_hold_secs",
             self.max_hold_secs,
@@ -2346,7 +2374,57 @@ mod tests {
 
     #[test]
     fn notifications_config_validation_catches_invalid_values() {
-        assert!(NotificationsConfig::default().validate().is_ok());
+        let defaults = NotificationsConfig::default();
+        assert_eq!(defaults.max_concurrent, 4);
+        assert_eq!(defaults.max_queued, 16);
+        assert!(defaults.validate().is_ok());
+
+        let parsed: NotificationsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.max_concurrent, 4);
+        assert_eq!(parsed.max_queued, 16);
+        assert!(parsed.validate().is_ok());
+
+        for bad_concurrent in [0, 33] {
+            let cfg = NotificationsConfig {
+                max_concurrent: bad_concurrent,
+                ..NotificationsConfig::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "expected max_concurrent={bad_concurrent} to fail validation"
+            );
+        }
+        for ok_concurrent in [1, 32] {
+            let cfg = NotificationsConfig {
+                max_concurrent: ok_concurrent,
+                ..NotificationsConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "expected max_concurrent={ok_concurrent} to pass validation"
+            );
+        }
+
+        for bad_queued in [0, 257] {
+            let cfg = NotificationsConfig {
+                max_queued: bad_queued,
+                ..NotificationsConfig::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "expected max_queued={bad_queued} to fail validation"
+            );
+        }
+        for ok_queued in [1, 256] {
+            let cfg = NotificationsConfig {
+                max_queued: ok_queued,
+                ..NotificationsConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "expected max_queued={ok_queued} to pass validation"
+            );
+        }
 
         let mut bad_quiet = NotificationsConfig {
             quiet_start: "22:00".to_string(),

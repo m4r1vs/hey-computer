@@ -122,6 +122,8 @@
     notifications = {
       enable = true;
       profile = "lean";
+      maxConcurrent = 4;
+      maxQueued = 16;
       maxHoldSecs = 60;
       maxTurnSecs = 45;
       maxToolCalls = 0;
@@ -214,6 +216,8 @@
   "mcp.servers.<name>.{icon,toolIcons} forward into settings.mcp";
   assert lib.assertMsg ((settingsOf full).notifications.enabled == true)
   "notifications.enable forwards to settings.notifications";
+  assert lib.assertMsg ((settingsOf full).notifications.max_concurrent == 4 && (settingsOf full).notifications.max_queued == 16)
+  "notifications.maxConcurrent and maxQueued forward to settings.notifications";
   assert lib.assertMsg ((settingsOf full).messenger.enabled == true)
   "messengerBridge.enable forwards to settings.messenger";
   assert lib.assertMsg (

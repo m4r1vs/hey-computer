@@ -55,6 +55,8 @@ const HOLD_DEDUPE_WINDOW: Duration = Duration::from_secs(30);
 const MAX_RECENT_HOLDS: usize = 64;
 /// Minimum interval between repeated `AuthRequired` desktop alerts per platform.
 const AUTH_ALERT_COOLDOWN: Duration = Duration::from_secs(3600);
+/// Maximum characters shown in the queued background self-chat notice preview.
+const SELF_CHAT_PREVIEW_CHARS: usize = 160;
 
 #[derive(Debug, Clone)]
 struct RecentHold {
@@ -471,6 +473,7 @@ async fn handle_event(
             if !config.messenger.self_chat_enabled {
                 return;
             }
+            let body = compose_dm_body(&text, quoted_text.as_deref(), media_placeholder.as_deref());
             let prompt = format_self_chat_prompt(
                 platform,
                 &text,
@@ -481,6 +484,8 @@ async fn handle_event(
                 return;
             }
             let background = config.messenger.self_chat_lane == SelfChatLane::Background;
+            let bg_saturated =
+                background && conductor.status().background_running >= config.tasks.max_concurrent;
             let initial_icons = IconResolver::from_config(config, None)
                 .command_icon(match platform {
                     Platform::Whatsapp => "whatsapp",
@@ -506,9 +511,19 @@ async fn handle_event(
                 initial_icons,
             };
             match conductor.ask(params, Sink::Present) {
-                Ok(id) => tracing::info!(
-                    "queued verified {platform} self-chat turn #{id} (background={background})"
-                ),
+                Ok(id) => {
+                    if bg_saturated {
+                        presenter.present(Presentation::Notice {
+                            summary: "Working in the background".to_string(),
+                            body: preview_text(&body, SELF_CHAT_PREVIEW_CHARS),
+                            urgency: Urgency::Low,
+                            replaces_id: None,
+                        });
+                    }
+                    tracing::info!(
+                        "queued verified {platform} self-chat turn #{id} (background={background})"
+                    );
+                }
                 Err(msg) => tracing::warn!("rejected {platform} self-chat turn: {msg}"),
             }
         }
@@ -731,4 +746,27 @@ fn format_self_chat_prompt(
     format!(
         "[From phone self-chat via {platform} — respond on desktop only; never attempt to send messages over {platform}]\n{body}"
     )
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_text_collapses_whitespace_and_truncates() {
+        assert_eq!(preview_text("  hello \n\t world  ", 20), "hello world");
+        assert_eq!(preview_text("abcdef", 4), "abcd…");
+        assert_eq!(preview_text("abcd", 4), "abcd");
+    }
 }
