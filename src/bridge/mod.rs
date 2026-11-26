@@ -9,6 +9,8 @@ pub mod config;
 pub mod context;
 pub mod protocol;
 pub mod signal;
+pub mod signal_desktop;
+pub mod store;
 pub mod whatsapp;
 
 use std::future::Future;

@@ -80,6 +80,9 @@
           pkgs.sqlite
           pkgs.webkitgtk_6_0
         ];
+        nativeCheckInputs = [
+          pkgs.sqlcipher
+        ];
 
         # Wrap `hey-computer-viewer` with GApps/WebKitGTK environment variables
         # while keeping `hey-computer` (the daemon & CLI) free of GUI wrapper
@@ -174,7 +177,7 @@
 
         postFixup = ''
           wrapProgram $out/bin/hey-computer-bridge \
-            --prefix PATH : "${pkgs.lib.makeBinPath [baileysReader pkgs.signal-cli pkgs.qrencode]}"
+            --prefix PATH : "${pkgs.lib.makeBinPath [baileysReader pkgs.signal-cli pkgs.qrencode pkgs.sqlcipher]}"
         '';
 
         meta = with pkgs.lib; {
@@ -263,6 +266,7 @@
             alejandra
             jq
             socat
+            sqlcipher
           ]
           ++ (runtimeTools pkgs);
 

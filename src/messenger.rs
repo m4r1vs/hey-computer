@@ -672,6 +672,7 @@ async fn handle_event(
         | BridgeEvent::Status { .. }
         | BridgeEvent::Context { .. }
         | BridgeEvent::Error { .. } => {}
+        _ => {}
     }
 }
 

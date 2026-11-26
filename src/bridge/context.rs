@@ -1,10 +1,11 @@
-//! Bounded LRU rolling conversation context cache, burst debouncing, age
-//! fencing, and the read-only Unix socket broadcast server.
+//! Persistent SQLite-backed + bounded LRU conversation context core, burst
+//! debouncing, age fencing, Signal Desktop background importer, and the
+//! read-only Unix socket broadcast & query server.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -18,16 +19,21 @@ use crate::bridge::protocol::{
     self, BridgeEvent, BridgeRequest, ContextAuthor, ContextMessage, MAX_BRIDGE_LINE, MessageKind,
     PROTOCOL_VERSION, Platform, PlatformState,
 };
+use crate::bridge::signal_desktop;
+use crate::bridge::store::{BridgeStore, ChatMetaRecord, StoredMessageInput};
+use crate::bridge::whatsapp::WhatsappControl;
 use crate::lines::{self, Line};
 
 /// Maximum UTF-8 bytes stored per context message in the in-memory ring buffer.
 const MAX_CONTEXT_TEXT_BYTES: usize = 2048;
 /// Bounded deduplication set size so reconnect replays never double-emit.
-const MAX_SEEN_IDS: usize = 512;
+const MAX_SEEN_IDS: usize = 2048;
 /// Client handshake read timeout.
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Broadcast channel capacity for live subscribers.
 const BROADCAST_CAPACITY: usize = 256;
+/// Periodic Signal Desktop incremental sync interval.
+const SIGNAL_DESKTOP_SYNC_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// Normalized message emitted internally by the WhatsApp or Signal adapter.
 #[derive(Debug, Clone)]
@@ -36,6 +42,8 @@ pub struct InboundRawMessage {
     pub platform: Platform,
     pub chat_id: String,
     pub chat_aliases: Vec<String>,
+    pub raw_jid: Option<String>,
+    pub chat_title: Option<String>,
     pub sender_id: String,
     pub sender_aliases: Vec<String>,
     pub sender_name: String,
@@ -62,7 +70,13 @@ pub enum RawAdapterEvent {
         aliases: Vec<String>,
         display_name: Option<String>,
     },
-    Message(InboundRawMessage),
+    ChatMetaBatch(Vec<ChatMetaRecord>),
+    HistoryBatch {
+        platform: Platform,
+        progress: Option<u8>,
+        messages: Vec<InboundRawMessage>,
+    },
+    Message(Box<InboundRawMessage>),
 }
 
 #[derive(Debug)]
@@ -73,6 +87,37 @@ enum CoreQuery {
         platform: Option<Platform>,
         sender_or_chat: String,
         limit: Option<usize>,
+        reply: oneshot::Sender<BridgeEvent>,
+    },
+    ListChats {
+        platform: Option<Platform>,
+        include_groups: bool,
+        include_dms: bool,
+        limit: Option<usize>,
+        reply: oneshot::Sender<BridgeEvent>,
+    },
+    GetMessages {
+        platform: Option<Platform>,
+        chat: String,
+        before_ms: Option<i64>,
+        after_ms: Option<i64>,
+        limit: Option<usize>,
+        reply: oneshot::Sender<BridgeEvent>,
+    },
+    Search {
+        query: String,
+        platform: Option<Platform>,
+        chat: Option<String>,
+        limit: Option<usize>,
+        reply: oneshot::Sender<BridgeEvent>,
+    },
+    FetchHistory {
+        platform: Platform,
+        chat: String,
+        count: Option<usize>,
+        reply: oneshot::Sender<BridgeEvent>,
+    },
+    SyncSignalDesktop {
         reply: oneshot::Sender<BridgeEvent>,
     },
 }
@@ -178,7 +223,7 @@ impl ContextCache {
     }
 
     /// Look up recent messages by canonical chat ID, alias (phone/LID/UUID), or
-    /// contact display name (case-insensitive exact match, then substring).
+    /// chat/contact display name (case-insensitive exact match, then substring).
     pub fn lookup(
         &self,
         platform: Option<Platform>,
@@ -190,7 +235,7 @@ impl ContextCache {
             return None;
         }
         let norm_query = normalize_identifier(query);
-        let lower_query = query.to_ascii_lowercase();
+        let lower_query = query.to_lowercase();
 
         let mut best: Option<(u8, u64, Platform, &ChatEntry)> = None;
         for ((plat, key), entry) in &self.chats {
@@ -204,13 +249,13 @@ impl ContextCache {
             } else if entry
                 .display_names
                 .iter()
-                .any(|n| n.eq_ignore_ascii_case(query))
+                .any(|n| n.to_lowercase() == lower_query)
             {
                 2u8
             } else if entry
                 .display_names
                 .iter()
-                .any(|n| n.to_ascii_lowercase().contains(&lower_query))
+                .any(|n| n.to_lowercase().contains(&lower_query))
             {
                 1u8
             } else {
@@ -295,10 +340,14 @@ struct PendingBurst {
 
 struct BridgeCore {
     config: BridgeConfig,
+    db_path: PathBuf,
+    store: BridgeStore,
     whatsapp_allow: Allowlist,
     signal_allow: Allowlist,
     whatsapp_state: PlatformState,
     whatsapp_detail: Option<String>,
+    whatsapp_sync_progress: Option<u8>,
+    whatsapp_ctrl_tx: Option<mpsc::Sender<WhatsappControl>>,
     signal_state: PlatformState,
     signal_detail: Option<String>,
     context: ContextCache,
@@ -308,7 +357,14 @@ struct BridgeCore {
 }
 
 impl BridgeCore {
-    fn new(config: BridgeConfig) -> Result<Self> {
+    fn new(
+        config: BridgeConfig,
+        whatsapp_ctrl_tx: Option<mpsc::Sender<WhatsappControl>>,
+    ) -> Result<Self> {
+        let state_dir = config.resolved_state_dir()?;
+        let db_path = state_dir.join("history.db");
+        let store = BridgeStore::open(&db_path)?;
+
         let whatsapp_allow = Allowlist::load(
             &config.whatsapp.allow_from,
             config.whatsapp.allow_from_file.as_deref(),
@@ -337,10 +393,14 @@ impl BridgeCore {
         let context = ContextCache::new(config.max_tracked_chats, config.context_messages);
         Ok(Self {
             config,
+            db_path,
+            store,
             whatsapp_allow,
             signal_allow,
             whatsapp_state,
             whatsapp_detail: None,
+            whatsapp_sync_progress: None,
+            whatsapp_ctrl_tx,
             signal_state,
             signal_detail: None,
             context,
@@ -360,6 +420,7 @@ impl BridgeCore {
     }
 
     fn status_event(&self) -> BridgeEvent {
+        let (stored_chats, stored_messages) = self.store.counts().unwrap_or((0, 0));
         BridgeEvent::Status {
             version: PROTOCOL_VERSION,
             read_only: true,
@@ -368,6 +429,9 @@ impl BridgeCore {
             whatsapp_detail: self.whatsapp_detail.clone(),
             signal_detail: self.signal_detail.clone(),
             tracked_chats: self.context.len(),
+            stored_chats,
+            stored_messages,
+            whatsapp_sync_progress: self.whatsapp_sync_progress,
         }
     }
 
@@ -377,6 +441,21 @@ impl BridgeCore {
         sender_or_chat: &str,
         limit: Option<usize>,
     ) -> BridgeEvent {
+        let lim = limit.unwrap_or(self.config.context_messages).clamp(1, 100);
+        if let Ok((Some(chat), rows)) =
+            self.store
+                .get_messages(platform, sender_or_chat, None, None, lim)
+            && !rows.is_empty()
+        {
+            let messages = rows.iter().map(stored_to_context_message).collect();
+            return BridgeEvent::Context {
+                platform: Some(chat.platform),
+                chat_id: Some(chat.chat_id),
+                sender_name: (!chat.title.is_empty()).then_some(chat.title),
+                messages,
+            };
+        }
+
         match self.context.lookup(platform, sender_or_chat, limit) {
             Some((plat, chat_id, sender_name, messages)) => BridgeEvent::Context {
                 platform: Some(plat),
@@ -391,6 +470,20 @@ impl BridgeCore {
                 messages: Vec::new(),
             },
         }
+    }
+
+    fn recent_for_chat(&self, platform: Platform, canonical_chat: &str) -> Vec<ContextMessage> {
+        if let Ok((_, rows)) = self.store.get_messages(
+            Some(platform),
+            canonical_chat,
+            None,
+            None,
+            self.config.context_messages,
+        ) && !rows.is_empty()
+        {
+            return rows.iter().map(stored_to_context_message).collect();
+        }
+        self.context.recent(platform, canonical_chat)
     }
 
     fn handle_raw_event(
@@ -438,9 +531,80 @@ impl BridgeCore {
             } => {
                 self.context
                     .record_contact(platform, &chat_id, &aliases, display_name.as_deref());
+                if let Err(e) = self.store.upsert_chat_meta(&ChatMetaRecord {
+                    platform,
+                    chat_id,
+                    aliases,
+                    is_group: false,
+                    is_self_chat: false,
+                    title: display_name,
+                    raw_jid: None,
+                }) {
+                    tracing::warn!("failed persisting contact alias: {e:#}");
+                }
                 Vec::new()
             }
-            RawAdapterEvent::Message(msg) => self.handle_message(msg, now_instant, now_ms),
+            RawAdapterEvent::ChatMetaBatch(items) => {
+                let filtered: Vec<ChatMetaRecord> = items
+                    .into_iter()
+                    .filter(|m| !m.is_group || self.groups_enabled_for(m.platform))
+                    .collect();
+                for m in &filtered {
+                    self.context.record_contact(
+                        m.platform,
+                        &m.chat_id,
+                        &m.aliases,
+                        m.title.as_deref(),
+                    );
+                }
+                if let Err(e) = self.store.upsert_chat_meta_batch(&filtered) {
+                    tracing::warn!("failed persisting chat_meta_batch: {e:#}");
+                }
+                Vec::new()
+            }
+            RawAdapterEvent::HistoryBatch {
+                platform,
+                progress,
+                messages,
+            } => {
+                if platform == Platform::Whatsapp
+                    && let Some(p) = progress
+                {
+                    self.whatsapp_sync_progress =
+                        Some(self.whatsapp_sync_progress.map_or(p, |prev| prev.max(p)));
+                }
+                let batch_inputs: Vec<StoredMessageInput> = messages
+                    .iter()
+                    .filter(|m| !m.is_group || self.groups_enabled_for(m.platform))
+                    .map(raw_to_store_input)
+                    .collect();
+                if !batch_inputs.is_empty() {
+                    match self
+                        .store
+                        .upsert_messages_batch(&batch_inputs, self.config.max_stored_messages)
+                    {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(
+                                %platform,
+                                imported = n,
+                                progress = ?self.whatsapp_sync_progress,
+                                "indexed messenger history batch"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("failed indexing history_batch: {e:#}"),
+                    }
+                }
+                Vec::new()
+            }
+            RawAdapterEvent::Message(msg) => self.handle_message(*msg, now_instant, now_ms),
+        }
+    }
+
+    fn groups_enabled_for(&self, platform: Platform) -> bool {
+        match platform {
+            Platform::Whatsapp => self.config.whatsapp.groups_enabled,
+            Platform::Signal => self.config.signal.groups_enabled,
         }
     }
 
@@ -459,6 +623,63 @@ impl BridgeCore {
         false
     }
 
+    fn persist_live_message(&mut self, msg: &InboundRawMessage, canonical_chat: &str) {
+        let store_input = raw_to_store_input(msg);
+        if let Err(e) = self
+            .store
+            .upsert_messages_batch(&[store_input], self.config.max_stored_messages)
+        {
+            tracing::warn!("failed persisting live message into history.db: {e:#}");
+        }
+
+        // Keep the bounded RAM cache synchronized as well (strictly separating
+        // group chat_title from group member sender_name).
+        if !msg.is_self_chat {
+            let body = effective_text(&msg.text, msg.media_placeholder.as_deref());
+            if !body.is_empty() {
+                let chat_display_name: Option<&str> = if msg.is_group {
+                    msg.chat_title.as_deref()
+                } else {
+                    msg.chat_title.as_deref().or_else(|| {
+                        if !msg.sender_name.trim().is_empty() {
+                            Some(msg.sender_name.trim())
+                        } else {
+                            None
+                        }
+                    })
+                };
+                let author = if msg.from_me {
+                    ContextAuthor::Me
+                } else {
+                    ContextAuthor::Them
+                };
+                let speaker = if msg.from_me {
+                    "Me".to_string()
+                } else if msg.sender_name.trim().is_empty() {
+                    normalize_identifier(&msg.sender_id)
+                } else {
+                    msg.sender_name.trim().to_string()
+                };
+                let mut aliases = msg.chat_aliases.clone();
+                if !msg.is_group && !msg.from_me {
+                    aliases.extend(msg.sender_aliases.iter().cloned());
+                }
+                self.context.push_message(
+                    msg.platform,
+                    canonical_chat,
+                    &aliases,
+                    chat_display_name,
+                    ContextMessage {
+                        author,
+                        sender_name: speaker,
+                        timestamp_ms: msg.timestamp_ms,
+                        text: body,
+                    },
+                );
+            }
+        }
+    }
+
     fn handle_message(
         &mut self,
         msg: InboundRawMessage,
@@ -470,17 +691,21 @@ impl BridgeCore {
             return Vec::new();
         }
 
-        let groups_enabled = match msg.platform {
-            Platform::Whatsapp => self.config.whatsapp.groups_enabled,
-            Platform::Signal => self.config.signal.groups_enabled,
-        };
-        if msg.is_group && !groups_enabled {
+        if msg.is_group && !self.groups_enabled_for(msg.platform) {
             return Vec::new();
         }
 
         let canonical_chat = normalize_identifier(&msg.chat_id);
         let max_age_ms = (self.config.max_message_age_secs as i64).saturating_mul(1000);
         let is_stale = now_ms.saturating_sub(msg.timestamp_ms) > max_age_ms;
+
+        // CRITICAL INDEXING SPLIT:
+        // Index every valid DM, self-chat, and enabled group message into
+        // `history.db` + `ContextCache` BEFORE allowlist / staleness gating so
+        // `hey-computer-bridge chats|groups|messages|search` has complete history,
+        // while live `BridgeEvent::Message` broadcast triggers remain strictly
+        // gated by `is_stale` and `allowlist`.
+        self.persist_live_message(&msg, &canonical_chat);
 
         // 1. Verified Phone Self-Chat
         if msg.from_me && msg.is_self_chat {
@@ -510,28 +735,9 @@ impl BridgeCore {
             return Vec::new();
         }
 
-        // 2. Outbound message sent by the user to another contact (e.g. from phone)
+        // 2. Outbound message sent by the user to another contact or group (e.g. from phone)
         if msg.from_me && !msg.is_self_chat {
-            let body = effective_text(&msg.text, msg.media_placeholder.as_deref());
-            if !body.is_empty() {
-                self.context.push_message(
-                    msg.platform,
-                    &canonical_chat,
-                    &msg.chat_aliases,
-                    if msg.sender_name.is_empty() {
-                        None
-                    } else {
-                        Some(msg.sender_name.as_str())
-                    },
-                    ContextMessage {
-                        author: ContextAuthor::Me,
-                        sender_name: "Me".to_string(),
-                        timestamp_ms: msg.timestamp_ms,
-                        text: body,
-                    },
-                );
-            }
-            // User answered the contact directly: cancel any pending inbound DM burst.
+            // User answered the chat directly: cancel any pending inbound burst.
             self.pending.remove(&(msg.platform, canonical_chat.clone()));
 
             if is_stale {
@@ -545,7 +751,7 @@ impl BridgeCore {
             }];
         }
 
-        // 3. Inbound message from another contact (DM or enabled group)
+        // 3. Inbound message from another contact (DM or enabled group): gate live triggers by allowlist + age fence.
         let allowlist = match msg.platform {
             Platform::Whatsapp => &self.whatsapp_allow,
             Platform::Signal => &self.signal_allow,
@@ -553,6 +759,9 @@ impl BridgeCore {
         let mut candidates: Vec<&str> = Vec::new();
         candidates.push(msg.chat_id.as_str());
         candidates.push(msg.sender_id.as_str());
+        if let Some(title) = msg.chat_title.as_deref() {
+            candidates.push(title);
+        }
         for a in &msg.chat_aliases {
             candidates.push(a.as_str());
         }
@@ -560,38 +769,17 @@ impl BridgeCore {
             candidates.push(a.as_str());
         }
         if !allowlist.matches_any(candidates) {
-            tracing::debug!(platform = %msg.platform, "ignoring non-allowlisted inbound message");
+            tracing::debug!(
+                platform = %msg.platform,
+                "indexed inbound message; skipping live broadcast (not on allowlist)"
+            );
             return Vec::new();
         }
 
-        let display_name = if msg.sender_name.trim().is_empty() {
-            canonical_chat.clone()
-        } else {
-            msg.sender_name.trim().to_string()
-        };
-        let body = effective_text(&msg.text, msg.media_placeholder.as_deref());
-        if !body.is_empty() {
-            let mut aliases = msg.chat_aliases.clone();
-            aliases.extend(msg.sender_aliases.iter().cloned());
-            self.context.push_message(
-                msg.platform,
-                &canonical_chat,
-                &aliases,
-                Some(display_name.as_str()),
-                ContextMessage {
-                    author: ContextAuthor::Them,
-                    sender_name: display_name.clone(),
-                    timestamp_ms: msg.timestamp_ms,
-                    text: body,
-                },
-            );
-        }
-
-        // Historical catch-ups populate the rolling context buffer without firing triggers.
         if is_stale {
             tracing::debug!(
                 platform = %msg.platform,
-                "age-fenced historical inbound message (buffered for context only)"
+                "age-fenced historical inbound message (indexed for context/history only)"
             );
             return Vec::new();
         }
@@ -672,7 +860,7 @@ impl BridgeCore {
                 let text = burst.texts.join("\n");
                 let recent_messages = match burst.kind {
                     MessageKind::SelfChat => Vec::new(),
-                    _ => self.context.recent(platform, &canonical_chat),
+                    _ => self.recent_for_chat(platform, &canonical_chat),
                 };
                 let sender_id = normalize_identifier(&burst.latest.sender_id);
                 let sender_name = if burst.latest.sender_name.trim().is_empty() {
@@ -707,6 +895,198 @@ impl BridgeCore {
         }
         out
     }
+
+    fn handle_list_chats(
+        &self,
+        platform: Option<Platform>,
+        include_groups: bool,
+        include_dms: bool,
+        limit: Option<usize>,
+    ) -> BridgeEvent {
+        let lim = limit.unwrap_or(50).clamp(1, 5_000);
+        match self
+            .store
+            .list_chats(platform, include_groups, include_dms, lim)
+        {
+            Ok(chats) => BridgeEvent::Chats { chats },
+            Err(e) => BridgeEvent::Error {
+                message: format!("list_chats failed: {e}"),
+            },
+        }
+    }
+
+    fn handle_get_messages(
+        &self,
+        platform: Option<Platform>,
+        chat: &str,
+        before_ms: Option<i64>,
+        after_ms: Option<i64>,
+        limit: Option<usize>,
+    ) -> BridgeEvent {
+        let lim = limit.unwrap_or(50).clamp(1, 5_000);
+        match self
+            .store
+            .get_messages(platform, chat, before_ms, after_ms, lim)
+        {
+            Ok((chat_summary, messages)) => BridgeEvent::Messages {
+                chat: chat_summary,
+                messages,
+            },
+            Err(e) => BridgeEvent::Error {
+                message: format!("get_messages failed: {e}"),
+            },
+        }
+    }
+
+    fn handle_search(
+        &self,
+        query: &str,
+        platform: Option<Platform>,
+        chat: Option<&str>,
+        limit: Option<usize>,
+    ) -> BridgeEvent {
+        let lim = limit.unwrap_or(30).clamp(1, 1_000);
+        match self.store.search_messages(query, platform, chat, lim) {
+            Ok(hits) => BridgeEvent::SearchResults { hits },
+            Err(e) => BridgeEvent::Error {
+                message: format!("search failed: {e}"),
+            },
+        }
+    }
+
+    fn handle_fetch_history(
+        &self,
+        platform: Platform,
+        chat: &str,
+        count: Option<usize>,
+    ) -> BridgeEvent {
+        if platform != Platform::Whatsapp {
+            return BridgeEvent::Error {
+                message: "fetch_history is only supported for whatsapp (use sync_signal_desktop for signal)"
+                    .to_string(),
+            };
+        }
+        let Some(ctrl_tx) = &self.whatsapp_ctrl_tx else {
+            return BridgeEvent::Error {
+                message: "whatsapp adapter is disabled".to_string(),
+            };
+        };
+        if self.whatsapp_state != PlatformState::Connected {
+            return BridgeEvent::Error {
+                message: format!("whatsapp is currently {}", self.whatsapp_state),
+            };
+        }
+        let cursor = match self.store.oldest_cursor(Platform::Whatsapp, chat) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return BridgeEvent::Error {
+                    message: format!("no stored WhatsApp message cursor found for '{chat}'"),
+                };
+            }
+            Err(e) => {
+                return BridgeEvent::Error {
+                    message: format!("lookup cursor failed: {e}"),
+                };
+            }
+        };
+        let clamped_count = count.unwrap_or(50).clamp(1, 200);
+        match ctrl_tx.try_send(WhatsappControl::FetchHistory {
+            chat_jid: cursor.raw_jid,
+            oldest_msg_id: cursor.oldest_msg_id,
+            oldest_from_me: cursor.oldest_msg_from_me,
+            oldest_ts_ms: cursor.oldest_msg_ts_ms,
+            count: clamped_count,
+        }) {
+            Ok(()) => BridgeEvent::HistoryRequested {
+                chat_id: cursor.chat_id,
+                count: clamped_count,
+            },
+            Err(_) => BridgeEvent::Error {
+                message: "whatsapp control channel is busy or closed".to_string(),
+            },
+        }
+    }
+}
+
+fn raw_to_store_input(msg: &InboundRawMessage) -> StoredMessageInput {
+    StoredMessageInput {
+        platform: msg.platform,
+        chat_id: msg.chat_id.clone(),
+        chat_aliases: msg.chat_aliases.clone(),
+        raw_jid: msg.raw_jid.clone(),
+        msg_id: msg.id.clone(),
+        timestamp_ms: msg.timestamp_ms,
+        from_me: msg.from_me,
+        is_group: msg.is_group,
+        is_self_chat: msg.is_self_chat,
+        chat_title: msg.chat_title.clone(),
+        sender_id: msg.sender_id.clone(),
+        sender_name: msg.sender_name.clone(),
+        text: msg.text.clone(),
+        quoted_text: msg.quoted_text.clone(),
+        media_placeholder: msg.media_placeholder.clone(),
+    }
+}
+
+fn stored_to_context_message(m: &crate::bridge::protocol::StoredMessage) -> ContextMessage {
+    let author = if m.from_me {
+        ContextAuthor::Me
+    } else {
+        ContextAuthor::Them
+    };
+    let sender_name = if m.from_me {
+        "Me".to_string()
+    } else if m.sender_name.trim().is_empty() {
+        m.sender_id.clone()
+    } else {
+        m.sender_name.clone()
+    };
+    let body = truncate_utf8(
+        &effective_text(&m.text, m.media_placeholder.as_deref()),
+        MAX_CONTEXT_TEXT_BYTES,
+    );
+    ContextMessage {
+        author,
+        sender_name,
+        timestamp_ms: m.timestamp_ms,
+        text: body,
+    }
+}
+
+fn spawn_signal_desktop_sync_task(
+    config: BridgeConfig,
+    db_path: PathBuf,
+    reply: Option<oneshot::Sender<BridgeEvent>>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let res = BridgeStore::open(&db_path)
+            .and_then(|mut store| signal_desktop::sync_signal_desktop(&config, &mut store));
+        match res {
+            Ok(summary) => {
+                if summary.messages_imported > 0 {
+                    tracing::info!(
+                        conversations = summary.conversations,
+                        messages_imported = summary.messages_imported,
+                        "synced Signal Desktop SQLCipher history"
+                    );
+                }
+                if let Some(tx) = reply {
+                    let _ = tx.send(BridgeEvent::SyncCompleted {
+                        conversations: summary.conversations,
+                        messages_imported: summary.messages_imported,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Signal Desktop SQLCipher sync failed: {e:#}");
+                if let Some(tx) = reply {
+                    let _ = tx.send(BridgeEvent::Error {
+                        message: format!("Signal Desktop sync failed: {e}"),
+                    });
+                }
+            }
+        }
+    });
 }
 
 /// Serve `hey-computer-bridge` on `socket` until `shutdown` resolves.
@@ -719,7 +1099,14 @@ pub async fn serve(
     let listener = bind_socket(socket).await?;
     tracing::info!("hey-computer-bridge listening on {}", socket.display());
 
-    let mut core = match BridgeCore::new(config.clone()) {
+    let (wa_ctrl_tx, wa_ctrl_rx) = if config.whatsapp.enabled {
+        let (tx, rx) = mpsc::channel::<WhatsappControl>(32);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    let mut core = match BridgeCore::new(config.clone(), wa_ctrl_tx) {
         Ok(core) => core,
         Err(e) => {
             let _ = std::fs::remove_file(socket);
@@ -727,18 +1114,22 @@ pub async fn serve(
         }
     };
 
-    let (raw_tx, mut raw_rx) = mpsc::channel::<RawAdapterEvent>(256);
+    if config.resolved_signal_desktop_dir().is_some() {
+        spawn_signal_desktop_sync_task(config.clone(), core.db_path.clone(), None);
+    }
+
+    let (raw_tx, mut raw_rx) = mpsc::channel::<RawAdapterEvent>(512);
     let (query_tx, mut query_rx) = mpsc::channel::<CoreQuery>(64);
     let (bcast_tx, _) = broadcast::channel::<BridgeEvent>(BROADCAST_CAPACITY);
     let (adapter_stop_tx, adapter_stop_rx) = tokio::sync::watch::channel(false);
 
     let mut adapters = tokio::task::JoinSet::new();
-    if config.whatsapp.enabled {
+    if let Some(ctrl_rx) = wa_ctrl_rx {
         let cfg = config.clone();
         let tx = raw_tx.clone();
         let stop = adapter_stop_rx.clone();
         adapters.spawn(async move {
-            crate::bridge::whatsapp::run(cfg, tx, stop).await;
+            crate::bridge::whatsapp::run(cfg, tx, ctrl_rx, stop).await;
         });
     }
     if config.signal.enabled {
@@ -750,6 +1141,10 @@ pub async fn serve(
         });
     }
     drop(raw_tx);
+
+    let mut sig_desktop_tick = tokio::time::interval(SIGNAL_DESKTOP_SYNC_INTERVAL);
+    // First tick fires immediately; we already kicked off initial sync above.
+    sig_desktop_tick.tick().await;
 
     let mut connections = tokio::task::JoinSet::new();
     tokio::pin!(shutdown);
@@ -791,6 +1186,34 @@ pub async fn serve(
                     CoreQuery::GetContext { platform, sender_or_chat, limit, reply } => {
                         let _ = reply.send(core.context_event(platform, &sender_or_chat, limit));
                     }
+                    CoreQuery::ListChats { platform, include_groups, include_dms, limit, reply } => {
+                        let _ = reply.send(core.handle_list_chats(platform, include_groups, include_dms, limit));
+                    }
+                    CoreQuery::GetMessages { platform, chat, before_ms, after_ms, limit, reply } => {
+                        let _ = reply.send(core.handle_get_messages(platform, &chat, before_ms, after_ms, limit));
+                    }
+                    CoreQuery::Search { query, platform, chat, limit, reply } => {
+                        let _ = reply.send(core.handle_search(&query, platform, chat.as_deref(), limit));
+                    }
+                    CoreQuery::FetchHistory { platform, chat, count, reply } => {
+                        let _ = reply.send(core.handle_fetch_history(platform, &chat, count));
+                    }
+                    CoreQuery::SyncSignalDesktop { reply } => {
+                        spawn_signal_desktop_sync_task(
+                            core.config.clone(),
+                            core.db_path.clone(),
+                            Some(reply),
+                        );
+                    }
+                }
+            }
+            _ = sig_desktop_tick.tick() => {
+                if core.config.resolved_signal_desktop_dir().is_some() {
+                    spawn_signal_desktop_sync_task(
+                        core.config.clone(),
+                        core.db_path.clone(),
+                        None,
+                    );
                 }
             }
             () = async {
@@ -896,6 +1319,97 @@ async fn handle_client(
                 .await
                 .context("bridge core stopped")?;
             let reply = rx.await.context("bridge core dropped context reply")?;
+            send_event(&mut write, &reply).await?;
+        }
+        BridgeRequest::ListChats {
+            platform,
+            include_groups,
+            include_dms,
+            limit,
+        } => {
+            let (tx, rx) = oneshot::channel();
+            query_tx
+                .send(CoreQuery::ListChats {
+                    platform,
+                    include_groups,
+                    include_dms,
+                    limit,
+                    reply: tx,
+                })
+                .await
+                .context("bridge core stopped")?;
+            let reply = rx.await.context("bridge core dropped list_chats reply")?;
+            send_event(&mut write, &reply).await?;
+        }
+        BridgeRequest::GetMessages {
+            platform,
+            chat,
+            before_ms,
+            after_ms,
+            limit,
+        } => {
+            let (tx, rx) = oneshot::channel();
+            query_tx
+                .send(CoreQuery::GetMessages {
+                    platform,
+                    chat,
+                    before_ms,
+                    after_ms,
+                    limit,
+                    reply: tx,
+                })
+                .await
+                .context("bridge core stopped")?;
+            let reply = rx.await.context("bridge core dropped get_messages reply")?;
+            send_event(&mut write, &reply).await?;
+        }
+        BridgeRequest::Search {
+            query,
+            platform,
+            chat,
+            limit,
+        } => {
+            let (tx, rx) = oneshot::channel();
+            query_tx
+                .send(CoreQuery::Search {
+                    query,
+                    platform,
+                    chat,
+                    limit,
+                    reply: tx,
+                })
+                .await
+                .context("bridge core stopped")?;
+            let reply = rx.await.context("bridge core dropped search reply")?;
+            send_event(&mut write, &reply).await?;
+        }
+        BridgeRequest::FetchHistory {
+            platform,
+            chat,
+            count,
+        } => {
+            let (tx, rx) = oneshot::channel();
+            query_tx
+                .send(CoreQuery::FetchHistory {
+                    platform,
+                    chat,
+                    count,
+                    reply: tx,
+                })
+                .await
+                .context("bridge core stopped")?;
+            let reply = rx
+                .await
+                .context("bridge core dropped fetch_history reply")?;
+            send_event(&mut write, &reply).await?;
+        }
+        BridgeRequest::SyncSignalDesktop => {
+            let (tx, rx) = oneshot::channel();
+            query_tx
+                .send(CoreQuery::SyncSignalDesktop { reply: tx })
+                .await
+                .context("bridge core stopped")?;
+            let reply = rx.await.context("bridge core dropped sync reply")?;
             send_event(&mut write, &reply).await?;
         }
         BridgeRequest::Subscribe => {

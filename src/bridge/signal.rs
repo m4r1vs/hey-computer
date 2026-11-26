@@ -4,9 +4,9 @@
 //! Spawns:
 //! `signal-cli --config <state>/signal -a <e164> daemon --socket <0700_runtime>/signal.sock --no-receive-stdout --receive-mode manual --ignore-stories --ignore-attachments`
 //!
-//! Calls ONLY three read-only JSON-RPC methods: `version`, `listContacts`, and
-//! `subscribeReceive`. Never passes `--send-read-receipts` and never implements
-//! or invokes `send`, `sendReceipt`, `sendTyping`, or `sendReaction`.
+//! Calls ONLY read-only JSON-RPC methods: `version`, `listContacts`,
+//! `listGroups`, and `subscribeReceive`. Never passes `--send-read-receipts` and
+//! never implements or invokes `send`, `sendReceipt`, `sendTyping`, or `sendReaction`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +28,7 @@ use crate::bridge::config::{
 };
 use crate::bridge::context::{InboundRawMessage, RawAdapterEvent};
 use crate::bridge::protocol::{MAX_BRIDGE_LINE, Platform, PlatformState};
+use crate::bridge::store::ChatMetaRecord;
 use crate::lines::{self, Line};
 
 /// Safe environment variables retained for the scrubbed JVM environment.
@@ -80,7 +81,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Local contact directory populated from read-only `listContacts` RPC.
+/// Local contact and group directory populated from read-only `listContacts` and
+/// `listGroups` RPCs.
 #[derive(Debug, Default)]
 pub struct ContactDirectory {
     own_e164: String,
@@ -88,6 +90,7 @@ pub struct ContactDirectory {
     uuid_to_e164: HashMap<String, String>,
     e164_to_uuid: HashMap<String, String>,
     names: HashMap<String, String>,
+    groups: HashMap<String, String>,
 }
 
 impl ContactDirectory {
@@ -98,6 +101,7 @@ impl ContactDirectory {
             uuid_to_e164: HashMap::new(),
             e164_to_uuid: HashMap::new(),
             names: HashMap::new(),
+            groups: HashMap::new(),
         }
     }
 
@@ -152,10 +156,47 @@ impl ContactDirectory {
         events
     }
 
+    pub fn ingest_groups(&mut self, value: &Value) -> Vec<ChatMetaRecord> {
+        let mut records = Vec::new();
+        let Some(items) = value.as_array() else {
+            return records;
+        };
+        for item in items {
+            let Some(raw_id) = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let chat_id = normalize_identifier(&format!("group:{raw_id}"));
+            let title = item
+                .get("name")
+                .or_else(|| item.get("title"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+
+            if let Some(t) = &title {
+                self.groups.insert(chat_id.clone(), t.clone());
+            }
+
+            records.push(ChatMetaRecord {
+                platform: Platform::Signal,
+                chat_id: chat_id.clone(),
+                aliases: vec![chat_id],
+                is_group: true,
+                is_self_chat: false,
+                title,
+                raw_jid: None,
+            });
+        }
+        records
+    }
+
     fn matches_own(&self, e164: Option<&str>, uuid: Option<&str>) -> bool {
-        // If an E.164 is present, it must match own_e164; if a UUID is present
-        // and own_uuid is known, it must match own_uuid; and at least one field
-        // must affirmatively match own.
         if let Some(num) = e164
             && num != self.own_e164
         {
@@ -492,8 +533,15 @@ pub async fn run(
             }
         };
 
-        let run_result =
-            drive_signal_session(stream, &own_e164, &tx, &mut stop, &mut backoff_secs).await;
+        let run_result = drive_signal_session(
+            stream,
+            &own_e164,
+            config.signal.groups_enabled,
+            &tx,
+            &mut stop,
+            &mut backoff_secs,
+        )
+        .await;
 
         terminate_process_group(child_pid);
         let _ = child.kill().await;
@@ -575,6 +623,7 @@ async fn wait_for_signal_socket(
 async fn drive_signal_session(
     stream: UnixStream,
     own_e164: &str,
+    groups_enabled: bool,
     tx: &mpsc::Sender<RawAdapterEvent>,
     stop: &mut watch::Receiver<bool>,
     backoff_secs: &mut u64,
@@ -582,7 +631,7 @@ async fn drive_signal_session(
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
 
-    // Strictly read-only JSON-RPC calls: version, listContacts, subscribeReceive.
+    // Strictly read-only JSON-RPC calls: version, listContacts, listGroups, subscribeReceive.
     send_rpc(&mut write, "1", "version", json!({})).await?;
     let _version = read_rpc_response(&mut reader, "1", stop).await?;
 
@@ -597,6 +646,28 @@ async fn drive_signal_session(
     if let Ok(Some(result)) = read_rpc_response(&mut reader, "2", stop).await {
         for ev in contacts.ingest_contacts(&result) {
             let _ = tx.send(ev).await;
+        }
+    }
+
+    if groups_enabled {
+        send_rpc(
+            &mut write,
+            "2g",
+            "listGroups",
+            json!({ "account": own_e164 }),
+        )
+        .await?;
+        match read_rpc_response(&mut reader, "2g", stop).await {
+            Ok(Some(result)) => {
+                let group_records = contacts.ingest_groups(&result);
+                if !group_records.is_empty() {
+                    let _ = tx.send(RawAdapterEvent::ChatMetaBatch(group_records)).await;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!("signal-cli listGroups returned non-fatal error: {e:#}");
+            }
         }
     }
 
@@ -645,7 +716,7 @@ async fn drive_signal_session(
                         continue;
                     };
                     if let Some(msg) = parse_signal_envelope(envelope, &mut contacts) {
-                        let _ = tx.send(RawAdapterEvent::Message(msg)).await;
+                        let _ = tx.send(RawAdapterEvent::Message(Box::new(msg))).await;
                     }
                 }
                 Ok(Line::TooLong(n)) => {
@@ -728,6 +799,8 @@ async fn read_rpc_response(
 ///
 /// - Verified Note-to-Self: `syncMessage.sentMessage` where `source` == own AND
 ///   `destination` == own AND `groupInfo` is absent.
+/// - Outbound to group: `syncMessage.sentMessage` where `source` == own AND
+///   `groupInfo` is present (`from_me = true, is_group = true, is_self_chat = false`).
 /// - Outbound to another contact: `syncMessage.sentMessage` where `source` ==
 ///   own AND `destination` != own AND `groupInfo` is absent (`from_me = true`,
 ///   `is_self_chat = false`).
@@ -760,7 +833,7 @@ pub fn parse_signal_envelope(
         contacts.own_uuid = Some(u.clone());
     }
 
-    // Case 1: syncMessage.sentMessage (Note to Self OR outbound reply from phone)
+    // Case 1: syncMessage.sentMessage (Note to Self, outbound group reply, OR outbound DM reply)
     if let Some(sent) = envelope
         .get("syncMessage")
         .and_then(|s| s.get("sentMessage"))
@@ -769,21 +842,6 @@ pub fn parse_signal_envelope(
         if !contacts.matches_own(source_e164.as_deref(), source_uuid.as_deref()) {
             return None;
         }
-        let group_info = sent.get("groupInfo").filter(|v| !v.is_null());
-        if group_info.is_some() {
-            return None;
-        }
-
-        let dest_e164 = sent
-            .get("destinationNumber")
-            .or_else(|| sent.get("destination"))
-            .and_then(|v| v.as_str())
-            .and_then(normalize_e164);
-        let dest_uuid = sent
-            .get("destinationUuid")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .map(normalize_identifier);
 
         let text = sent
             .get("message")
@@ -801,6 +859,50 @@ pub fn parse_signal_envelope(
             .and_then(|v| v.as_i64())
             .unwrap_or(env_ts);
 
+        // Outbound message sent to a Signal group from the phone / linked Desktop.
+        if let Some(gi) = sent.get("groupInfo").filter(|v| !v.is_null()) {
+            let gid = gi
+                .get("groupId")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            let chat_id = normalize_identifier(&format!("group:{gid}"));
+            let group_title =
+                extract_group_title(gi).or_else(|| contacts.groups.get(&chat_id).cloned());
+            if let Some(t) = &group_title {
+                contacts.groups.insert(chat_id.clone(), t.clone());
+            }
+            return Some(InboundRawMessage {
+                id: format!("sync-grp-{ts}-{gid}"),
+                platform: Platform::Signal,
+                chat_id: chat_id.clone(),
+                chat_aliases: vec![chat_id],
+                raw_jid: None,
+                chat_title: group_title,
+                sender_id: contacts.own_e164.clone(),
+                sender_aliases: vec![contacts.own_e164.clone()],
+                sender_name: "Me".to_string(),
+                from_me: true,
+                is_group: true,
+                is_self_chat: false,
+                timestamp_ms: ts,
+                text,
+                quoted_text,
+                media_placeholder,
+            });
+        }
+
+        let dest_e164 = sent
+            .get("destinationNumber")
+            .or_else(|| sent.get("destination"))
+            .and_then(|v| v.as_str())
+            .and_then(normalize_e164);
+        let dest_uuid = sent
+            .get("destinationUuid")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(normalize_identifier);
+
         let is_self_chat = contacts.matches_own(dest_e164.as_deref(), dest_uuid.as_deref());
         if is_self_chat {
             let mut aliases = vec![contacts.own_e164.clone()];
@@ -812,6 +914,8 @@ pub fn parse_signal_envelope(
                 platform: Platform::Signal,
                 chat_id: contacts.own_e164.clone(),
                 chat_aliases: aliases.clone(),
+                raw_jid: None,
+                chat_title: Some("Note to Self".to_string()),
                 sender_id: contacts.own_e164.clone(),
                 sender_aliases: aliases,
                 sender_name: "Me".to_string(),
@@ -831,11 +935,14 @@ pub fn parse_signal_envelope(
         if chat_id == "unknown" {
             return None;
         }
+        let chat_title = (!display_name.is_empty()).then(|| display_name.clone());
         return Some(InboundRawMessage {
             id: format!("sync-out-{ts}-{chat_id}"),
             platform: Platform::Signal,
             chat_id,
             chat_aliases,
+            raw_jid: None,
+            chat_title,
             sender_id: contacts.own_e164.clone(),
             sender_aliases: vec![contacts.own_e164.clone()],
             sender_name: display_name,
@@ -871,15 +978,22 @@ pub fn parse_signal_envelope(
             contacts.resolve_peer(source_e164.as_deref(), source_uuid.as_deref(), source_name);
 
         let group_info = data.get("groupInfo").filter(|v| !v.is_null());
-        let (is_group, chat_id, chat_aliases) = if let Some(gi) = group_info {
+        let (is_group, chat_id, chat_aliases, chat_title) = if let Some(gi) = group_info {
             let gid = gi
                 .get("groupId")
                 .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .unwrap_or("unknown");
-            let cid = format!("group:{gid}");
-            (true, cid.clone(), vec![cid])
+            let cid = normalize_identifier(&format!("group:{gid}"));
+            let gtitle = extract_group_title(gi).or_else(|| contacts.groups.get(&cid).cloned());
+            if let Some(t) = &gtitle {
+                contacts.groups.insert(cid.clone(), t.clone());
+            }
+            (true, cid.clone(), vec![cid], gtitle)
         } else {
-            (false, sender_id.clone(), sender_aliases.clone())
+            let dm_title = (!sender_name.is_empty()).then(|| sender_name.clone());
+            (false, sender_id.clone(), sender_aliases.clone(), dm_title)
         };
 
         return Some(InboundRawMessage {
@@ -887,6 +1001,8 @@ pub fn parse_signal_envelope(
             platform: Platform::Signal,
             chat_id,
             chat_aliases,
+            raw_jid: None,
+            chat_title,
             sender_id,
             sender_aliases,
             sender_name,
@@ -900,6 +1016,18 @@ pub fn parse_signal_envelope(
         });
     }
 
+    None
+}
+
+fn extract_group_title(gi: &Value) -> Option<String> {
+    for key in ["groupName", "name", "title"] {
+        if let Some(s) = gi.get(key).and_then(|v| v.as_str()) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
     None
 }
 
@@ -1021,12 +1149,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unwraps_note_to_self_and_distinguishes_outbound_to_other() {
+    fn unwraps_note_to_self_group_sync_and_distinguishes_outbound_to_other() {
         let mut dir = ContactDirectory::new("+4915100000000".to_string());
         dir.ingest_contacts(&json!([
             { "number": "+4915100000000", "uuid": "11111111-1111-1111-1111-111111111111" },
             { "number": "+4915100000001", "uuid": "22222222-2222-2222-2222-222222222222", "name": "Alice Test" }
         ]));
+        let groups = dir.ingest_groups(&json!([
+            { "id": "grp-flatmates-1", "name": "Flatmates Group" }
+        ]));
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].chat_id, "group:grp-flatmates-1");
+        assert_eq!(groups[0].title.as_deref(), Some("Flatmates Group"));
 
         // Verified Note to Self
         let self_env = json!({
@@ -1078,5 +1212,43 @@ mod tests {
         assert!(!outbound.is_self_chat);
         assert_eq!(outbound.chat_id, "+4915100000001");
         assert_eq!(outbound.sender_name, "Alice Test");
+        assert_eq!(outbound.chat_title.as_deref(), Some("Alice Test"));
+
+        // Outbound syncMessage sent to a Signal group resolves group title from listGroups!
+        let grp_out_env = json!({
+            "sourceNumber": "+4915100000000",
+            "timestamp": 1764109203000i64,
+            "syncMessage": {
+                "sentMessage": {
+                    "groupInfo": { "groupId": "grp-flatmates-1" },
+                    "timestamp": 1764109203000i64,
+                    "message": "Bringing pizza!"
+                }
+            }
+        });
+        let grp_out = parse_signal_envelope(&grp_out_env, &mut dir).unwrap();
+        assert!(grp_out.from_me);
+        assert!(grp_out.is_group);
+        assert!(!grp_out.is_self_chat);
+        assert_eq!(grp_out.chat_id, "group:grp-flatmates-1");
+        assert_eq!(grp_out.chat_title.as_deref(), Some("Flatmates Group"));
+        assert_eq!(grp_out.sender_name, "Me");
+
+        // Inbound dataMessage in Signal group keeps speaker name separate from group title!
+        let grp_in_env = json!({
+            "sourceUuid": "22222222-2222-2222-2222-222222222222",
+            "timestamp": 1764109204000i64,
+            "dataMessage": {
+                "groupInfo": { "groupId": "grp-flatmates-1" },
+                "timestamp": 1764109204000i64,
+                "message": "Awesome!"
+            }
+        });
+        let grp_in = parse_signal_envelope(&grp_in_env, &mut dir).unwrap();
+        assert!(!grp_in.from_me);
+        assert!(grp_in.is_group);
+        assert_eq!(grp_in.chat_id, "group:grp-flatmates-1");
+        assert_eq!(grp_in.chat_title.as_deref(), Some("Flatmates Group"));
+        assert_eq!(grp_in.sender_name, "Alice Test");
     }
 }
