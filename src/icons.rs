@@ -50,13 +50,14 @@ pub const GOOGLE_WORKSPACE_TOOL_ICONS: &[(&str, &str)] = &[
 
 /// Default Nerd Font v3 glyphs for recognized shell command basenames.
 pub const DEFAULT_COMMAND_ICONS: &[(&str, &str)] = &[
-    ("gh", "\u{e709}"),         // nf-dev-github
-    ("obsidian", "\u{f082e}"),  // nf-md-notebook
-    ("openhue", "\u{f0eb}"),    // nf-fa-lightbulb_o
-    ("hue-lights", "\u{f0eb}"), // nf-fa-lightbulb_o
-    ("transit", "\u{f052c}"),   // nf-md-train
-    ("yt-dlp", "\u{f16a}"),     // nf-fa-youtube_play
-    ("gcalcli", "\u{f455}"),    // nf-oct-calendar
+    ("gh", "\u{e709}"),            // nf-dev-github
+    ("obsidian", "\u{f082e}"),     // nf-md-notebook
+    ("openhue", "\u{f0eb}"),       // nf-fa-lightbulb_o
+    ("hue-lights", "\u{f0eb}"),    // nf-fa-lightbulb_o
+    ("transit", "\u{f052c}"),      // nf-md-train
+    ("yt-dlp", "\u{f16a}"),        // nf-fa-youtube_play
+    ("gcalcli", "\u{f455}"),       // nf-oct-calendar
+    ("swaync-client", "\u{f0f3}"), // nf-fa-bell
 ];
 
 /// Default Nerd Font v3 glyphs for built-in tool kinds.
@@ -787,6 +788,15 @@ mod tests {
                 "kind": "fetch"
             })
         ));
+        assert!(tracker.observe_update(
+            &resolver,
+            &json!({
+                "toolCallId": "c8",
+                "name": "run_command",
+                "kind": "execute",
+                "rawInput": {"CommandLine": "swaync-client -sw --latest-notification"}
+            })
+        ));
 
         assert_eq!(
             tracker.icons(),
@@ -797,6 +807,7 @@ mod tests {
                 "\u{f42f}",  // gmail
                 "\u{f2df}",  // google drive
                 "\u{f059f}", // web fetch
+                "\u{f0f3}",  // swaync-client bell
             ]
         );
 
