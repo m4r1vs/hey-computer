@@ -15,11 +15,12 @@
   stubPiper = pkgs.writeShellScriptBin "piper" ''cat >/dev/null'';
   stubBridge = pkgs.writeShellScriptBin "hey-computer-bridge" ''echo "bridge stub: $*"'';
 
-  evaluate = settings:
+  evaluateWith = extraModule: settings:
     (home-manager.lib.homeManagerConfiguration {
       inherit pkgs;
       modules = [
         module
+        extraModule
         {
           home = {
             username = "alice";
@@ -37,6 +38,8 @@
         }
       ];
     }).config;
+
+  evaluate = evaluateWith {};
 
   full = evaluate {
     vault = "/home/alice/Alice's Notes";
@@ -200,6 +203,32 @@
     subagents.enable = false;
   };
 
+  withSecureTmux = evaluateWith {
+    programs.tmux.enable = true;
+  } {};
+
+  withInsecureTmux = evaluateWith {
+    programs.tmux = {
+      enable = true;
+      secureSocket = false;
+    };
+  } {};
+
+  withSessionSubdirTmux = evaluateWith {
+    home.sessionVariables.TMUX_TMPDIR = "$XDG_RUNTIME_DIR/tmux";
+  } {};
+
+  withLiteralTmuxTmpDir = evaluateWith {
+    home.sessionVariables.TMUX_TMPDIR = "/var/tmp";
+  } {};
+
+  withNullTmuxTmpDirOverride =
+    evaluateWith {
+      programs.tmux.enable = true;
+    } {
+      tmux.tmpDir = null;
+    };
+
   memorySample = pkgs.writeText "memory.md" "Prefer concise answers.\n";
   memoryExtra = pkgs.writeText "memory-extra.md" "Local state note.\n";
   withMemory = evaluate {
@@ -301,7 +330,17 @@
   assert lib.assertMsg (!((settingsOf bare).instructions or {} ? memory_file))
   "memory.file = null omits instructions.memory_file";
   assert lib.assertMsg (!(builtins.tryEval (evaluate {vualt = "/tmp";}).programs.hey-computer.settings).success)
-  "a misspelt option must fail"; true;
+  "a misspelt option must fail";
+  assert lib.assertMsg (lib.elem "TMUX_TMPDIR=%t" withSecureTmux.systemd.user.services.hey-computer.Service.Environment)
+  "programs.tmux.enable (default secureSocket = true) propagates TMUX_TMPDIR=%t";
+  assert lib.assertMsg (!(lib.any (lib.hasPrefix "TMUX_TMPDIR=") withInsecureTmux.systemd.user.services.hey-computer.Service.Environment))
+  "programs.tmux.secureSocket = false omits TMUX_TMPDIR";
+  assert lib.assertMsg (lib.elem "TMUX_TMPDIR=%t/tmux" withSessionSubdirTmux.systemd.user.services.hey-computer.Service.Environment)
+  "home.sessionVariables.TMUX_TMPDIR subdir under XDG_RUNTIME_DIR maps to %t/...";
+  assert lib.assertMsg (lib.elem "TMUX_TMPDIR=/var/tmp" withLiteralTmuxTmpDir.systemd.user.services.hey-computer.Service.Environment)
+  "literal home.sessionVariables.TMUX_TMPDIR is propagated unchanged";
+  assert lib.assertMsg (!(lib.any (lib.hasPrefix "TMUX_TMPDIR=") withNullTmuxTmpDirOverride.systemd.user.services.hey-computer.Service.Environment))
+  "tmux.tmpDir = null explicitly omits TMUX_TMPDIR"; true;
 
   configFile = full.xdg.configFile."hey-computer/config.toml".source;
   subagentsConfig = withSubagents.xdg.configFile."hey-computer/config.toml".source;
@@ -309,6 +348,7 @@
   bareConfig = bare.xdg.configFile."hey-computer/config.toml".source;
   memoryConfig = withMemory.xdg.configFile."hey-computer/config.toml".source;
   unit = full.xdg.configFile."systemd/user/hey-computer.service".source;
+  secureTmuxUnit = withSecureTmux.xdg.configFile."systemd/user/hey-computer.service".source;
   bridgeUnit = full.xdg.configFile."systemd/user/hey-computer-messenger-bridge.service".source;
   package = full.programs.hey-computer.package;
 in
@@ -366,6 +406,9 @@ in
       grep -q 'BindReadOnlyPaths=' ${bridgeUnit}
       agent_path=$(sed -n 's/^Environment=PATH=//p' ${unit})
       test -n "$agent_path"
+      grep -qx 'Environment=TMUX_TMPDIR=%t' ${secureTmuxUnit}
+      test -n "$(sed -n 's/^Environment=PATH=//p' ${secureTmuxUnit})"
+      ! grep -q 'XDG_RUNTIME_DIR' ${secureTmuxUnit}
 
       # The agent's PATH: the shim first, then openhue, agy, bridge, the extras and the basics.
       PATH=$agent_path

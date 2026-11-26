@@ -81,6 +81,43 @@
     ++ cfg.systemPath
   );
 
+  sessionTmuxTmpDir = config.home.sessionVariables.TMUX_TMPDIR or null;
+
+  # Home Manager's programs.tmux.secureSocket exports TMUX_TMPDIR using shell
+  # parameter expansion, which systemd Environment= does not evaluate. Map
+  # XDG_RUNTIME_DIR expressions to systemd's %t specifier and pass literal
+  # paths unchanged, while ignoring arbitrary shell expressions.
+  translateSessionTmuxTmpDir = val:
+    if !(builtins.isString val) || val == ""
+    then null
+    else if !(lib.hasInfix "$" val)
+    then val
+    else if
+      lib.elem val [
+        "$XDG_RUNTIME_DIR"
+        "\${XDG_RUNTIME_DIR}"
+        "\${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        "\${XDG_RUNTIME_DIR:-\"/run/user/$(id -u)\"}"
+      ]
+    then "%t"
+    else if lib.hasPrefix "$XDG_RUNTIME_DIR/" val && !(lib.hasInfix "$" (lib.removePrefix "$XDG_RUNTIME_DIR/" val))
+    then "%t/${lib.removePrefix "$XDG_RUNTIME_DIR/" val}"
+    else if lib.hasPrefix "\${XDG_RUNTIME_DIR}/" val && !(lib.hasInfix "$" (lib.removePrefix "\${XDG_RUNTIME_DIR}/" val))
+    then "%t/${lib.removePrefix "\${XDG_RUNTIME_DIR}/" val}"
+    else null;
+
+  inferredTmuxTmpDir =
+    if !cfg.tmux.enable
+    then null
+    else let
+      fromSession = translateSessionTmuxTmpDir sessionTmuxTmpDir;
+    in
+      if fromSession != null
+      then fromSession
+      else if (config.programs.tmux.enable or false) && (config.programs.tmux.secureSocket or false)
+      then "%t"
+      else null;
+
   /*
   A long answer's window must not belong to the service: with the default
   KillMode a restart of the daemon would close it. systemd-run --scope puts
@@ -427,6 +464,21 @@ in {
         default = pkgs.tmux;
         defaultText = literalExpression "pkgs.tmux";
         description = "The tmux package placed on the daemon/agent PATH.";
+      };
+
+      tmpDir = mkOption {
+        type = types.nullOr types.str;
+        default = inferredTmuxTmpDir;
+        defaultText = literalExpression ''
+          "%t" when programs.tmux.secureSocket is enabled (or home.sessionVariables.TMUX_TMPDIR
+          targets $XDG_RUNTIME_DIR), a literal home.sessionVariables.TMUX_TMPDIR if set, otherwise null
+        '';
+        description = ''
+          Optional `TMUX_TMPDIR` passed to `hey-computer.service` so both ambient
+          desktop context and agent `tmux` tool calls reach the same socket
+          directory as interactive shells. Accepts systemd specifiers such as
+          `%t` (`$XDG_RUNTIME_DIR`). Set `null` to omit `TMUX_TMPDIR`.
+        '';
       };
     };
 
@@ -1051,7 +1103,9 @@ in {
         refusal.
         */
         NoNewPrivileges = true;
-        Environment = ["PATH=${agentPath}"];
+        Environment =
+          ["PATH=${agentPath}"]
+          ++ lib.optional (cfg.tmux.enable && cfg.tmux.tmpDir != null) "TMUX_TMPDIR=${cfg.tmux.tmpDir}";
       };
       Install.WantedBy = ["graphical-session.target"];
     };

@@ -7,10 +7,11 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::CStr;
+use std::ffi::{CStr, OsStr, OsString};
 use std::future::Future;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1053,8 +1054,113 @@ fn format_local_time(
     })
 }
 
+#[derive(Debug, Default, Clone)]
+struct TmuxEnv {
+    tmux: Option<OsString>,
+    tmpdir: Option<OsString>,
+    xdg_runtime_dir: Option<PathBuf>,
+    default_tmp_dir: PathBuf,
+    uid: u32,
+}
+
+impl TmuxEnv {
+    fn from_process() -> Self {
+        let non_empty_env = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty());
+        // SAFETY: geteuid cannot fail and touches no memory.
+        let uid = unsafe { libc::geteuid() };
+        Self {
+            tmux: non_empty_env("TMUX"),
+            tmpdir: non_empty_env("TMUX_TMPDIR"),
+            xdg_runtime_dir: non_empty_env("XDG_RUNTIME_DIR").map(PathBuf::from),
+            default_tmp_dir: PathBuf::from("/tmp"),
+            uid,
+        }
+    }
+}
+
+/// Check that `<tmpdir>/tmux-<uid>` is a private directory (`0700`) owned by
+/// `uid` containing a Unix socket named `default` owned by `uid`, matching
+/// tmux's own socket-directory security checks without following symlinks.
+pub(crate) fn has_private_tmux_socket(tmpdir: &Path, uid: u32) -> bool {
+    let dir = tmpdir.join(format!("tmux-{uid}"));
+    let Ok(dir_meta) = std::fs::symlink_metadata(&dir) else {
+        return false;
+    };
+    if !dir_meta.file_type().is_dir() || dir_meta.uid() != uid || (dir_meta.mode() & 0o077) != 0 {
+        return false;
+    }
+    let sock = dir.join("default");
+    let Ok(sock_meta) = std::fs::symlink_metadata(&sock) else {
+        return false;
+    };
+    sock_meta.file_type().is_socket() && sock_meta.uid() == uid
+}
+
+fn fallback_tmux_tmpdirs(env: &TmuxEnv) -> Vec<PathBuf> {
+    if env.tmux.as_deref().is_some_and(|v| !v.is_empty()) {
+        return Vec::new();
+    }
+    let default_tmp =
+        (!env.default_tmp_dir.as_os_str().is_empty()).then_some(env.default_tmp_dir.as_path());
+    let tried = env
+        .tmpdir
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .map(Path::new)
+        .or(default_tmp);
+    let mut candidates = Vec::new();
+    for candidate in [env.xdg_runtime_dir.as_deref(), default_tmp]
+        .into_iter()
+        .flatten()
+    {
+        if candidate.as_os_str().is_empty() || tried == Some(candidate) {
+            continue;
+        }
+        if !candidates
+            .iter()
+            .any(|c: &PathBuf| c.as_path() == candidate)
+        {
+            candidates.push(candidate.to_path_buf());
+        }
+    }
+    candidates
+}
+
+fn detect_tmux_tmpdir_with(env: &TmuxEnv) -> Option<PathBuf> {
+    if env.tmux.as_deref().is_some_and(|v| !v.is_empty())
+        || env.tmpdir.as_deref().is_some_and(|v| !v.is_empty())
+    {
+        return None;
+    }
+    if !env.default_tmp_dir.as_os_str().is_empty()
+        && has_private_tmux_socket(&env.default_tmp_dir, env.uid)
+    {
+        return None;
+    }
+    let xdg = env.xdg_runtime_dir.as_deref()?;
+    if xdg.as_os_str().is_empty() || xdg == env.default_tmp_dir.as_path() {
+        return None;
+    }
+    has_private_tmux_socket(xdg, env.uid).then(|| xdg.to_path_buf())
+}
+
+/// Detect `$XDG_RUNTIME_DIR` as `TMUX_TMPDIR` for spawned agent processes when
+/// neither `TMUX` nor `TMUX_TMPDIR` is set, no default `/tmp` tmux socket
+/// exists, and a private user-owned tmux socket exists under `$XDG_RUNTIME_DIR`.
+pub(crate) fn detect_tmux_tmpdir() -> Option<PathBuf> {
+    detect_tmux_tmpdir_with(&TmuxEnv::from_process())
+}
+
 async fn query_hyprland() -> Option<DesktopState> {
-    query_desktop_with("hyprctl", "tmux", Path::new("/proc"), DESKTOP_TIMEOUT).await
+    let tmux_env = TmuxEnv::from_process();
+    query_desktop_with_env(
+        "hyprctl",
+        "tmux",
+        Path::new("/proc"),
+        &tmux_env,
+        DESKTOP_TIMEOUT,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1062,13 +1168,29 @@ async fn query_hyprland_with(program: &str, timeout: Duration) -> Option<Desktop
     query_desktop_with(program, "/nonexistent/tmux", Path::new("/proc"), timeout).await
 }
 
+#[cfg(test)]
 async fn query_desktop_with(
     hyprctl: &str,
     tmux: &str,
     proc_root: &Path,
     timeout: Duration,
 ) -> Option<DesktopState> {
-    match tokio::time::timeout(timeout, query_desktop_inner(hyprctl, tmux, proc_root)).await {
+    query_desktop_with_env(hyprctl, tmux, proc_root, &TmuxEnv::default(), timeout).await
+}
+
+async fn query_desktop_with_env(
+    hyprctl: &str,
+    tmux: &str,
+    proc_root: &Path,
+    tmux_env: &TmuxEnv,
+    timeout: Duration,
+) -> Option<DesktopState> {
+    match tokio::time::timeout(
+        timeout,
+        query_desktop_inner(hyprctl, tmux, proc_root, tmux_env),
+    )
+    .await
+    {
         Ok(state) => state,
         Err(_) => {
             tracing::debug!("desktop context query timed out after {timeout:?}");
@@ -1084,14 +1206,20 @@ enum RunResult {
 }
 
 async fn run_program(program: &str, args: &[&str]) -> RunResult {
-    let mut child = match Command::new(program)
-        .args(args)
+    run_program_env(program, args, &[]).await
+}
+
+async fn run_program_env(program: &str, args: &[&str], extra_env: &[(&str, &OsStr)]) -> RunResult {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) if e.kind() == ErrorKind::NotFound => {
             tracing::debug!("ambient desktop context skipped: {program} not found");
@@ -1124,7 +1252,19 @@ async fn run_program(program: &str, args: &[&str]) -> RunResult {
     }
 }
 
-async fn query_desktop_inner(hyprctl: &str, tmux: &str, proc_root: &Path) -> Option<DesktopState> {
+async fn run_tmux(tmux: &str, tmpdir: Option<&Path>, args: &[&str]) -> RunResult {
+    match tmpdir {
+        Some(dir) => run_program_env(tmux, args, &[("TMUX_TMPDIR", dir.as_os_str())]).await,
+        None => run_program(tmux, args).await,
+    }
+}
+
+async fn query_desktop_inner(
+    hyprctl: &str,
+    tmux: &str,
+    proc_root: &Path,
+    tmux_env: &TmuxEnv,
+) -> Option<DesktopState> {
     let mut instance: Option<String> = None;
     let raw = match run_program(hyprctl, &["-j", "activewindow"]).await {
         RunResult::Ok(bytes) => Some(bytes),
@@ -1185,7 +1325,8 @@ async fn query_desktop_inner(hyprctl: &str, tmux: &str, proc_root: &Path) -> Opt
         }
     }
 
-    let (matched_tmux, unfocused_tmux_roots) = query_tmux(tmux, focused_term_pids.as_ref()).await;
+    let (matched_tmux, unfocused_tmux_roots) =
+        query_tmux(tmux, focused_term_pids.as_ref(), tmux_env).await;
     if let Some(tmux_state) = matched_tmux {
         if tmux_state.focused {
             state.cwd = tmux_state.pane_path.clone();
@@ -1444,11 +1585,35 @@ fn resolve_cwd(
 async fn query_tmux(
     tmux: &str,
     focused_pids: Option<&HashSet<u32>>,
+    tmux_env: &TmuxEnv,
 ) -> (Option<TmuxState>, HashSet<u32>) {
     const CLIENT_FMT: &str = "#{client_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_current_path}\t#{pane_current_command}\t#{client_flags}\t#{client_termfeatures}\t#{client_activity}";
     let mut unfocused_pids = HashSet::new();
-    let RunResult::Ok(raw) = run_program(tmux, &["list-clients", "-F", CLIENT_FMT]).await else {
-        return (None, unfocused_pids);
+    let mut active_tmpdir: Option<PathBuf> = None;
+    let raw = match run_tmux(tmux, None, &["list-clients", "-F", CLIENT_FMT]).await {
+        RunResult::Ok(raw) => raw,
+        RunResult::NotFound => return (None, unfocused_pids),
+        RunResult::Failed => {
+            let mut found = None;
+            for candidate in fallback_tmux_tmpdirs(tmux_env) {
+                if !has_private_tmux_socket(&candidate, tmux_env.uid) {
+                    continue;
+                }
+                match run_tmux(tmux, Some(&candidate), &["list-clients", "-F", CLIENT_FMT]).await {
+                    RunResult::Ok(raw) => {
+                        active_tmpdir = Some(candidate);
+                        found = Some(raw);
+                        break;
+                    }
+                    RunResult::NotFound => return (None, unfocused_pids),
+                    RunResult::Failed => {}
+                }
+            }
+            let Some(raw) = found else {
+                return (None, unfocused_pids);
+            };
+            raw
+        }
     };
     let text = String::from_utf8_lossy(&raw);
     let mut focused_best: Option<((bool, u64), TmuxState)> = None;
@@ -1516,12 +1681,19 @@ async fn query_tmux(
     let Some((_, mut state)) = focused_best.or(fallback_best) else {
         // Server is running (`list-clients` succeeded) with no attached clients;
         // fall back to the most recently active detached session.
-        return (query_tmux_detached(tmux).await, unfocused_pids);
+        return (
+            query_tmux_detached(tmux, active_tmpdir.as_deref()).await,
+            unfocused_pids,
+        );
     };
     if is_valid_pane_id(&state.pane) {
         const PANE_FMT: &str = "#{pane_id}\t#{pane_active}\t#{pane_current_command}";
-        if let RunResult::Ok(panes_raw) =
-            run_program(tmux, &["list-panes", "-t", &state.pane, "-F", PANE_FMT]).await
+        if let RunResult::Ok(panes_raw) = run_tmux(
+            tmux,
+            active_tmpdir.as_deref(),
+            &["list-panes", "-t", &state.pane, "-F", PANE_FMT],
+        )
+        .await
         {
             state.window_panes = format_tmux_panes(&String::from_utf8_lossy(&panes_raw));
         }
@@ -1529,9 +1701,10 @@ async fn query_tmux(
     (Some(state), unfocused_pids)
 }
 
-async fn query_tmux_detached(tmux: &str) -> Option<TmuxState> {
+async fn query_tmux_detached(tmux: &str, tmpdir: Option<&Path>) -> Option<TmuxState> {
     const ALL_PANES_FMT: &str = "#{session_activity}\t#{session_name}\t#{window_active}\t#{window_index}\t#{window_name}\t#{pane_active}\t#{pane_id}\t#{pane_current_path}\t#{pane_current_command}";
-    let RunResult::Ok(raw) = run_program(tmux, &["list-panes", "-a", "-F", ALL_PANES_FMT]).await
+    let RunResult::Ok(raw) =
+        run_tmux(tmux, tmpdir, &["list-panes", "-a", "-F", ALL_PANES_FMT]).await
     else {
         return None;
     };
@@ -2110,6 +2283,270 @@ esac
             block.contains("tmux_pane_path: /home/alice/repo\n"),
             "{block}"
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tmux_tmpdir_fallback_candidates_and_socket_security() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let env_unset = TmuxEnv {
+            tmux: None,
+            tmpdir: None,
+            xdg_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            default_tmp_dir: PathBuf::from("/tmp"),
+            uid: 1000,
+        };
+        assert_eq!(
+            fallback_tmux_tmpdirs(&env_unset),
+            vec![PathBuf::from("/run/user/1000")]
+        );
+
+        let env_xdg = TmuxEnv {
+            tmpdir: Some(OsString::from("/run/user/1000")),
+            ..env_unset.clone()
+        };
+        assert_eq!(fallback_tmux_tmpdirs(&env_xdg), vec![PathBuf::from("/tmp")]);
+
+        let env_custom = TmuxEnv {
+            tmpdir: Some(OsString::from("/var/tmp")),
+            ..env_unset.clone()
+        };
+        assert_eq!(
+            fallback_tmux_tmpdirs(&env_custom),
+            vec![PathBuf::from("/run/user/1000"), PathBuf::from("/tmp")]
+        );
+
+        let env_explicit_tmux = TmuxEnv {
+            tmux: Some(OsString::from("/run/user/1000/tmux-1000/default,1,0")),
+            ..env_unset.clone()
+        };
+        assert!(fallback_tmux_tmpdirs(&env_explicit_tmux).is_empty());
+
+        let env_same_dir = TmuxEnv {
+            xdg_runtime_dir: Some(PathBuf::from("/tmp")),
+            ..env_unset.clone()
+        };
+        assert!(fallback_tmux_tmpdirs(&env_same_dir).is_empty());
+
+        // Real filesystem checks for private socket validation and agent detection.
+        let dir = scratch("tmux-sock");
+        let uid = unsafe { libc::geteuid() };
+        let xdg = dir.join("xdg");
+        let tmp = dir.join("tmp");
+        let xdg_tmux_dir = xdg.join(format!("tmux-{uid}"));
+        std::fs::create_dir_all(&xdg_tmux_dir).unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::set_permissions(&xdg_tmux_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Missing socket fails.
+        assert!(!has_private_tmux_socket(&xdg, uid));
+
+        // Real Unix socket in 0700 dir passes.
+        let sock_path = xdg_tmux_dir.join("default");
+        let _listener = UnixListener::bind(&sock_path).unwrap();
+        assert!(has_private_tmux_socket(&xdg, uid));
+        assert!(!has_private_tmux_socket(&xdg, uid + 1));
+
+        // Agent detection picks XDG when no /tmp socket exists and env is unset.
+        let detect_env = TmuxEnv {
+            tmux: None,
+            tmpdir: None,
+            xdg_runtime_dir: Some(xdg.clone()),
+            default_tmp_dir: tmp.clone(),
+            uid,
+        };
+        assert_eq!(detect_tmux_tmpdir_with(&detect_env), Some(xdg.clone()));
+        assert_eq!(
+            detect_tmux_tmpdir_with(&TmuxEnv {
+                tmpdir: Some(OsString::from("/already/set")),
+                ..detect_env.clone()
+            }),
+            None
+        );
+        assert_eq!(
+            detect_tmux_tmpdir_with(&TmuxEnv {
+                tmux: Some(OsString::from("/sock,1,0")),
+                ..detect_env.clone()
+            }),
+            None
+        );
+
+        // If default /tmp socket exists, agent detection leaves TMUX_TMPDIR unset.
+        let tmp_tmux_dir = tmp.join(format!("tmux-{uid}"));
+        std::fs::create_dir_all(&tmp_tmux_dir).unwrap();
+        std::fs::set_permissions(&tmp_tmux_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _tmp_listener = UnixListener::bind(tmp_tmux_dir.join("default")).unwrap();
+        assert_eq!(detect_tmux_tmpdir_with(&detect_env), None);
+
+        // Group/world-accessible tmux-<uid> directory is refused.
+        std::fs::set_permissions(&xdg_tmux_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!has_private_tmux_socket(&xdg, uid));
+        std::fs::set_permissions(&xdg_tmux_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Symlinked tmux-<uid> directory is refused.
+        let link_root = dir.join("link-root");
+        std::fs::create_dir_all(&link_root).unwrap();
+        std::os::unix::fs::symlink(&xdg_tmux_dir, link_root.join(format!("tmux-{uid}"))).unwrap();
+        assert!(!has_private_tmux_socket(&link_root, uid));
+
+        // Symlinked default socket is refused.
+        let sock_link_root = dir.join("sock-link-root");
+        let sock_link_dir = sock_link_root.join(format!("tmux-{uid}"));
+        std::fs::create_dir_all(&sock_link_dir).unwrap();
+        std::fs::set_permissions(&sock_link_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&sock_path, sock_link_dir.join("default")).unwrap();
+        assert!(!has_private_tmux_socket(&sock_link_root, uid));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn queries_tmux_via_xdg_runtime_tmpdir_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let dir = scratch("tmux-xdg-fallback");
+        let uid = unsafe { libc::geteuid() };
+        let proc_root = dir.join("proc");
+        let work_a = dir.join("work-a");
+        let work_b = dir.join("work-b");
+        std::fs::create_dir_all(&work_a).unwrap();
+        std::fs::create_dir_all(&work_b).unwrap();
+
+        let make_proc = |pid: u32, ppid: u32, comm: &str, cwd: &Path| {
+            let pdir = proc_root.join(pid.to_string());
+            std::fs::create_dir_all(&pdir).unwrap();
+            std::fs::write(
+                pdir.join("stat"),
+                format!("{pid} ({comm}) S {ppid} 1 1 0\n"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(cwd, pdir.join("cwd")).unwrap();
+        };
+        make_proc(100, 1, "ghostty", &work_a);
+        make_proc(101, 100, "zsh", &work_b);
+        make_proc(102, 101, "tmux: client", &work_b);
+
+        let xdg = dir.join("xdg");
+        let empty_tmp = dir.join("empty-tmp");
+        let xdg_tmux_dir = xdg.join(format!("tmux-{uid}"));
+        std::fs::create_dir_all(&xdg_tmux_dir).unwrap();
+        std::fs::create_dir_all(&empty_tmp).unwrap();
+        std::fs::set_permissions(&xdg_tmux_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _listener = UnixListener::bind(xdg_tmux_dir.join("default")).unwrap();
+
+        let hypr = write_script(
+            &dir,
+            "hypr-ghostty",
+            r#"echo '{"class":"com.mitchellh.ghostty","title":"hey-computer","pid":100,"workspace":{"id":2,"name":"2"}}'"#,
+        );
+        let xdg_str = xdg.to_string_lossy();
+        let tmux_xdg_only = write_script(
+            &dir,
+            "tmux-xdg-only",
+            &format!(
+                r#"
+if [ "${{TMUX_TMPDIR:-}}" != "{xdg_str}" ]; then
+  exit 1
+fi
+case "$1" in
+  list-clients)
+    printf '102\t0\t1\tagy\t%%13\t/home/alice/repo\tagy\tattached,focused,UTF-8\tfocus\t1700000050\n'
+    ;;
+  list-panes)
+    printf '%%13\t1\tagy\n%%14\t0\tzsh\n'
+    ;;
+esac
+"#
+            ),
+        );
+        let tmux_env = TmuxEnv {
+            tmux: None,
+            tmpdir: None,
+            xdg_runtime_dir: Some(xdg.clone()),
+            default_tmp_dir: empty_tmp.clone(),
+            uid,
+        };
+        let state = query_desktop_with_env(
+            &hypr,
+            &tmux_xdg_only,
+            &proc_root,
+            &tmux_env,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.cwd.as_deref(), Some("/home/alice/repo"));
+        let tm = state.tmux.expect("tmux recovered via XDG_RUNTIME_DIR");
+        assert!(tm.focused);
+        assert_eq!(tm.session, "0");
+        assert_eq!(tm.window, "1:agy");
+        assert_eq!(tm.pane, "%13");
+        assert_eq!(tm.window_panes.as_deref(), Some("%13*(agy), %14(zsh)"));
+
+        // Detached session fallback also propagates the winning TMUX_TMPDIR to `list-panes -a`.
+        let tmux_detached_xdg = write_script(
+            &dir,
+            "tmux-detached-xdg",
+            &format!(
+                r#"
+if [ "${{TMUX_TMPDIR:-}}" != "{xdg_str}" ]; then
+  exit 1
+fi
+case "$1" in
+  list-clients)
+    exit 0
+    ;;
+  list-panes)
+    printf '1700000090\twork\t1\t0\tcode\t1\t%%5\t/home/alice/work\tnvim\n'
+    ;;
+esac
+"#
+            ),
+        );
+        let state = query_desktop_with_env(
+            &hypr,
+            &tmux_detached_xdg,
+            &proc_root,
+            &tmux_env,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let tm = state.tmux.expect("detached tmux recovered via fallback");
+        assert!(!tm.focused);
+        assert_eq!(tm.session, "work");
+        assert_eq!(tm.pane, "%5");
+
+        // When no alternate socket exists on disk, `tmux` is only spawned once.
+        let calls_file = dir.join("tmux-calls");
+        let tmux_counting = write_script(
+            &dir,
+            "tmux-counting",
+            &format!("echo x >> \"{}\"\nexit 1", calls_file.display()),
+        );
+        let no_sock_env = TmuxEnv {
+            tmux: None,
+            tmpdir: None,
+            xdg_runtime_dir: Some(dir.join("no-sock-xdg")),
+            default_tmp_dir: empty_tmp,
+            uid,
+        };
+        let state = query_desktop_with_env(
+            &hypr,
+            &tmux_counting,
+            &proc_root,
+            &no_sock_env,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(state.tmux.is_none());
+        let calls = std::fs::read_to_string(&calls_file).unwrap();
+        assert_eq!(calls.lines().count(), 1);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

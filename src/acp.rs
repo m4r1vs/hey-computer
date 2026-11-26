@@ -230,8 +230,8 @@ impl Connection {
         state_dir: &Path,
     ) -> Result<(Self, oneshot::Receiver<()>)> {
         let (program, args) = argv.split_first().context("the agent command is empty")?;
-        let mut child = Command::new(program)
-            .args(args)
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .current_dir(cwd)
             .env("HEY_COMPUTER_STATE_DIR", state_dir)
             .env("HEY_COMPUTER_ARTIFACTS_DIR", state_dir.join("artifacts"))
@@ -240,9 +240,11 @@ impl Connection {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("starting {program}"))?;
+            .kill_on_drop(true);
+        if let Some(tmux_tmpdir) = crate::context::detect_tmux_tmpdir() {
+            cmd.env("TMUX_TMPDIR", tmux_tmpdir);
+        }
+        let mut child = cmd.spawn().with_context(|| format!("starting {program}"))?;
         let pgid = child.id().and_then(|id| i32::try_from(id).ok());
 
         let stdin = child.stdin.take().context("no stdin")?;
