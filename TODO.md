@@ -1,27 +1,12 @@
-# `hey-computer` TODOs (from Obsidian)
+# `hey-computer` TODOs
 
-> **Source:** `Journal/2026-11-26.md` (plus linked note `Hey Computer Notification Prompt Bug.md`) in Obsidian (`Marius' Remote Vault`)
-> **Exported:** 2026-11-26
-> **Tags:** `[Upstream]` = `hey-computer` repo, `[Config]` = `~/NixConfig` / desktop setup, `[Research]` = exploration / spike
-
----
-
-## 1. Bugs & Fixes
-
-- [x] `[Upstream]` **Hide system prompts in the GTK viewer for scheduled & notification runs.**
-  - Morning brief and other scheduled/repeating actions display the full system prompt covering most of the screen when opened in the GTK viewer — hide it entirely for scheduled/repeating runs.
-  - Notification-acting has the same issue: a simple notification shows the full `<notification_task>` + `<untrusted_notification>` + `<untrusted_chat_context>` prompt wrapper (see Obsidian note `[[Hey Computer Notification Prompt Bug]]`).
-- [x] `[Upstream]` `[Config]` **Fix notification hold-and-enrich timing and audio sync.**
-  - The drafted reply is not always ready before the hold-back window expires — either always use an extremely fast model for notification triage/drafting or slightly increase the hold window.
-  - The notification sound for a held-back notification currently plays immediately; bring it back in sync with when the notification is actually released.
-- [x] `[Config]` **Fix Waybar `background` state styling.**
-  - When `hey-computer` background work is active (`waybar-hey-computer` `background` class), the module renders with an ugly background in Waybar.
-- [x] `[Config]` `[Upstream]` **Do not persist `hey-computer` notifications in SwayNC history.**
-  - Prevent `hey-computer` notifications from staying persisted in SwayNC's notification panel.
+> **Tags:** `[Upstream]` = `hey-computer` repo, `[Config]` = `~/NixConfig` / desktop setup, `[npu-dictate]` = dictation frontend, `[Research]` = exploration / spike, `[Obsidian]` = vault organization
+> **UI naming:** Use **"Ask Computer"** (not "Ask Hey Computer") in user-facing prompts, launchers, keybind descriptions, and UI labels.
+> **Trust policy:** No confirmation/permission prompts — trust the agent to act directly; add permission prompts later only if needed. (Previously disregarded: vault Git auto-backup, `permissions.ask` confirmation tier, `hey-computer log`, env-var filtering.)
 
 ---
 
-## 2. Viewer, Shortcuts & Desktop UX
+## 1. Viewer, Shortcuts & Desktop UX
 
 - [ ] `[Upstream]` `[Config]` **Quick-reopen shortcut & persistent viewer window (`Ctrl+Super+A`).**
   - Add a `Ctrl+Super+A` shortcut to open the last opened thread at its exact scroll/reading position.
@@ -34,19 +19,23 @@
 
 ---
 
-## 3. New Features & Workflows
+## 2. New Features & Workflows
 
-- [x] `[Upstream]` `[Config]` **`plan-my-day` workflow.**
-  - Especially for workdays: build a *"roter Faden"* for the day with concrete tasks and sub-TODOs, periodically reassess progress throughout the day, and optionally block time in Google Calendar for specific tasks.
+- [ ] `[npu-dictate]` `[Config]` **Hotword detection & TTS barge-in.**
+  - Always-on, local detection of `"Hey Computer"`, then recording until silence (VAD) and transcribing with the existing `npu-dictate` backend.
+  - Evaluate small wake-word models such as `openWakeWord` (custom phrase training) running on CPU or NPU; likely belongs in `npu-dictate` rather than `hey-computer`, with no daemon dependencies.
+  - Requirements: keep audio strictly local until the hotword fires; visible Waybar mic indicator; mute toggle; pause while another app holds the mic (calls) or while media is playing to avoid false triggers.
+  - **TTS barge-in:** Interrupt active TTS playback immediately once speaking/wake-word fires via `hey-computer cancel` / `quiet-speech` (post-turn TTS cancellation and push-to-talk key-down silence are already wired; gate hotword barge-in via PipeWire `module-echo-cancel` / headphones or wake-word-only detection during TTS playback to avoid speaker self-triggers).
+  - Measure the false-accept rate on real German and English speech before trusting it.
 - [ ] `[Upstream]` **WhatsApp message-to-self replies.**
   - Allow the agent to respond to Marius's own messages via WhatsApp (evaluate whitelisting self-chat so outbound write is enabled strictly for self-messages).
 
 ---
 
-## 4. Integrations & Tooling
+## 3. Integrations & Tooling
 
 - [ ] `[Config]` `[Upstream]` **`spotify_player` integration & Spotify info shortcut.**
-  - Add `spotify_player` support/integration to `hey-computer` so the agent can search for tracks/albums and play them *(merged duplicate Obsidian items)*.
+  - Add `spotify_player` support/integration to `hey-computer` so the agent can search for tracks/albums and play them.
   - Add a Spotify info keyboard shortcut powered by `hey-computer`.
   - [ ] *Related prerequisite:* Update the `spotify_player` fork.
 - [ ] `[Config]` **Integrate `hey-computer` into existing desktop scripts.**
@@ -59,7 +48,7 @@
 
 ---
 
-## 5. Architecture, Packaging & Research
+## 4. Architecture, Packaging & Research
 
 - [ ] `[Upstream]` `[Config]` **Consolidate Nix definitions into `hey-computer`.**
   - Move `hey-computer`-related Nix definitions currently living in `~/NixConfig` into the `hey-computer` repository where it makes sense.
@@ -72,10 +61,3 @@
   - Research a browser extension so `hey-computer` better understands active browser pages and context.
 - [ ] `[Obsidian]` **Structure `hey-computer` ideas better in Obsidian.**
   - Organize `hey-computer` notes/ideas into a cleaner structure inside the vault.
-
----
-
-## Recently Completed (already checked `[x]` in Obsidian)
-
-- [x] Add `hey-computer` to the Whisper glossary.
-- [x] Add `playerctl` support to `hey-computer`.

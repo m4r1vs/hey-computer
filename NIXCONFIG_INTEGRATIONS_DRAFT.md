@@ -5,7 +5,7 @@
 > and tools in `~/NixConfig` with `hey-computer` (`[Config]` = NixConfig Home
 > Manager/scripts, `[Upstream]` = `hey-computer`, `[Tool]` = own flake tool).
 > User-facing labels follow the **"Ask Computer"** naming convention from
-> `IMPROVEMENTS.md`.
+> `TODO.md`.
 
 ## Context & Architectural Premise
 
