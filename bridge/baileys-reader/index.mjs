@@ -814,10 +814,14 @@ async function startSocket() {
     emit({ type: "state", state: "starting" });
   }
 
+  // Use Ubuntu("Desktop") rather than macOS("Desktop"): Baileys maps
+  // macOS("Desktop") to WebSubPlatform.DARWIN, which WhatsApp servers reject
+  // immediately with HTTP/WS status 428, whereas Ubuntu("Desktop") negotiates
+  // PlatformType.DESKTOP + requireFullSync (syncFullHistory) over WEB_BROWSER.
   const desktopBrowser =
-    typeof Browsers?.macOS === "function"
-      ? Browsers.macOS("Desktop")
-      : ["Mac OS", "Desktop", "14.4.1"];
+    typeof Browsers?.ubuntu === "function"
+      ? Browsers.ubuntu("Desktop")
+      : ["Ubuntu", "Desktop", "22.04.4"];
 
   const socketConfig = {
     auth: {
@@ -996,151 +1000,136 @@ async function startSocket() {
     }
   });
 
-  if (!pairOnly) {
-    sock.ev.on("groups.upsert", (groups) => {
-      emitChatMetaBatch(processGroupObjects(groups));
-    });
+  sock.ev.on("groups.upsert", (groups) => {
+    emitChatMetaBatch(processGroupObjects(groups));
+  });
 
-    sock.ev.on("groups.update", (updates) => {
-      emitChatMetaBatch(processGroupObjects(updates));
-    });
+  sock.ev.on("groups.update", (updates) => {
+    emitChatMetaBatch(processGroupObjects(updates));
+  });
 
-    sock.ev.on("contacts.upsert", (contacts) => {
-      emitChatMetaBatch(processContactsList(contacts));
-    });
+  sock.ev.on("contacts.upsert", (contacts) => {
+    emitChatMetaBatch(processContactsList(contacts));
+  });
 
-    sock.ev.on("contacts.update", (contacts) => {
-      emitChatMetaBatch(processContactsList(contacts));
-    });
+  sock.ev.on("contacts.update", (contacts) => {
+    emitChatMetaBatch(processContactsList(contacts));
+  });
 
-    sock.ev.on(
-      "messaging-history.set",
-      async ({
-        chats,
-        contacts,
-        messages,
-        lidPnMappings,
-        syncType,
-        progress,
-        isLatest,
-      }) => {
-        for (const entry of lidPnMappings || []) {
-          ingestLidMappingEntry(entry);
+  sock.ev.on(
+    "messaging-history.set",
+    async ({
+      chats,
+      contacts,
+      messages,
+      lidPnMappings,
+      syncType,
+      progress,
+      isLatest,
+    }) => {
+      for (const entry of lidPnMappings || []) {
+        ingestLidMappingEntry(entry);
+      }
+
+      const metaItems = [];
+      metaItems.push(...processContactsList(contacts));
+
+      for (const chat of chats || []) {
+        if (!chat || typeof chat !== "object") continue;
+        const cid = normalizeJid(chat.id || "");
+        if (isIgnoredJid(cid)) continue;
+        const lidJid = normalizeJid(chat.lidJid || chat.lid || "");
+        const pnJid = normalizeJid(chat.pnJid || chat.phoneNumber || "");
+        if (lidJid && pnJid) recordLidPnMapping(lidJid, pnJid);
+        if (cid.endsWith("@lid") && pnJid) recordLidPnMapping(cid, pnJid);
+        if (lidJid && cid.endsWith("@s.whatsapp.net")) {
+          recordLidPnMapping(lidJid, cid);
         }
 
-        const metaItems = [];
-        metaItems.push(...processContactsList(contacts));
-
-        for (const chat of chats || []) {
-          if (!chat || typeof chat !== "object") continue;
-          const cid = normalizeJid(chat.id || "");
-          if (isIgnoredJid(cid)) continue;
-          const lidJid = normalizeJid(chat.lidJid || chat.lid || "");
-          const pnJid = normalizeJid(chat.pnJid || chat.phoneNumber || "");
-          if (lidJid && pnJid) recordLidPnMapping(lidJid, pnJid);
-          if (cid.endsWith("@lid") && pnJid) recordLidPnMapping(cid, pnJid);
-          if (lidJid && cid.endsWith("@s.whatsapp.net")) {
-            recordLidPnMapping(lidJid, cid);
+        const isGroup = cid.endsWith("@g.us");
+        const title = String(
+          chat.name ||
+            chat.subject ||
+            (isGroup ? groupSubjects.get(cid) : contactNames.get(cid)) ||
+            "",
+        ).trim();
+        if (title) {
+          if (isGroup) {
+            groupSubjects.set(cid, title);
+          } else {
+            contactNames.set(cid, title);
           }
+        }
 
-          const isGroup = cid.endsWith("@g.us");
-          const title = String(
-            chat.name ||
-              chat.subject ||
-              (isGroup ? groupSubjects.get(cid) : contactNames.get(cid)) ||
-              "",
-          ).trim();
-          if (title) {
-            if (isGroup) {
-              groupSubjects.set(cid, title);
-            } else {
-              contactNames.set(cid, title);
-            }
-          }
+        const lidDigits = extractLidDigits(lidJid || cid);
+        const resolvedE164 = isGroup
+          ? null
+          : jidToE164(pnJid) ||
+            jidToE164(cid) ||
+            (lidDigits ? lookupLidFromDisk(sessionDir, lidDigits) : null);
 
-          const lidDigits = extractLidDigits(lidJid || cid);
-          const resolvedE164 = isGroup
-            ? null
-            : jidToE164(pnJid) ||
-              jidToE164(cid) ||
-              (lidDigits ? lookupLidFromDisk(sessionDir, lidDigits) : null);
+        const aliases = [];
+        for (const a of [cid, lidJid, pnJid, resolvedE164]) {
+          if (a && !aliases.includes(a)) aliases.push(a);
+        }
+        metaItems.push({
+          raw_jid: cid,
+          resolved_e164: resolvedE164,
+          aliases,
+          is_group: isGroup,
+          title: title || null,
+        });
+      }
+      emitChatMetaBatch(metaItems);
 
-          const aliases = [];
-          for (const a of [cid, lidJid, pnJid, resolvedE164]) {
-            if (a && !aliases.includes(a)) aliases.push(a);
-          }
-          metaItems.push({
-            raw_jid: cid,
-            resolved_e164: resolvedE164,
-            aliases,
-            is_group: isGroup,
-            title: title || null,
+      const selfJid = normalizeJid(sock.user?.id || state.creds?.me?.id || "");
+      const selfLid = normalizeJid(
+        sock.user?.lid || state.creds?.me?.lid || "",
+      );
+      const selfE164 = jidToE164(selfJid);
+
+      const converted = [];
+      for (const msg of messages || []) {
+        const item = await convertWaMessage(
+          sock,
+          selfJid,
+          selfLid,
+          selfE164,
+          msg,
+          "history",
+        );
+        if (item) converted.push(item);
+      }
+
+      const syncTypeStr = String(syncType ?? "");
+      const progressNum =
+        typeof progress === "number" && Number.isFinite(progress)
+          ? progress
+          : null;
+      const latestFlag = Boolean(isLatest);
+
+      if (converted.length === 0) {
+        if (progressNum !== null || latestFlag) {
+          emit({
+            type: "history_batch",
+            sync_type: syncTypeStr,
+            progress: progressNum,
+            is_latest: latestFlag,
+            messages: [],
           });
         }
-        emitChatMetaBatch(metaItems);
+        return;
+      }
 
-        const selfJid = normalizeJid(sock.user?.id || state.creds?.me?.id || "");
-        const selfLid = normalizeJid(
-          sock.user?.lid || state.creds?.me?.lid || "",
-        );
-        const selfE164 = jidToE164(selfJid);
-
-        const converted = [];
-        for (const msg of messages || []) {
-          const item = await convertWaMessage(
-            sock,
-            selfJid,
-            selfLid,
-            selfE164,
-            msg,
-            "history",
-          );
-          if (item) converted.push(item);
-        }
-
-        const syncTypeStr = String(syncType ?? "");
-        const progressNum =
-          typeof progress === "number" && Number.isFinite(progress)
-            ? progress
-            : null;
-        const latestFlag = Boolean(isLatest);
-
-        if (converted.length === 0) {
-          if (progressNum !== null || latestFlag) {
-            emit({
-              type: "history_batch",
-              sync_type: syncTypeStr,
-              progress: progressNum,
-              is_latest: latestFlag,
-              messages: [],
-            });
-          }
-          return;
-        }
-
-        let chunk = [];
-        let bytes = 128;
-        for (const item of converted) {
-          const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8") + 2;
-          if (
-            chunk.length > 0 &&
-            (chunk.length >= MAX_HISTORY_CHUNK_COUNT ||
-              bytes + itemBytes > MAX_BATCH_JSON_BYTES)
-          ) {
-            emit({
-              type: "history_batch",
-              sync_type: syncTypeStr,
-              progress: progressNum,
-              is_latest: latestFlag,
-              messages: chunk,
-            });
-            chunk = [];
-            bytes = 128;
-          }
-          chunk.push(item);
-          bytes += itemBytes;
-        }
-        if (chunk.length > 0) {
+      let chunk = [];
+      let bytes = 128;
+      for (const item of converted) {
+        const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8") + 2;
+        if (
+          chunk.length > 0 &&
+          (chunk.length >= MAX_HISTORY_CHUNK_COUNT ||
+            bytes + itemBytes > MAX_BATCH_JSON_BYTES)
+        ) {
           emit({
             type: "history_batch",
             sync_type: syncTypeStr,
@@ -1148,10 +1137,25 @@ async function startSocket() {
             is_latest: latestFlag,
             messages: chunk,
           });
+          chunk = [];
+          bytes = 128;
         }
-      },
-    );
+        chunk.push(item);
+        bytes += itemBytes;
+      }
+      if (chunk.length > 0) {
+        emit({
+          type: "history_batch",
+          sync_type: syncTypeStr,
+          progress: progressNum,
+          is_latest: latestFlag,
+          messages: chunk,
+        });
+      }
+    },
+  );
 
+  if (!pairOnly) {
     sock.ev.on("messages.upsert", async (upsert) => {
       const upsertType = upsert?.type;
       if (upsertType !== "notify" && upsertType !== "append") {

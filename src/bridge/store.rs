@@ -282,6 +282,28 @@ impl BridgeStore {
         Ok(())
     }
 
+    /// Remove tombstoned group rows that have neither a title nor any stored messages
+    /// (e.g. left/deleted Signal groups where `name` and messages were cleared).
+    pub fn prune_empty_unnamed_groups(&mut self) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM chat_aliases
+             WHERE (platform, chat_id) IN (
+                 SELECT platform, chat_id FROM chats
+                 WHERE is_group = 1 AND title = '' AND message_count = 0
+             )",
+            [],
+        )?;
+        let removed = tx.execute(
+            "DELETE FROM chats WHERE is_group = 1 AND title = '' AND message_count = 0",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Upsert a batch of messages inside a single transaction, hydrating any
     /// previously empty rows, recomputing per-chat aggregates accurately, and
     /// optionally pruning oldest messages beyond `max_stored` (`0` = unlimited).

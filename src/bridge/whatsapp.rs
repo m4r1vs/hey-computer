@@ -20,9 +20,9 @@ use crate::bridge::config::{
     BridgeConfig, PairingLockGuard, ensure_private_dir, is_pairing_in_progress, normalize_e164,
     normalize_identifier, normalize_jid,
 };
-use crate::bridge::context::{InboundRawMessage, RawAdapterEvent};
+use crate::bridge::context::{InboundRawMessage, RawAdapterEvent, raw_to_store_input};
 use crate::bridge::protocol::{MAX_BRIDGE_LINE, Platform, PlatformState};
-use crate::bridge::store::ChatMetaRecord;
+use crate::bridge::store::{BridgeStore, ChatMetaRecord, StoredMessageInput};
 use crate::lines::{self, Line};
 
 /// Strictly read-only control commands sent to `baileys-reader` over stdin.
@@ -266,6 +266,9 @@ pub async fn run(
 
         let mut reader = BufReader::new(stdout);
         let mut auth_required = false;
+        let mut yielded_for_pairing = false;
+        let mut pair_poll = tokio::time::interval(Duration::from_secs(1));
+        pair_poll.tick().await;
 
         loop {
             tokio::select! {
@@ -277,6 +280,15 @@ pub async fn run(
                         let _ = child.wait().await;
                         stderr_task.abort();
                         return;
+                    }
+                }
+                _ = pair_poll.tick(), if uses_default_reader => {
+                    if is_pairing_in_progress(&session_dir) {
+                        tracing::info!("yielding active whatsapp reader while interactive pairing is in progress");
+                        yielded_for_pairing = true;
+                        terminate_process_group(child_pid);
+                        let _ = child.kill().await;
+                        break;
                     }
                 }
                 Some(ctrl) = ctrl_rx.recv() => {
@@ -416,6 +428,10 @@ pub async fn run(
 
         if *stop.borrow() {
             break;
+        }
+        if yielded_for_pairing {
+            backoff_secs = 2;
+            continue;
         }
         if auth_required {
             tracing::warn!(
@@ -660,9 +676,25 @@ fn normalize_baileys_message(
 }
 
 /// Interactive one-time QR pairing for WhatsApp (`hey-computer-bridge pair whatsapp`).
+///
+/// Acquires `.pairing.lock` so any running `hey-computer-messenger-bridge` daemon
+/// yields the session directory, clears any stale prior auth files so QR pairing
+/// always negotiates a clean `syncFullHistory` session without `401`/`428` stale-creds
+/// collisions, renders the QR code on inherited stderr, and indexes any initial
+/// bootstrap history batches emitted during the post-pair handshake directly into
+/// `history.db` before releasing the lock for daemon hot-attach.
 pub async fn pair_whatsapp(config: &BridgeConfig) -> Result<()> {
     let session_dir = whatsapp_session_dir(config)?;
     let _pair_lock = PairingLockGuard::acquire(&session_dir);
+
+    // Give any active daemon `baileys-reader` up to ~1.2s to observe `.pairing.lock`
+    // and release its open session before clearing prior auth artifacts.
+    if session_dir.join("creds.json").exists() {
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        clear_session_dir_preserving_lock(&session_dir)?;
+    }
+
+    let db_path = config.resolved_state_dir()?.join("history.db");
     let (program, base_args) = reader_program(config);
     let mut cmd = Command::new(&program);
     cmd.args(&base_args)
@@ -672,15 +704,85 @@ pub async fn pair_whatsapp(config: &BridgeConfig) -> Result<()> {
     if !config.whatsapp.sync_full_history {
         cmd.arg("--no-full-history");
     }
-    let status = cmd
+    let mut child = cmd
         .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .status()
-        .await
+        .spawn()
         .with_context(|| format!("spawning {program} --pair-only"))?;
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut reader = BufReader::new(stdout);
+    let mut pending_meta: Vec<ChatMetaRecord> = Vec::new();
+    let mut pending_msgs: Vec<StoredMessageInput> = Vec::new();
+
+    while let Ok(line) = lines::read(&mut reader, MAX_BRIDGE_LINE).await {
+        match line {
+            Line::Text(raw) => {
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<BaileysOutput>(&raw) {
+                    Ok(BaileysOutput::ChatMetaBatch { items }) => {
+                        pending_meta.extend(
+                            items
+                                .into_iter()
+                                .filter_map(normalize_baileys_chat_meta)
+                                .filter(|m| !m.is_group || config.whatsapp.groups_enabled),
+                        );
+                    }
+                    Ok(BaileysOutput::HistoryBatch { messages, .. }) => {
+                        pending_msgs.extend(
+                            messages
+                                .into_iter()
+                                .map(convert_baileys_message)
+                                .filter(|m| !m.is_group || config.whatsapp.groups_enabled)
+                                .map(|m| raw_to_store_input(&m)),
+                        );
+                    }
+                    Ok(BaileysOutput::Message(msg)) => {
+                        let inbound = convert_baileys_message(*msg);
+                        if !inbound.is_group || config.whatsapp.groups_enabled {
+                            pending_msgs.push(raw_to_store_input(&inbound));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Line::Eof => break,
+            Line::TooLong(_) | Line::NotUtf8 => continue,
+        }
+    }
+
+    let status = child.wait().await?;
     if !status.success() {
         bail!("WhatsApp pairing failed with status {status}");
+    }
+
+    if (!pending_meta.is_empty() || !pending_msgs.is_empty())
+        && let Ok(mut store) = BridgeStore::open(&db_path)
+    {
+        let _ = store.upsert_chat_meta_batch(&pending_meta);
+        let _ = store.upsert_messages_batch(&pending_msgs, config.max_stored_messages);
+    }
+
+    Ok(())
+}
+
+fn clear_session_dir_preserving_lock(session_dir: &std::path::Path) -> Result<()> {
+    for entry in std::fs::read_dir(session_dir)
+        .with_context(|| format!("reading whatsapp session dir {}", session_dir.display()))?
+    {
+        let entry = entry?;
+        if entry.file_name() == ".pairing.lock" {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
     }
     Ok(())
 }

@@ -162,6 +162,11 @@ impl ContactDirectory {
             return records;
         };
         for item in items {
+            if item.get("isMember").and_then(|v| v.as_bool()) == Some(false)
+                || item.get("isBlocked").and_then(|v| v.as_bool()) == Some(true)
+            {
+                continue;
+            }
             let Some(raw_id) = item
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -179,9 +184,10 @@ impl ContactDirectory {
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string);
 
-            if let Some(t) = &title {
-                self.groups.insert(chat_id.clone(), t.clone());
-            }
+            let Some(t) = title else {
+                continue;
+            };
+            self.groups.insert(chat_id.clone(), t.clone());
 
             records.push(ChatMetaRecord {
                 platform: Platform::Signal,
@@ -189,7 +195,7 @@ impl ContactDirectory {
                 aliases: vec![chat_id],
                 is_group: true,
                 is_self_chat: false,
-                title,
+                title: Some(t),
                 raw_jid: None,
             });
         }

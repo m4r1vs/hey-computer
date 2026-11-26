@@ -361,7 +361,7 @@ pub fn list_signal_desktop_groups(
 
     let mut groups: Vec<ChatSummary> = convs
         .into_values()
-        .filter(|c| c.is_group)
+        .filter(|c| c.is_group && (!c.title.is_empty() || c.active_at_ms > 0))
         .map(|c| ChatSummary {
             platform: Platform::Signal,
             chat_id: c.chat_id,
@@ -414,7 +414,13 @@ pub fn sync_signal_desktop(
 
     let meta_batch: Vec<ChatMetaRecord> = convs
         .values()
-        .filter(|c| !c.is_group || config.signal.groups_enabled)
+        .filter(|c| {
+            if c.is_group {
+                config.signal.groups_enabled && (!c.title.is_empty() || c.active_at_ms > 0)
+            } else {
+                true
+            }
+        })
         .map(|c| ChatMetaRecord {
             platform: Platform::Signal,
             chat_id: c.chat_id.clone(),
@@ -561,6 +567,7 @@ pub fn sync_signal_desktop(
     if max_ts > prev_watermark {
         store.set_sync_state(WATERMARK_KEY, &max_ts.to_string())?;
     }
+    let _ = store.prune_empty_unnamed_groups()?;
 
     Ok(SignalDesktopSyncSummary {
         conversations: conversations_count,

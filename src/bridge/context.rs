@@ -1009,7 +1009,7 @@ impl BridgeCore {
     }
 }
 
-fn raw_to_store_input(msg: &InboundRawMessage) -> StoredMessageInput {
+pub(crate) fn raw_to_store_input(msg: &InboundRawMessage) -> StoredMessageInput {
     StoredMessageInput {
         platform: msg.platform,
         chat_id: msg.chat_id.clone(),
