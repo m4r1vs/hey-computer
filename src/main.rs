@@ -244,6 +244,9 @@ enum Command {
         /// Open the viewer with the History drawer pre-filtered by this recall query.
         #[arg(long, value_name = "QUERY", conflicts_with_all = ["schedule", "schedules", "history"])]
         recall: Option<String>,
+        /// Reopen the last viewed thread/schedule at its saved scroll position.
+        #[arg(long, conflicts_with_all = ["turn_id", "schedule", "schedules", "history", "recall"])]
+        resume: bool,
         /// Focus the bottom follow-up composer on startup.
         #[arg(long)]
         focus_composer: bool,
@@ -709,6 +712,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             schedules,
             history,
             recall,
+            resume,
             focus_composer,
             detach,
             foreground,
@@ -722,6 +726,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
                 *schedules,
                 *history,
                 recall.as_deref(),
+                *resume,
                 *focus_composer,
                 *detach,
                 *foreground,
@@ -1064,6 +1069,7 @@ struct ViewerLaunchArgs<'a> {
     schedules: bool,
     history: bool,
     recall: Option<&'a str>,
+    resume: bool,
     focus_composer: bool,
 }
 
@@ -1094,6 +1100,9 @@ fn build_viewer_args(opts: &ViewerLaunchArgs<'_>) -> Vec<OsString> {
     if let Some(q) = opts.recall {
         args.push(OsString::from("--recall"));
         args.push(OsString::from(q));
+    }
+    if opts.resume {
+        args.push(OsString::from("--resume"));
     }
     if opts.focus_composer {
         args.push(OsString::from("--focus-composer"));
@@ -1159,11 +1168,12 @@ async fn view_cmd(
     schedules: bool,
     history: bool,
     recall: Option<&str>,
+    resume: bool,
     focus_composer: bool,
     detach: bool,
     foreground: bool,
 ) -> Result<ExitCode> {
-    let has_other_mode = schedule.is_some() || schedules || history || recall.is_some();
+    let has_other_mode = schedule.is_some() || schedules || history || recall.is_some() || resume;
     let (file, resolved_turn_id) = resolve_view_target(target, turn_id, has_other_mode);
     let launch_args = ViewerLaunchArgs {
         config_path,
@@ -1174,6 +1184,7 @@ async fn view_cmd(
         schedules,
         history,
         recall,
+        resume,
         focus_composer,
     };
 
@@ -1224,6 +1235,8 @@ async fn view_cmd(
         println!("opened schedule `{sched}` in viewer");
     } else if schedules {
         println!("opened schedules overview in viewer");
+    } else if resume {
+        println!("resumed last view in viewer");
     } else if let Some(path) = file.as_deref() {
         println!("opened {} in viewer", path.display());
     } else {
@@ -2336,6 +2349,7 @@ async fn schedule_cmd(
                 false,
                 None,
                 false,
+                false,
                 detach,
                 false,
             )
@@ -2803,6 +2817,18 @@ mod tests {
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
             vec!["--schedule", "morning-digest"]
+        );
+
+        let resume_args = build_viewer_args(&ViewerLaunchArgs {
+            resume: true,
+            ..ViewerLaunchArgs::default()
+        });
+        assert_eq!(
+            resume_args
+                .into_iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["--resume"]
         );
 
         let (file, tid) = resolve_view_target(Some("#42"), None, false);

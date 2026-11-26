@@ -329,7 +329,20 @@
     });
   }
 
+  function hostSaveViewState() {
+    return hostPost({
+      type: "save_view_state",
+      viewMode: state.viewMode || "thread",
+      turnId: state.latestTurnId !== undefined ? state.latestTurnId : null,
+      scheduleTarget: state.activeScheduleTarget || null,
+      scrollY: Math.max(0, Math.round(window.scrollY || 0))
+    });
+  }
+
   function hostCloseWindow() {
+    if (bootRestoreComplete) {
+      hostSaveViewState();
+    }
     if (rawHost && typeof rawHost.closeWindow === "function") {
       rawHost.closeWindow();
       return;
@@ -591,6 +604,12 @@
       openHistory: Boolean(boot.openHistory || boot.open_history),
       recallQuery: typeof boot.recallQuery === "string" ? boot.recallQuery : "",
       initialFindQuery: typeof boot.initialFindQuery === "string" ? boot.initialFindQuery : "",
+      initialScrollY:
+        typeof boot.initialScrollY === "number" &&
+        Number.isFinite(boot.initialScrollY) &&
+        boot.initialScrollY > 0
+          ? Math.round(boot.initialScrollY)
+          : 0,
       todayJournalPath: boot.todayJournalPath || localTodayJournalPath(),
       activatedDayPlanDates: Array.isArray(
         boot.activatedDayPlanDates || boot.activated_day_plan_dates
@@ -668,6 +687,28 @@
   let jumpList = [];
   let jumpIndex = 0;
   let pendingRestoreScrollY = null;
+  let bootRestoreComplete = false;
+  let userScrolledSinceBoot = false;
+  let viewStateSaveTimer = null;
+
+  function scheduleSaveViewState(immediate) {
+    if (!bootRestoreComplete) return;
+    if (immediate) {
+      if (viewStateSaveTimer !== null) {
+        clearTimeout(viewStateSaveTimer);
+        viewStateSaveTimer = null;
+      }
+      hostSaveViewState();
+      return;
+    }
+    if (viewStateSaveTimer !== null) {
+      clearTimeout(viewStateSaveTimer);
+    }
+    viewStateSaveTimer = setTimeout(function () {
+      viewStateSaveTimer = null;
+      hostSaveViewState();
+    }, 180);
+  }
 
   // Find bar origin scroll Y (for recording jump point on committed Enter jump)
   let findOriginScrollY = null;
@@ -1646,13 +1687,18 @@
 
     updateActivatedDayPlanDates(null);
 
-    if (!options.preserveScroll) {
+    if (pendingRestoreScrollY !== null) {
+      const y = pendingRestoreScrollY;
+      pendingRestoreScrollY = null;
+      window.scrollTo({ top: y, behavior: "instant" });
+    } else if (!options.preserveScroll) {
       if (scrollEl && thread.turns.length > 1) {
         scrollEl.scrollIntoView({ behavior: "instant", block: "start" });
       } else {
         window.scrollTo({ top: 0, behavior: "instant" });
       }
     }
+    scheduleSaveViewState(false);
   }
 
   /* ------------------------------------------------------------------------
@@ -1870,9 +1916,14 @@
     wrap.appendChild(cardsList);
     dom.readingColumn.appendChild(wrap);
 
-    if (!preserveScroll) {
+    if (pendingRestoreScrollY !== null) {
+      const y = pendingRestoreScrollY;
+      pendingRestoreScrollY = null;
+      window.scrollTo({ top: y, behavior: "instant" });
+    } else if (!preserveScroll) {
       window.scrollTo({ top: 0, behavior: "instant" });
     }
+    scheduleSaveViewState(false);
   }
 
   function renderScheduleInspector(detail, preserveScroll) {
@@ -2089,6 +2140,7 @@
     } else if (!preserveScroll) {
       window.scrollTo({ top: 0, behavior: "instant" });
     }
+    scheduleSaveViewState(false);
   }
 
   /* ------------------------------------------------------------------------
@@ -3453,6 +3505,10 @@
     syncTurnInfo(false);
     setSpeakingState(false);
 
+    if (state.initialScrollY > 0) {
+      pendingRestoreScrollY = state.initialScrollY;
+    }
+
     if (state.viewMode === "schedule_inspector" && state.scheduleDetail) {
       renderScheduleInspector(state.scheduleDetail, false);
     } else if (state.viewMode === "schedules_overview") {
@@ -3461,6 +3517,49 @@
       renderActiveThread();
     }
     renderHistoryResults(state.history);
+
+    if (state.initialScrollY > 0) {
+      const targetY = state.initialScrollY;
+      const markUserScrolled = function () {
+        userScrolledSinceBoot = true;
+      };
+      window.addEventListener("wheel", markUserScrolled, { once: true, passive: true });
+      window.addEventListener("touchstart", markUserScrolled, { once: true, passive: true });
+      window.addEventListener("keydown", markUserScrolled, { once: true });
+
+      requestAnimationFrame(function () {
+        if (!userScrolledSinceBoot) {
+          window.scrollTo({ top: targetY, behavior: "instant" });
+        }
+        bootRestoreComplete = true;
+        scheduleSaveViewState(false);
+      });
+
+      if (document.fonts && document.fonts.ready && typeof document.fonts.ready.then === "function") {
+        document.fonts.ready.then(function () {
+          if (!userScrolledSinceBoot) {
+            window.scrollTo({ top: targetY, behavior: "instant" });
+            scheduleSaveViewState(false);
+          }
+        });
+      }
+    } else {
+      bootRestoreComplete = true;
+    }
+
+    window.addEventListener(
+      "scroll",
+      function () {
+        scheduleSaveViewState(false);
+      },
+      { passive: true }
+    );
+    window.addEventListener("pagehide", function () {
+      scheduleSaveViewState(true);
+    });
+    window.addEventListener("beforeunload", function () {
+      scheduleSaveViewState(true);
+    });
 
     if (state.openHistory || state.recallQuery) {
       toggleHistoryDrawer(true, {

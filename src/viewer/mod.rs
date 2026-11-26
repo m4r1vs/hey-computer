@@ -43,9 +43,10 @@ use webkit6::{
 };
 
 use self::actions::{
-    SnippetOutcome, approve_distill_changes, copy_to_clipboard_persistent,
-    execute_snippet_with_timeout, plan_openhue_commands, run_openhue_plan, save_skill_files,
-    save_to_vault, toggle_vault_journal_task,
+    SnippetOutcome, ViewerResumeState, approve_distill_changes, copy_to_clipboard_persistent,
+    execute_snippet_with_timeout, load_viewer_resume_state, plan_openhue_commands,
+    run_openhue_plan, save_skill_files, save_to_vault, save_viewer_resume_state,
+    toggle_vault_journal_task,
 };
 use self::loader::{
     ViewerThread, load_activated_day_plan_dates, load_schedule_detail, load_schedule_summaries,
@@ -203,6 +204,10 @@ pub struct Cli {
     #[arg(long)]
     pub drop_cap: bool,
 
+    /// Reopen the last viewed thread/schedule at its saved scroll position.
+    #[arg(long)]
+    pub resume: bool,
+
     /// Auto-focus the bottom "Ask Computer" follow-up composer on load.
     #[arg(long)]
     pub focus_composer: bool,
@@ -243,6 +248,7 @@ struct AppState {
     active_thread: RefCell<ViewerThread>,
     latest_turn_id: Cell<Option<u64>>,
     active_schedule_target: RefCell<Option<String>>,
+    last_view_state: RefCell<ViewerResumeState>,
     boot_json: String,
     initial_palette: Option<WallpaperPalette>,
     theme_monitors: RefCell<Vec<gio::FileMonitor>>,
@@ -522,6 +528,12 @@ struct IncomingMessage {
     message: Option<String>,
     #[serde(default)]
     payload: Option<Value>,
+    #[serde(default, alias = "view_mode")]
+    view_mode: Option<String>,
+    #[serde(default, alias = "schedule_target")]
+    schedule_target: Option<String>,
+    #[serde(default, alias = "scroll_y")]
+    scroll_y: Option<f64>,
 }
 
 fn parse_optional_u64(val: Option<&Value>) -> Option<u64> {
@@ -561,6 +573,151 @@ fn format_window_title(subtitle: &str) -> String {
     }
 }
 
+struct ResolvedStartup {
+    thread: ViewerThread,
+    latest_turn_id: Option<u64>,
+    initial_view: &'static str,
+    schedule_detail: Option<loader::ViewerScheduleDetail>,
+    initial_schedule_target: Option<String>,
+    initial_scroll_y: f64,
+    resume_state: ViewerResumeState,
+    schedules: Vec<loader::ViewerScheduleSummary>,
+}
+
+fn resolve_startup(
+    cli: &Cli,
+    state_dir: Option<&Path>,
+    socket: Option<&Path>,
+) -> Result<ResolvedStartup> {
+    let explicit_target =
+        cli.turn_id.is_some() || cli.file.is_some() || cli.schedule.is_some() || cli.schedules;
+    let saved_resume = if cli.resume && !explicit_target {
+        load_viewer_resume_state(state_dir)
+    } else {
+        None
+    };
+
+    let mut effective_turn_id = cli.turn_id;
+    let mut effective_file = cli.file.clone();
+    let mut effective_schedule = cli.schedule.clone();
+    let mut effective_schedules = cli.schedules;
+    let mut initial_scroll_y = 0.0;
+
+    if let Some(ref saved) = saved_resume {
+        match saved.view_mode.as_str() {
+            "schedules_overview" => {
+                effective_schedules = true;
+                initial_scroll_y = saved.scroll_y;
+            }
+            "schedule_inspector" if saved.schedule_target.is_some() => {
+                effective_schedule = saved.schedule_target.clone();
+                initial_scroll_y = saved.scroll_y;
+            }
+            _ => {
+                effective_turn_id = saved.turn_id;
+                effective_file = saved.file.clone().filter(|p| p.exists());
+                initial_scroll_y = saved.scroll_y;
+            }
+        }
+    }
+
+    let (initial_thread, mut latest_turn_id) = resolve_initial_thread(
+        state_dir,
+        effective_turn_id,
+        effective_file.as_deref(),
+        cli.drop_cap,
+    )?;
+
+    // Only apply saved scroll offset when the resumed thread actually matched.
+    if let Some(ref saved) = saved_resume
+        && saved.view_mode == "thread"
+    {
+        let matched = if let Some(wanted_id) = saved.turn_id {
+            initial_thread
+                .turns
+                .iter()
+                .any(|t| t.turn_id == Some(wanted_id))
+                || latest_turn_id == Some(wanted_id)
+        } else {
+            effective_file.is_some()
+        };
+        if !matched {
+            initial_scroll_y = 0.0;
+        }
+    }
+
+    let running_ids = if effective_schedules || effective_schedule.is_some() {
+        query_running_schedule_ids(socket)
+    } else {
+        Default::default()
+    };
+    let schedules = load_schedule_summaries(state_dir, &running_ids);
+
+    let mut initial_view = "thread";
+    let mut schedule_detail = None;
+    let mut initial_schedule_target = None;
+    if let Some(ref target) = effective_schedule {
+        match load_schedule_detail(state_dir, target, &running_ids, cli.drop_cap) {
+            Ok(Some(detail)) => {
+                if let Some(lt_id) = detail.latest_turn.as_ref().and_then(|t| t.turn_id) {
+                    latest_turn_id = Some(lt_id);
+                }
+                initial_schedule_target = Some(detail.summary.name.clone());
+                schedule_detail = Some(detail);
+                initial_view = "schedule_inspector";
+            }
+            Ok(None) => {
+                eprintln!(
+                    "hey-computer-viewer: schedule `{target}` not found; opening schedules overview"
+                );
+                initial_view = "schedules_overview";
+                initial_scroll_y = 0.0;
+            }
+            Err(err) => {
+                tracing::warn!("cannot load schedule `{target}`: {err:#}");
+                initial_view = "schedules_overview";
+                initial_scroll_y = 0.0;
+            }
+        }
+    } else if effective_schedules {
+        initial_view = "schedules_overview";
+    }
+
+    let resume_state = ViewerResumeState {
+        view_mode: initial_view.to_string(),
+        turn_id: latest_turn_id,
+        file: if initial_view == "thread" && latest_turn_id.is_none() {
+            effective_file.filter(|p| p.exists())
+        } else {
+            None
+        },
+        schedule_target: initial_schedule_target.clone(),
+        scroll_y: initial_scroll_y,
+    }
+    .normalized();
+
+    Ok(ResolvedStartup {
+        thread: initial_thread,
+        latest_turn_id,
+        initial_view,
+        schedule_detail,
+        initial_schedule_target,
+        initial_scroll_y,
+        resume_state,
+        schedules,
+    })
+}
+
+fn persist_view_state(state: &AppState) {
+    if state.cli.snapshot.is_some() {
+        return;
+    }
+    let current = state.last_view_state.borrow().clone();
+    if let Err(err) = save_viewer_resume_state(state.state_dir.as_deref(), &current) {
+        tracing::debug!("failed saving viewer resume state: {err:#}");
+    }
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -583,49 +740,18 @@ pub fn run() -> Result<()> {
     let skills_dir = config.user_skills_dir();
     let assets_dir = resolve_assets_dir();
 
-    let (initial_thread, mut latest_turn_id) = resolve_initial_thread(
-        state_dir.as_deref(),
-        cli.turn_id,
-        cli.file.as_deref(),
-        cli.drop_cap,
-    )?;
+    let startup = resolve_startup(&cli, state_dir.as_deref(), socket.as_deref())?;
+    let initial_thread = startup.thread;
+    let latest_turn_id = startup.latest_turn_id;
+    let initial_view = startup.initial_view;
+    let schedule_detail = startup.schedule_detail;
+    let initial_schedule_target = startup.initial_schedule_target;
+    let initial_scroll_y = startup.initial_scroll_y;
+    let initial_resume_state = startup.resume_state;
+    let schedules = startup.schedules;
+
     let initial_recall_query = cli.recall.as_deref().unwrap_or("");
     let history_entries = query_history_entries(state_dir.as_deref(), initial_recall_query, 30);
-
-    let running_ids = if cli.schedules || cli.schedule.is_some() {
-        query_running_schedule_ids(socket.as_deref())
-    } else {
-        Default::default()
-    };
-    let schedules = load_schedule_summaries(state_dir.as_deref(), &running_ids);
-
-    let mut initial_view = "thread";
-    let mut schedule_detail = None;
-    let mut initial_schedule_target = None;
-    if let Some(ref target) = cli.schedule {
-        match load_schedule_detail(state_dir.as_deref(), target, &running_ids, cli.drop_cap) {
-            Ok(Some(detail)) => {
-                if let Some(lt_id) = detail.latest_turn.as_ref().and_then(|t| t.turn_id) {
-                    latest_turn_id = Some(lt_id);
-                }
-                initial_schedule_target = Some(detail.summary.name.clone());
-                schedule_detail = Some(detail);
-                initial_view = "schedule_inspector";
-            }
-            Ok(None) => {
-                eprintln!(
-                    "hey-computer-viewer: schedule `{target}` not found; opening schedules overview"
-                );
-                initial_view = "schedules_overview";
-            }
-            Err(err) => {
-                tracing::warn!("cannot load schedule `{target}`: {err:#}");
-                initial_view = "schedules_overview";
-            }
-        }
-    } else if cli.schedules {
-        initial_view = "schedules_overview";
-    }
 
     let system_dark = detect_system_dark();
     let resolved_dark = resolve_is_dark(cli.force_theme, system_dark);
@@ -644,6 +770,7 @@ pub fn run() -> Result<()> {
         "openHistory": cli.history || cli.recall.is_some(),
         "recallQuery": initial_recall_query,
         "initialFindQuery": cli.initial_find.as_deref().unwrap_or(""),
+        "initialScrollY": initial_scroll_y,
         "initialView": initial_view,
         "scheduleTarget": initial_schedule_target,
         "schedules": schedules,
@@ -682,6 +809,7 @@ pub fn run() -> Result<()> {
         active_thread: RefCell::new(initial_thread),
         latest_turn_id: Cell::new(latest_turn_id),
         active_schedule_target: RefCell::new(initial_schedule_target),
+        last_view_state: RefCell::new(initial_resume_state),
         boot_json,
         initial_palette,
         theme_monitors: RefCell::new(Vec::new()),
@@ -689,6 +817,7 @@ pub fn run() -> Result<()> {
         tts_gen: Cell::new(0),
         clipboard_workers: RefCell::new(Vec::new()),
     });
+    persist_view_state(&state);
 
     let app = gtk4::Application::builder()
         .application_id(&app_id)
@@ -775,10 +904,11 @@ fn build_ui(app: &gtk4::Application, state: &Rc<AppState>) {
         .child(&webview)
         .build();
 
-    // Stop any active TTS stream cleanly if the window is closed via WM or shortcut.
+    // Stop any active TTS stream and persist last reading position on window close.
     let state_for_close = Rc::clone(state);
     let wv_for_close = webview.clone();
     window.connect_close_request(move |_| {
+        persist_view_state(&state_for_close);
         stop_active_tts(&state_for_close, &wv_for_close);
         glib::Propagation::Proceed
     });
@@ -1068,6 +1198,15 @@ fn dispatch_open_schedule(
                 }
                 *state_clone.active_schedule_target.borrow_mut() =
                     Some(detail.summary.name.clone());
+                {
+                    let mut last = state_clone.last_view_state.borrow_mut();
+                    last.view_mode = "schedule_inspector".to_string();
+                    last.turn_id = detail.latest_turn.as_ref().and_then(|t| t.turn_id);
+                    last.file = None;
+                    last.schedule_target = Some(detail.summary.name.clone());
+                    last.scroll_y = 0.0;
+                }
+                persist_view_state(&state_clone);
                 win.set_title(Some(&format_window_title(&detail.summary.title)));
                 dispatch_to_js(
                     &wv,
@@ -1213,10 +1352,55 @@ fn handle_ipc_message(
             }
             if let Some(latest) = parse_optional_u64(msg.latest_turn_id.as_ref()) {
                 state.latest_turn_id.set(Some(latest));
+                let mut last = state.last_view_state.borrow_mut();
+                last.turn_id = Some(latest);
+                last.file = None;
             }
             if let Some(ref title) = msg.title {
                 window.set_title(Some(&format_window_title(title)));
             }
+            persist_view_state(state);
+        }
+        "save_view_state" => {
+            {
+                let mut last = state.last_view_state.borrow_mut();
+                if let Some(ref mode) = msg.view_mode {
+                    last.view_mode = mode.clone();
+                }
+                if let Some(tid) = parse_optional_u64(
+                    msg.turn_id
+                        .as_ref()
+                        .or(msg.latest_turn_id.as_ref())
+                        .or(msg.id.as_ref()),
+                ) {
+                    last.turn_id = Some(tid);
+                    last.file = None;
+                } else if last.view_mode == "thread"
+                    && let Some(cur) = state.latest_turn_id.get()
+                {
+                    last.turn_id = Some(cur);
+                    last.file = None;
+                }
+                if last.view_mode == "schedule_inspector" {
+                    if let Some(ref target) = msg.schedule_target
+                        && !target.trim().is_empty()
+                    {
+                        last.schedule_target = Some(target.trim().to_string());
+                    }
+                    last.file = None;
+                } else if last.view_mode == "schedules_overview" {
+                    last.schedule_target = None;
+                    last.file = None;
+                } else {
+                    last.schedule_target = None;
+                }
+                if let Some(y) = msg.scroll_y
+                    && y.is_finite()
+                {
+                    last.scroll_y = y.max(0.0).round();
+                }
+            }
+            persist_view_state(state);
         }
         "load_schedules" => {
             stop_active_tts(state, webview);
@@ -1539,6 +1723,15 @@ fn handle_ipc_message(
                 Ok(Some((thread, latest_id))) => {
                     state.latest_turn_id.set(Some(latest_id));
                     *state.active_schedule_target.borrow_mut() = None;
+                    {
+                        let mut last = state.last_view_state.borrow_mut();
+                        last.view_mode = "thread".to_string();
+                        last.turn_id = Some(latest_id);
+                        last.file = None;
+                        last.schedule_target = None;
+                        last.scroll_y = 0.0;
+                    }
+                    persist_view_state(state);
                     window.set_title(Some(&format_window_title(&thread.title)));
                     let activated_day_plan_dates = load_activated_day_plan_dates(Some(dir));
                     dispatch_to_js(
@@ -3054,6 +3247,7 @@ mod tests {
             "--recall",
             "transit",
             "--drop-cap",
+            "--resume",
             "--focus-composer",
             "--force-theme",
             "dark",
@@ -3078,6 +3272,7 @@ mod tests {
         assert!(cli.history);
         assert_eq!(cli.recall.as_deref(), Some("transit"));
         assert!(cli.drop_cap);
+        assert!(cli.resume);
         assert!(cli.focus_composer);
         assert_eq!(cli.force_theme, Some(ForceTheme::Dark));
         assert_eq!(cli.width, 1200);
@@ -3837,6 +4032,140 @@ mod tests {
             err.to_string().contains("timed out"),
             "unexpected timeout error: {err:#}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn persists_and_resolves_viewer_resume_state() {
+        use super::actions::{
+            ViewerResumeState, load_viewer_resume_state, save_viewer_resume_state,
+            viewer_resume_state_path,
+        };
+        use super::resolve_startup;
+        use hey_computer::config::History;
+        use hey_computer::store::{Lane, NewTurn, Store, TurnOrigin, TurnStatus};
+
+        let dir = temp_test_dir("resume");
+        let (store, _) = Store::open(&dir, &History::default()).expect("open store");
+        store.create_turn(NewTurn {
+            id: 10,
+            lane: Lane::Interactive,
+            status: TurnStatus::Queued,
+            profile: "fast".to_string(),
+            created_at_ms: 1_764_060_000_000,
+            request: "First topic".to_string(),
+            attachments: Vec::new(),
+            origin: TurnOrigin::Cli,
+            schedule_id: None,
+        });
+        store.finish_completed(
+            10,
+            "# First Topic\n\nLong answer body.".to_string(),
+            Vec::new(),
+            1_764_060_001_000,
+        );
+        store.create_turn(NewTurn {
+            id: 20,
+            lane: Lane::Interactive,
+            status: TurnStatus::Queued,
+            profile: "fast".to_string(),
+            created_at_ms: 1_764_060_100_000,
+            request: "Second topic".to_string(),
+            attachments: Vec::new(),
+            origin: TurnOrigin::Cli,
+            schedule_id: None,
+        });
+        store.finish_completed(
+            20,
+            "# Second Topic\n\nNewer answer.".to_string(),
+            Vec::new(),
+            1_764_060_101_000,
+        );
+        store.flush().await;
+        store.shutdown().await;
+
+        // 1. Save older thread (#10) with an exact scroll offset; verify 0600 permissions.
+        save_viewer_resume_state(
+            Some(&dir),
+            &ViewerResumeState {
+                view_mode: "thread".to_string(),
+                turn_id: Some(10),
+                file: None,
+                schedule_target: None,
+                scroll_y: 432.6,
+            },
+        )
+        .expect("save resume state");
+        let state_file = viewer_resume_state_path(&dir);
+        let mode = std::fs::metadata(&state_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let loaded = load_viewer_resume_state(Some(&dir)).expect("load resume state");
+        assert_eq!(loaded.view_mode, "thread");
+        assert_eq!(loaded.turn_id, Some(10));
+        assert_eq!(loaded.scroll_y, 433.0);
+
+        // 2. `--resume` reopens turn #10 (not newer #20) at scroll_y = 433.
+        let cli_resume = Cli::try_parse_from(["hey-computer-viewer", "--resume"]).unwrap();
+        let resumed = resolve_startup(&cli_resume, Some(&dir), None).expect("resolve --resume");
+        assert_eq!(resumed.initial_view, "thread");
+        assert_eq!(resumed.latest_turn_id, Some(10));
+        assert_eq!(resumed.initial_scroll_y, 433.0);
+
+        // 3. Explicit `--turn-id` overrides `--resume` and starts at scroll 0.
+        let cli_explicit =
+            Cli::try_parse_from(["hey-computer-viewer", "--resume", "--turn-id", "20"]).unwrap();
+        let explicit = resolve_startup(&cli_explicit, Some(&dir), None).expect("resolve explicit");
+        assert_eq!(explicit.latest_turn_id, Some(20));
+        assert_eq!(explicit.initial_scroll_y, 0.0);
+
+        // 4. Saved schedules_overview restores view + scroll offset.
+        save_viewer_resume_state(
+            Some(&dir),
+            &ViewerResumeState {
+                view_mode: "schedules_overview".to_string(),
+                turn_id: None,
+                file: None,
+                schedule_target: None,
+                scroll_y: 180.0,
+            },
+        )
+        .unwrap();
+        let resumed_sched =
+            resolve_startup(&cli_resume, Some(&dir), None).expect("resolve schedules overview");
+        assert_eq!(resumed_sched.initial_view, "schedules_overview");
+        assert_eq!(resumed_sched.initial_scroll_y, 180.0);
+
+        // 5. Missing/pruned turn falls back cleanly with scroll reset to 0.
+        save_viewer_resume_state(
+            Some(&dir),
+            &ViewerResumeState {
+                view_mode: "thread".to_string(),
+                turn_id: Some(9999),
+                file: None,
+                schedule_target: None,
+                scroll_y: 500.0,
+            },
+        )
+        .unwrap();
+        let pruned = resolve_startup(&cli_resume, Some(&dir), None).expect("resolve pruned turn");
+        assert_eq!(pruned.initial_scroll_y, 0.0);
+
+        // 6. Negative / NaN scroll offsets clamp safely to 0.
+        save_viewer_resume_state(
+            Some(&dir),
+            &ViewerResumeState {
+                view_mode: "thread".to_string(),
+                turn_id: Some(20),
+                file: None,
+                schedule_target: None,
+                scroll_y: -42.0,
+            },
+        )
+        .unwrap();
+        let clamped = load_viewer_resume_state(Some(&dir)).unwrap();
+        assert_eq!(clamped.scroll_y, 0.0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

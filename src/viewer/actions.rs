@@ -1412,6 +1412,110 @@ pub fn copy_to_clipboard_persistent(
 }
 
 /* --------------------------------------------------------------------------
+Viewer Resume State (`<state_dir>/viewer_last.json`, mode `0600`)
+-------------------------------------------------------------------------- */
+
+/// Persisted last-opened viewer target and exact reading scroll offset so
+/// `hey-computer view --resume` can reopen where the user left off.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewerResumeState {
+    #[serde(default)]
+    pub view_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_target: Option<String>,
+    #[serde(default)]
+    pub scroll_y: f64,
+}
+
+impl ViewerResumeState {
+    pub fn has_target(&self) -> bool {
+        match self.view_mode.as_str() {
+            "schedules_overview" => true,
+            "schedule_inspector" => self
+                .schedule_target
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty()),
+            _ => {
+                self.turn_id.is_some_and(|id| id > 0)
+                    || self
+                        .file
+                        .as_ref()
+                        .is_some_and(|p| !p.as_os_str().is_empty())
+            }
+        }
+    }
+
+    pub fn normalized(&self) -> Self {
+        let view_mode = match self.view_mode.as_str() {
+            "schedules_overview" | "schedule_inspector" => self.view_mode.clone(),
+            _ => "thread".to_string(),
+        };
+        let scroll_y = if self.scroll_y.is_finite() && self.scroll_y > 0.0 {
+            self.scroll_y.round()
+        } else {
+            0.0
+        };
+        let turn_id = self.turn_id.filter(|&id| id > 0);
+        let schedule_target = self
+            .schedule_target
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        let file = if view_mode == "thread" && turn_id.is_none() {
+            self.file
+                .as_ref()
+                .filter(|p| !p.as_os_str().is_empty())
+                .cloned()
+        } else {
+            None
+        };
+        Self {
+            view_mode,
+            turn_id,
+            file,
+            schedule_target,
+            scroll_y,
+        }
+    }
+}
+
+pub fn viewer_resume_state_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("viewer_last.json")
+}
+
+pub fn load_viewer_resume_state(state_dir: Option<&Path>) -> Option<ViewerResumeState> {
+    let dir = state_dir?;
+    let path = viewer_resume_state_path(dir);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let parsed: ViewerResumeState = serde_json::from_str(&raw).ok()?;
+    let norm = parsed.normalized();
+    norm.has_target().then_some(norm)
+}
+
+pub fn save_viewer_resume_state(
+    state_dir: Option<&Path>,
+    resume: &ViewerResumeState,
+) -> Result<()> {
+    let Some(dir) = state_dir.filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    let norm = resume.normalized();
+    if !norm.has_target() {
+        return Ok(());
+    }
+    ensure_private_dir_0700(dir)?;
+    let path = viewer_resume_state_path(dir);
+    let json = serde_json::to_string(&norm).context("serializing viewer resume state")?;
+    atomic_write_private_0600(&path, json.as_bytes())
+}
+
+/* --------------------------------------------------------------------------
 Atomic Filesystem Helpers
 -------------------------------------------------------------------------- */
 
