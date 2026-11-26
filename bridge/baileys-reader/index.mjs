@@ -3,13 +3,15 @@
 //
 // Invariants:
 // - Never calls sendMessage, readMessages, sendPresenceUpdate, or sendReceipt.
-// - Runs with markOnlineOnConnect: false and syncFullHistory: false.
-// - Ignores stdin completely in daemon mode (one-way JSONL output on stdout).
+// - Runs with markOnlineOnConnect: false (never alters online/read state).
+// - Accepts ONLY `{"type":"fetch_history",...}` on stdin in daemon mode for
+//   read-only historical message paging.
 // - Scrubs libsignal SessionEntry objects before anything reaches stderr.
 // - Writes creds.json atomically (0600) with .bak recovery.
 
 import fs from "node:fs";
 import path from "node:path";
+import readline from "node:readline";
 import util from "node:util";
 
 // ---------------------------------------------------------------------------
@@ -82,6 +84,7 @@ for (const method of ["log", "info", "warn", "error", "debug", "trace"]) {
 
 const {
   default: makeWASocket,
+  Browsers,
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
@@ -98,6 +101,7 @@ const { default: qrcode } = await import("qrcode-terminal");
 function parseArgs(argv) {
   let sessionDir = "";
   let pairOnly = false;
+  let fullHistory = true;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--session") {
@@ -107,9 +111,11 @@ function parseArgs(argv) {
       sessionDir = arg.slice("--session=".length);
     } else if (arg === "--pair-only") {
       pairOnly = true;
+    } else if (arg === "--no-full-history") {
+      fullHistory = false;
     } else if (arg === "--help" || arg === "-h") {
       rawStderrWrite(
-        "Usage: hey-computer-baileys-reader --session <dir> [--pair-only]\n",
+        "Usage: hey-computer-baileys-reader --session <dir> [--pair-only] [--no-full-history]\n",
       );
       process.exit(0);
     } else {
@@ -121,15 +127,10 @@ function parseArgs(argv) {
     rawStderrWrite("Missing required --session <dir>\n");
     process.exit(2);
   }
-  return { sessionDir, pairOnly };
+  return { sessionDir, pairOnly, fullHistory };
 }
 
-const { sessionDir, pairOnly } = parseArgs(process.argv.slice(2));
-
-// Daemon mode never reads stdin; pause it explicitly.
-if (!pairOnly && process.stdin) {
-  process.stdin.pause();
-}
+const { sessionDir, pairOnly, fullHistory } = parseArgs(process.argv.slice(2));
 
 // Enforce private file permissions for all created session artifacts.
 if (typeof process.umask === "function") {
@@ -137,11 +138,20 @@ if (typeof process.umask === "function") {
 }
 
 // ---------------------------------------------------------------------------
-// 4. One-way JSONL stdout emitter
+// 4. JSONL stdout emitter (chunked well below MAX_BRIDGE_LINE = 128 KiB)
 // ---------------------------------------------------------------------------
+
+const MAX_HISTORY_CHUNK_COUNT = 80;
+const MAX_BATCH_JSON_BYTES = 92 * 1024;
+const MAX_SINGLE_TEXT_CHARS = 24 * 1024;
 
 function emit(event) {
   process.stdout.write(`${JSON.stringify(event)}\n`);
+}
+
+function clampString(val, maxChars = MAX_SINGLE_TEXT_CHARS) {
+  if (!val || typeof val !== "string") return "";
+  return val.length > maxChars ? val.slice(0, maxChars) : val;
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +281,7 @@ function rememberRawMessage(key, message) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Identity, @lid resolution, and message unwrapping
+// 7. Identity, @lid resolution, group/contact caches, and message unwrapping
 // ---------------------------------------------------------------------------
 
 function normalizeJid(jid) {
@@ -285,6 +295,15 @@ function normalizeJid(jid) {
   return `${bareUser}@${domain}`;
 }
 
+function isIgnoredJid(jid) {
+  return (
+    !jid ||
+    jid === "status@broadcast" ||
+    jid.endsWith("@broadcast") ||
+    jid.endsWith("@newsletter")
+  );
+}
+
 function jidToE164(jid) {
   const norm = normalizeJid(jid);
   if (!norm.endsWith("@s.whatsapp.net")) return null;
@@ -293,14 +312,58 @@ function jidToE164(jid) {
   return `+${digits}`;
 }
 
+function anyPhoneToE164(val) {
+  if (!val) return null;
+  const str = String(val).trim();
+  const fromJid = jidToE164(str);
+  if (fromJid) return fromJid;
+  if (str.includes("@")) return null;
+  const digits = str.replace(/\D/g, "");
+  if (digits.length < 7 || digits.length > 15) return null;
+  return `+${digits}`;
+}
+
 function extractLidDigits(jid) {
   const norm = normalizeJid(jid);
-  if (!norm.endsWith("@lid")) return null;
-  const digits = norm.slice(0, -"@lid".length).replace(/\D/g, "");
-  return digits || null;
+  if (!norm) return null;
+  if (norm.endsWith("@lid")) {
+    const digits = norm.slice(0, -"@lid".length).replace(/\D/g, "");
+    return digits || null;
+  }
+  if (!norm.includes("@")) {
+    const digits = norm.replace(/\D/g, "");
+    return digits.length >= 7 ? digits : null;
+  }
+  return null;
 }
 
 const lidToPnCache = new Map();
+const groupSubjects = new Map();
+const contactNames = new Map();
+
+function recordLidPnMapping(lidCandidate, pnCandidate) {
+  const lidDigits = extractLidDigits(
+    typeof lidCandidate === "string" ? lidCandidate : "",
+  );
+  const e164 = anyPhoneToE164(pnCandidate);
+  if (lidDigits && e164) {
+    lidToPnCache.set(lidDigits, e164);
+  }
+}
+
+function ingestLidMappingEntry(entry) {
+  if (!entry) return;
+  if (Array.isArray(entry) && entry.length >= 2) {
+    recordLidPnMapping(entry[0], entry[1]);
+    return;
+  }
+  if (typeof entry === "object") {
+    const lid = entry.lid || entry.lidJid || entry.id || "";
+    const pn =
+      entry.pn || entry.pnJid || entry.phoneNumber || entry.jid || entry.phone || "";
+    recordLidPnMapping(lid, pn);
+  }
+}
 
 function lookupLidFromDisk(dir, lidDigits) {
   if (!lidDigits) return null;
@@ -314,13 +377,10 @@ function lookupLidFromDisk(dir, lidDigits) {
       typeof parsed === "string"
         ? parsed
         : parsed?.pn || parsed?.jid || parsed?.phone || null;
-    if (candidate) {
-      const digits = String(candidate).replace(/\D/g, "");
-      if (digits.length >= 7 && digits.length <= 15) {
-        const e164 = `+${digits}`;
-        lidToPnCache.set(lidDigits, e164);
-        return e164;
-      }
+    const e164 = anyPhoneToE164(candidate);
+    if (e164) {
+      lidToPnCache.set(lidDigits, e164);
+      return e164;
     }
   } catch {
     // Mapping file may not exist yet.
@@ -349,8 +409,8 @@ async function resolveJidToE164(sock, dir, jid, altJid) {
     const repo = sock?.signalRepository?.lidMapping;
     if (repo && typeof repo.getPNForLID === "function") {
       const pn = await repo.getPNForLID(normalizeJid(jid));
-      const e164 = jidToE164(pn) || (pn ? `+${String(pn).replace(/\D/g, "")}` : null);
-      if (e164 && /^\+\d{7,15}$/.test(e164)) {
+      const e164 = anyPhoneToE164(pn);
+      if (e164) {
         lidToPnCache.set(lidDigits, e164);
         return e164;
       }
@@ -360,6 +420,108 @@ async function resolveJidToE164(sock, dir, jid, altJid) {
   }
 
   return null;
+}
+
+function emitChatMetaBatch(items) {
+  if (!Array.isArray(items) || items.length === 0) return;
+  let chunk = [];
+  let bytes = 64;
+  for (const item of items) {
+    const encodedLen = Buffer.byteLength(JSON.stringify(item), "utf8") + 2;
+    if (
+      chunk.length > 0 &&
+      (chunk.length >= 100 || bytes + encodedLen > MAX_BATCH_JSON_BYTES)
+    ) {
+      emit({ type: "chat_meta_batch", items: chunk });
+      chunk = [];
+      bytes = 64;
+    }
+    chunk.push(item);
+    bytes += encodedLen;
+  }
+  if (chunk.length > 0) {
+    emit({ type: "chat_meta_batch", items: chunk });
+  }
+}
+
+function processContactsList(contacts) {
+  const metaItems = [];
+  for (const c of contacts || []) {
+    if (!c || typeof c !== "object") continue;
+    const id = normalizeJid(c.id || "");
+    const lid = normalizeJid(c.lid || c.lidJid || "");
+    const pn = normalizeJid(c.phoneNumber || c.pnJid || c.jid || "");
+    if (lid && pn) recordLidPnMapping(lid, pn);
+    if (id.endsWith("@lid") && pn) recordLidPnMapping(id, pn);
+    if (lid && id.endsWith("@s.whatsapp.net")) recordLidPnMapping(lid, id);
+
+    const primaryJid = pn || id || lid;
+    if (isIgnoredJid(primaryJid)) continue;
+    const isGroup = primaryJid.endsWith("@g.us");
+    const name = String(c.name || c.notify || c.verifiedName || "").trim();
+
+    if (name) {
+      if (isGroup) {
+        groupSubjects.set(primaryJid, name);
+      } else {
+        for (const key of [id, lid, pn]) {
+          if (key) contactNames.set(key, name);
+        }
+      }
+    }
+
+    const lidDigits = extractLidDigits(lid || id);
+    const resolvedE164 = isGroup
+      ? null
+      : jidToE164(pn) ||
+        jidToE164(id) ||
+        (lidDigits ? lookupLidFromDisk(sessionDir, lidDigits) : null);
+
+    const aliases = [];
+    for (const a of [id, lid, pn, resolvedE164]) {
+      if (a && !aliases.includes(a)) aliases.push(a);
+    }
+
+    metaItems.push({
+      raw_jid: primaryJid,
+      resolved_e164: resolvedE164,
+      aliases,
+      is_group: isGroup,
+      title: name || null,
+    });
+  }
+  return metaItems;
+}
+
+function processGroupObjects(groups) {
+  const metaItems = [];
+  for (const g of groups || []) {
+    if (!g || typeof g !== "object") continue;
+    const gid = normalizeJid(g.id || "");
+    if (!gid || !gid.endsWith("@g.us")) continue;
+    const subject = String(g.subject || g.name || "").trim();
+    if (subject) {
+      groupSubjects.set(gid, subject);
+    }
+    for (const p of g.participants || []) {
+      if (!p || typeof p !== "object") continue;
+      const pLid = p.lid || (String(p.id || "").endsWith("@lid") ? p.id : "");
+      const pPn =
+        p.phoneNumber ||
+        p.pn ||
+        p.jid ||
+        (String(p.id || "").endsWith("@s.whatsapp.net") ? p.id : "");
+      recordLidPnMapping(pLid, pPn);
+    }
+    metaItems.push({
+      raw_jid: gid,
+      resolved_e164: null,
+      aliases: [gid],
+      is_group: true,
+      title: subject || groupSubjects.get(gid) || null,
+    });
+  }
+  return metaItems;
 }
 
 function unwrapMessage(message) {
@@ -437,11 +599,11 @@ function extractTextAndMedia(rawMessage) {
   if (contextInfo?.quotedMessage) {
     const quoted = extractTextAndMedia(contextInfo.quotedMessage);
     const combined = (quoted.text || quoted.mediaPlaceholder || "").trim();
-    if (combined) quotedText = combined;
+    if (combined) quotedText = clampString(combined, 4096);
   }
 
   return {
-    text: text.trim(),
+    text: clampString(text.trim()),
     quotedText,
     mediaPlaceholder,
   };
@@ -461,6 +623,84 @@ function extractTimestampMs(ts) {
   }
   if (!Number.isFinite(num) || num <= 0) return Date.now();
   return num < 1e12 ? Math.trunc(num * 1000) : Math.trunc(num);
+}
+
+async function convertWaMessage(sock, selfJid, selfLid, selfE164, msg, upsertType) {
+  if (!msg || !msg.key) return null;
+
+  const remoteJid = normalizeJid(msg.key.remoteJid || "");
+  if (isIgnoredJid(remoteJid)) return null;
+
+  if (!msg.message || msg.messageStubType === WAMessageStubType.CIPHERTEXT) {
+    return null;
+  }
+
+  rememberRawMessage(msg.key, msg.message);
+
+  const { text, quotedText, mediaPlaceholder } = extractTextAndMedia(msg.message);
+  if (!text && !mediaPlaceholder) {
+    return null;
+  }
+
+  const isGroup = remoteJid.endsWith("@g.us");
+  const fromMe = Boolean(msg.key.fromMe);
+  const remoteJidAlt = normalizeJid(msg.key.remoteJidAlt || "");
+  const participant = normalizeJid(msg.key.participant || "");
+  const participantAlt = normalizeJid(msg.key.participantAlt || "");
+
+  const resolvedChatE164 = isGroup
+    ? null
+    : await resolveJidToE164(sock, sessionDir, remoteJid, remoteJidAlt);
+  const senderRaw = isGroup ? participant : remoteJid;
+  const senderAlt = isGroup ? participantAlt : remoteJidAlt;
+  const resolvedSenderE164 = await resolveJidToE164(
+    sock,
+    sessionDir,
+    senderRaw,
+    senderAlt,
+  );
+
+  const isSelfChat =
+    fromMe &&
+    !isGroup &&
+    (Boolean(selfJid && remoteJid === selfJid) ||
+      Boolean(selfLid && remoteJid === selfLid) ||
+      Boolean(selfE164 && resolvedChatE164 === selfE164));
+
+  const pushName =
+    (typeof msg.pushName === "string" && msg.pushName.trim()) ||
+    (!fromMe && senderRaw ? contactNames.get(senderRaw) || null : null);
+
+  const chatTitle = isGroup
+    ? groupSubjects.get(remoteJid) || null
+    : fromMe
+      ? contactNames.get(remoteJid) ||
+        (remoteJidAlt ? contactNames.get(remoteJidAlt) : null) ||
+        null
+      : (typeof msg.pushName === "string" && msg.pushName.trim()) ||
+        contactNames.get(remoteJid) ||
+        (remoteJidAlt ? contactNames.get(remoteJidAlt) : null) ||
+        null;
+
+  return {
+    upsert_type: upsertType,
+    id: msg.key.id || `${Date.now()}`,
+    remote_jid: remoteJid,
+    remote_jid_alt: remoteJidAlt || null,
+    participant: participant || null,
+    participant_alt: participantAlt || null,
+    resolved_chat_e164: resolvedChatE164,
+    resolved_sender_e164: resolvedSenderE164,
+    from_me: fromMe,
+    is_group: isGroup,
+    is_self_chat: isSelfChat,
+    push_name: pushName,
+    chat_title: chatTitle,
+    timestamp_ms: extractTimestampMs(msg.messageTimestamp),
+    text,
+    quoted_text: quotedText,
+    media_placeholder: mediaPlaceholder,
+  };
 }
 
 async function fetchVersionWithTimeout(timeoutMs = 15000) {
@@ -487,7 +727,7 @@ async function fetchVersionWithTimeout(timeoutMs = 15000) {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Main connection & supervision loop
+// 8. Main connection, read-only stdin paging listener, & supervision loop
 // ---------------------------------------------------------------------------
 
 const logger = pino({ level: "silent" });
@@ -495,6 +735,61 @@ let shuttingDown = false;
 let activeSock = null;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
+
+if (!pairOnly && process.stdin) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+  });
+  rl.on("line", async (rawLine) => {
+    const trimmed = String(rawLine || "").trim();
+    if (!trimmed) return;
+    let cmd;
+    try {
+      cmd = JSON.parse(trimmed);
+    } catch {
+      rawStderrWrite("Rejected non-JSON stdin control line\n");
+      return;
+    }
+    if (!cmd || cmd.type !== "fetch_history") {
+      rawStderrWrite(
+        `Rejected unsupported stdin control command (${cmd?.type || "unknown"}); bridge is strictly read-only\n`,
+      );
+      return;
+    }
+    const chatJid = normalizeJid(cmd.chat_jid || "");
+    const oldestMsgId = String(cmd.oldest_msg_id || "").trim();
+    const oldestFromMe = Boolean(cmd.oldest_from_me);
+    const oldestTsMs = Math.trunc(Number(cmd.oldest_ts_ms));
+    const count = Math.max(1, Math.min(200, Math.trunc(Number(cmd.count) || 50)));
+    if (!chatJid || !oldestMsgId || !Number.isFinite(oldestTsMs) || oldestTsMs <= 0) {
+      rawStderrWrite("Ignoring malformed fetch_history control parameters\n");
+      return;
+    }
+    if (!activeSock || typeof activeSock.fetchMessageHistory !== "function") {
+      rawStderrWrite("Cannot fetch_history: WhatsApp socket not ready\n");
+      return;
+    }
+    try {
+      await activeSock.fetchMessageHistory(
+        count,
+        {
+          remoteJid: chatJid,
+          fromMe: oldestFromMe,
+          id: oldestMsgId,
+        },
+        oldestTsMs,
+      );
+    } catch (err) {
+      rawStderrWrite(
+        `fetchMessageHistory failed: ${err?.message || "unknown"}\n`,
+      );
+    }
+  });
+  rl.on("error", () => {
+    // Ignore stdin pipe close errors during shutdown.
+  });
+}
 
 function computeBackoffMs(attempt) {
   const base = Math.min(60000, Math.round(2000 * Math.pow(1.8, attempt)));
@@ -519,6 +814,11 @@ async function startSocket() {
     emit({ type: "state", state: "starting" });
   }
 
+  const desktopBrowser =
+    typeof Browsers?.macOS === "function"
+      ? Browsers.macOS("Desktop")
+      : ["Mac OS", "Desktop", "14.4.1"];
+
   const socketConfig = {
     auth: {
       creds: state.creds,
@@ -526,8 +826,9 @@ async function startSocket() {
     },
     logger,
     printQRInTerminal: false,
-    browser: ["Desktop", "Linux", "1.0"],
-    syncFullHistory: false,
+    browser: fullHistory ? desktopBrowser : ["Desktop", "Linux", "1.0"],
+    syncFullHistory: fullHistory,
+    shouldSyncHistoryMessage: () => fullHistory,
     markOnlineOnConnect: false,
     getMessage: async (key) => {
       if (!key || !key.remoteJid || !key.id) {
@@ -588,6 +889,9 @@ async function startSocket() {
       if (pairOnly) {
         try {
           await saveCreds();
+          // Allow initial pre-key and creds.update writes to flush cleanly.
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          await saveCreds();
         } catch (err) {
           rawStderrWrite(
             `Warning: final creds save failed: ${err?.message || "unknown"}\n`,
@@ -618,6 +922,21 @@ async function startSocket() {
         self_lid: selfLid || null,
         self_e164: selfE164,
       });
+
+      if (typeof sock.groupFetchAllParticipating === "function") {
+        sock
+          .groupFetchAllParticipating()
+          .then((groupsMap) => {
+            const list = Object.values(groupsMap || {});
+            const metaItems = processGroupObjects(list);
+            emitChatMetaBatch(metaItems);
+          })
+          .catch((err) => {
+            rawStderrWrite(
+              `groupFetchAllParticipating skipped: ${err?.message || "unknown"}\n`,
+            );
+          });
+      }
     }
 
     if (connection === "close") {
@@ -678,6 +997,161 @@ async function startSocket() {
   });
 
   if (!pairOnly) {
+    sock.ev.on("groups.upsert", (groups) => {
+      emitChatMetaBatch(processGroupObjects(groups));
+    });
+
+    sock.ev.on("groups.update", (updates) => {
+      emitChatMetaBatch(processGroupObjects(updates));
+    });
+
+    sock.ev.on("contacts.upsert", (contacts) => {
+      emitChatMetaBatch(processContactsList(contacts));
+    });
+
+    sock.ev.on("contacts.update", (contacts) => {
+      emitChatMetaBatch(processContactsList(contacts));
+    });
+
+    sock.ev.on(
+      "messaging-history.set",
+      async ({
+        chats,
+        contacts,
+        messages,
+        lidPnMappings,
+        syncType,
+        progress,
+        isLatest,
+      }) => {
+        for (const entry of lidPnMappings || []) {
+          ingestLidMappingEntry(entry);
+        }
+
+        const metaItems = [];
+        metaItems.push(...processContactsList(contacts));
+
+        for (const chat of chats || []) {
+          if (!chat || typeof chat !== "object") continue;
+          const cid = normalizeJid(chat.id || "");
+          if (isIgnoredJid(cid)) continue;
+          const lidJid = normalizeJid(chat.lidJid || chat.lid || "");
+          const pnJid = normalizeJid(chat.pnJid || chat.phoneNumber || "");
+          if (lidJid && pnJid) recordLidPnMapping(lidJid, pnJid);
+          if (cid.endsWith("@lid") && pnJid) recordLidPnMapping(cid, pnJid);
+          if (lidJid && cid.endsWith("@s.whatsapp.net")) {
+            recordLidPnMapping(lidJid, cid);
+          }
+
+          const isGroup = cid.endsWith("@g.us");
+          const title = String(
+            chat.name ||
+              chat.subject ||
+              (isGroup ? groupSubjects.get(cid) : contactNames.get(cid)) ||
+              "",
+          ).trim();
+          if (title) {
+            if (isGroup) {
+              groupSubjects.set(cid, title);
+            } else {
+              contactNames.set(cid, title);
+            }
+          }
+
+          const lidDigits = extractLidDigits(lidJid || cid);
+          const resolvedE164 = isGroup
+            ? null
+            : jidToE164(pnJid) ||
+              jidToE164(cid) ||
+              (lidDigits ? lookupLidFromDisk(sessionDir, lidDigits) : null);
+
+          const aliases = [];
+          for (const a of [cid, lidJid, pnJid, resolvedE164]) {
+            if (a && !aliases.includes(a)) aliases.push(a);
+          }
+          metaItems.push({
+            raw_jid: cid,
+            resolved_e164: resolvedE164,
+            aliases,
+            is_group: isGroup,
+            title: title || null,
+          });
+        }
+        emitChatMetaBatch(metaItems);
+
+        const selfJid = normalizeJid(sock.user?.id || state.creds?.me?.id || "");
+        const selfLid = normalizeJid(
+          sock.user?.lid || state.creds?.me?.lid || "",
+        );
+        const selfE164 = jidToE164(selfJid);
+
+        const converted = [];
+        for (const msg of messages || []) {
+          const item = await convertWaMessage(
+            sock,
+            selfJid,
+            selfLid,
+            selfE164,
+            msg,
+            "history",
+          );
+          if (item) converted.push(item);
+        }
+
+        const syncTypeStr = String(syncType ?? "");
+        const progressNum =
+          typeof progress === "number" && Number.isFinite(progress)
+            ? progress
+            : null;
+        const latestFlag = Boolean(isLatest);
+
+        if (converted.length === 0) {
+          if (progressNum !== null || latestFlag) {
+            emit({
+              type: "history_batch",
+              sync_type: syncTypeStr,
+              progress: progressNum,
+              is_latest: latestFlag,
+              messages: [],
+            });
+          }
+          return;
+        }
+
+        let chunk = [];
+        let bytes = 128;
+        for (const item of converted) {
+          const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8") + 2;
+          if (
+            chunk.length > 0 &&
+            (chunk.length >= MAX_HISTORY_CHUNK_COUNT ||
+              bytes + itemBytes > MAX_BATCH_JSON_BYTES)
+          ) {
+            emit({
+              type: "history_batch",
+              sync_type: syncTypeStr,
+              progress: progressNum,
+              is_latest: latestFlag,
+              messages: chunk,
+            });
+            chunk = [];
+            bytes = 128;
+          }
+          chunk.push(item);
+          bytes += itemBytes;
+        }
+        if (chunk.length > 0) {
+          emit({
+            type: "history_batch",
+            sync_type: syncTypeStr,
+            progress: progressNum,
+            is_latest: latestFlag,
+            messages: chunk,
+          });
+        }
+      },
+    );
+
     sock.ev.on("messages.upsert", async (upsert) => {
       const upsertType = upsert?.type;
       if (upsertType !== "notify" && upsertType !== "append") {
@@ -691,80 +1165,20 @@ async function startSocket() {
       const selfE164 = jidToE164(selfJid);
 
       for (const msg of upsert.messages || []) {
-        if (!msg || !msg.key) continue;
-
-        const remoteJid = normalizeJid(msg.key.remoteJid || "");
-        if (
-          !remoteJid ||
-          remoteJid === "status@broadcast" ||
-          remoteJid.endsWith("@broadcast")
-        ) {
-          continue;
-        }
-
-        // Skip CIPHERTEXT stubs and empty protocol messages.
-        if (
-          !msg.message ||
-          msg.messageStubType === WAMessageStubType.CIPHERTEXT
-        ) {
-          continue;
-        }
-
-        rememberRawMessage(msg.key, msg.message);
-
-        const { text, quotedText, mediaPlaceholder } = extractTextAndMedia(
-          msg.message,
-        );
-        if (!text && !mediaPlaceholder) {
-          continue;
-        }
-
-        const isGroup = remoteJid.endsWith("@g.us");
-        const isBroadcast = remoteJid.endsWith("@broadcast");
-        const fromMe = Boolean(msg.key.fromMe);
-        const remoteJidAlt = normalizeJid(msg.key.remoteJidAlt || "");
-        const participant = normalizeJid(msg.key.participant || "");
-        const participantAlt = normalizeJid(msg.key.participantAlt || "");
-
-        const resolvedChatE164 = isGroup
-          ? null
-          : await resolveJidToE164(sock, sessionDir, remoteJid, remoteJidAlt);
-        const senderRaw = isGroup ? participant : remoteJid;
-        const senderAlt = isGroup ? participantAlt : remoteJidAlt;
-        const resolvedSenderE164 = await resolveJidToE164(
+        const converted = await convertWaMessage(
           sock,
-          sessionDir,
-          senderRaw,
-          senderAlt,
+          selfJid,
+          selfLid,
+          selfE164,
+          msg,
+          upsertType,
         );
-
-        const isSelfChat =
-          fromMe &&
-          !isGroup &&
-          !isBroadcast &&
-          (Boolean(selfJid && remoteJid === selfJid) ||
-            Boolean(selfLid && remoteJid === selfLid) ||
-            Boolean(selfE164 && resolvedChatE164 === selfE164));
-
-        emit({
-          type: "message",
-          upsert_type: upsertType,
-          id: msg.key.id || `${Date.now()}`,
-          remote_jid: remoteJid,
-          remote_jid_alt: remoteJidAlt || null,
-          participant: participant || null,
-          participant_alt: participantAlt || null,
-          resolved_chat_e164: resolvedChatE164,
-          resolved_sender_e164: resolvedSenderE164,
-          from_me: fromMe,
-          is_group: isGroup,
-          is_self_chat: isSelfChat,
-          push_name: msg.pushName || null,
-          timestamp_ms: extractTimestampMs(msg.messageTimestamp),
-          text,
-          quoted_text: quotedText,
-          media_placeholder: mediaPlaceholder,
-        });
+        if (converted) {
+          emit({
+            type: "message",
+            ...converted,
+          });
+        }
       }
     });
   }

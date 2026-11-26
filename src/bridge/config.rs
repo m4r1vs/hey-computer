@@ -27,6 +27,8 @@ pub struct BridgeConfig {
     pub context_messages: usize,
     /// Maximum chats retained in the in-memory LRU ring buffer.
     pub max_tracked_chats: usize,
+    /// Maximum rows retained in `<state_dir>/history.db` (`0` = unlimited).
+    pub max_stored_messages: usize,
     /// Burst coalescing window for incoming DMs in milliseconds.
     pub debounce_ms: u64,
     /// Burst coalescing window for verified phone self-chat in milliseconds.
@@ -47,6 +49,7 @@ impl Default for BridgeConfig {
             read_only: true,
             context_messages: 10,
             max_tracked_chats: 64,
+            max_stored_messages: 0,
             debounce_ms: 1500,
             self_chat_debounce_ms: 800,
             max_debounce_ms: 5000,
@@ -65,6 +68,7 @@ pub struct WhatsappConfig {
     pub allow_from: Vec<String>,
     pub allow_from_file: Option<PathBuf>,
     pub groups_enabled: bool,
+    pub sync_full_history: bool,
     /// Override for the Baileys reader binary (primarily for tests or custom installs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reader_command: Vec<String>,
@@ -77,7 +81,8 @@ impl Default for WhatsappConfig {
             self_chat: true,
             allow_from: Vec::new(),
             allow_from_file: None,
-            groups_enabled: false,
+            groups_enabled: true,
+            sync_full_history: true,
             reader_command: Vec::new(),
         }
     }
@@ -93,6 +98,13 @@ pub struct SignalConfig {
     pub allow_from: Vec<String>,
     pub allow_from_file: Option<PathBuf>,
     pub groups_enabled: bool,
+    /// Optional Signal Desktop directory (`~/.config/Signal` auto-detected when `None`;
+    /// `Some("")` disables automatic Signal Desktop SQLCipher import).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_dir: Option<PathBuf>,
+    /// Override for the `sqlcipher` binary (primarily for tests or custom installs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sqlcipher_command: Vec<String>,
     /// Override for the `signal-cli` command (primarily for tests or custom installs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
@@ -107,7 +119,9 @@ impl Default for SignalConfig {
             account_file: None,
             allow_from: Vec::new(),
             allow_from_file: None,
-            groups_enabled: false,
+            groups_enabled: true,
+            desktop_dir: None,
+            sqlcipher_command: Vec::new(),
             command: Vec::new(),
         }
     }
@@ -185,6 +199,27 @@ impl BridgeConfig {
             .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
             .context("cannot determine state_dir (set XDG_STATE_HOME or state_dir)")?;
         Ok(base.join("hey-computer-bridge"))
+    }
+
+    /// Resolve the Signal Desktop directory for read-only SQLCipher import:
+    /// - `Some("")` disables automatic import (`None`).
+    /// - `Some(path)` returns that explicit path.
+    /// - `None` auto-discovers `<config_dir>/Signal` when `sql/db.sqlite` exists on disk.
+    pub fn resolved_signal_desktop_dir(&self) -> Option<PathBuf> {
+        if let Some(explicit) = &self.signal.desktop_dir {
+            if explicit.as_os_str().is_empty() {
+                return None;
+            }
+            return Some(explicit.clone());
+        }
+        let candidate = dirs::config_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join(".config")))?
+            .join("Signal");
+        if candidate.join("sql").join("db.sqlite").is_file() {
+            Some(candidate)
+        } else {
+            None
+        }
     }
 }
 
@@ -484,6 +519,18 @@ pub fn normalize_identifier(raw: &str) -> String {
     if is_uuid_like(trimmed) {
         return format!("uuid:{}", trimmed.to_ascii_lowercase());
     }
+    if let Some(rest) = trimmed
+        .strip_prefix("group:")
+        .or_else(|| trimmed.strip_prefix("GROUP:"))
+    {
+        let inner = rest.trim();
+        if let Some((_, domain)) = inner.split_once('@')
+            && domain.eq_ignore_ascii_case("g.us")
+        {
+            return format!("group:{}", normalize_jid(inner));
+        }
+        return format!("group:{inner}");
+    }
     if let Some((_, domain)) = trimmed.split_once('@') {
         if domain.eq_ignore_ascii_case("lid") {
             return normalize_jid(trimmed);
@@ -491,9 +538,6 @@ pub fn normalize_identifier(raw: &str) -> String {
         if domain.eq_ignore_ascii_case("g.us") {
             return format!("group:{}", normalize_jid(trimmed));
         }
-    }
-    if let Some(rest) = trimmed.strip_prefix("group:") {
-        return format!("group:{}", rest.trim());
     }
     trimmed.to_ascii_lowercase()
 }
@@ -528,6 +572,15 @@ mod tests {
         assert!(err.to_string().contains("strictly read-only"));
 
         assert!(BridgeConfig::parse_toml("allow_outbound = true").is_err());
+
+        let defaults = BridgeConfig::default();
+        assert_eq!(defaults.max_stored_messages, 0);
+        assert!(defaults.whatsapp.groups_enabled);
+        assert!(defaults.whatsapp.sync_full_history);
+        assert!(defaults.signal.groups_enabled);
+
+        let disabled = BridgeConfig::parse_toml("[signal]\ndesktop_dir = \"\"\n").unwrap();
+        assert_eq!(disabled.resolved_signal_desktop_dir(), None);
     }
 
     #[test]
@@ -548,6 +601,10 @@ mod tests {
         assert_eq!(
             normalize_identifier("550E8400-E29B-41D4-A716-446655440000"),
             "uuid:550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(
+            normalize_identifier(&normalize_identifier("120363001234567890:2@g.us")),
+            "group:120363001234567890@g.us"
         );
 
         let list = Allowlist::load(

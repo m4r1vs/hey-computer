@@ -1,17 +1,18 @@
 //! WhatsApp adapter: supervises the strictly read-only `baileys-reader` helper.
 //!
-//! The Node helper is spawned with `stdin = /dev/null` and emits one-way JSONL
-//! events on stdout. On `401` (`auth_required`), the supervisor transitions
-//! WhatsApp to `PlatformState::AuthRequired` and stops respawning so the user
-//! gets a single clear unlink alert instead of a tight crash loop.
+//! Spawns `baileys-reader` with piped stdout (for live messages, contact/group
+//! metadata, and full history sync batches) and piped stdin accepting ONLY
+//! `{"type":"fetch_history",...}` control requests for read-only paging.
+//! On `401` (`auth_required`), transitions WhatsApp to `PlatformState::AuthRequired`
+//! and stops respawning until `creds.json` is re-linked.
 
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
-use tokio::io::BufReader;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
 
@@ -21,7 +22,45 @@ use crate::bridge::config::{
 };
 use crate::bridge::context::{InboundRawMessage, RawAdapterEvent};
 use crate::bridge::protocol::{MAX_BRIDGE_LINE, Platform, PlatformState};
+use crate::bridge::store::ChatMetaRecord;
 use crate::lines::{self, Line};
+
+/// Strictly read-only control commands sent to `baileys-reader` over stdin.
+#[derive(Debug, Clone)]
+pub enum WhatsappControl {
+    FetchHistory {
+        chat_jid: String,
+        oldest_msg_id: String,
+        oldest_from_me: bool,
+        oldest_ts_ms: i64,
+        count: usize,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StdinControlPayload<'a> {
+    FetchHistory {
+        chat_jid: &'a str,
+        oldest_msg_id: &'a str,
+        oldest_from_me: bool,
+        oldest_ts_ms: i64,
+        count: usize,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct BaileysChatMeta {
+    raw_jid: String,
+    #[serde(default)]
+    resolved_e164: Option<String>,
+    #[serde(default)]
+    aliases: Vec<String>,
+    #[serde(default)]
+    is_group: bool,
+    #[serde(default)]
+    title: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct BaileysMessage {
@@ -47,6 +86,8 @@ struct BaileysMessage {
     is_self_chat: bool,
     #[serde(default)]
     push_name: Option<String>,
+    #[serde(default)]
+    chat_title: Option<String>,
     timestamp_ms: i64,
     #[serde(default)]
     text: String,
@@ -74,6 +115,20 @@ enum BaileysOutput {
         #[serde(default)]
         self_lid: Option<String>,
     },
+    ChatMetaBatch {
+        #[serde(default)]
+        items: Vec<BaileysChatMeta>,
+    },
+    HistoryBatch {
+        #[serde(default)]
+        sync_type: String,
+        #[serde(default)]
+        progress: Option<f64>,
+        #[serde(default)]
+        is_latest: bool,
+        #[serde(default)]
+        messages: Vec<BaileysMessage>,
+    },
     Message(Box<BaileysMessage>),
 }
 
@@ -95,10 +150,11 @@ fn whatsapp_session_dir(config: &BridgeConfig) -> Result<PathBuf> {
 }
 
 /// Supervise `baileys-reader` until `stop` becomes `true` or `auth_required`
-/// stops retries.
+/// pauses retries until re-pairing.
 pub async fn run(
     config: BridgeConfig,
     tx: mpsc::Sender<RawAdapterEvent>,
+    mut ctrl_rx: mpsc::Receiver<WhatsappControl>,
     mut stop: watch::Receiver<bool>,
 ) {
     let session_dir = match whatsapp_session_dir(&config) {
@@ -160,11 +216,11 @@ pub async fn run(
             .await;
 
         let mut cmd = Command::new(&program);
-        cmd.args(&base_args)
-            .arg("--session")
-            .arg(&session_dir)
-            // Layer 1 read-only enforcement: stdin is /dev/null.
-            .stdin(Stdio::null())
+        cmd.args(&base_args).arg("--session").arg(&session_dir);
+        if !config.whatsapp.sync_full_history {
+            cmd.arg("--no-full-history");
+        }
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -197,6 +253,7 @@ pub async fn run(
         };
 
         let child_pid = child.id();
+        let mut child_stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
 
@@ -214,11 +271,39 @@ pub async fn run(
             tokio::select! {
                 _ = stop.changed() => {
                     if *stop.borrow() {
+                        drop(child_stdin);
                         terminate_process_group(child_pid);
                         let _ = child.kill().await;
                         let _ = child.wait().await;
                         stderr_task.abort();
                         return;
+                    }
+                }
+                Some(ctrl) = ctrl_rx.recv() => {
+                    match ctrl {
+                        WhatsappControl::FetchHistory {
+                            chat_jid,
+                            oldest_msg_id,
+                            oldest_from_me,
+                            oldest_ts_ms,
+                            count,
+                        } => {
+                            let payload = StdinControlPayload::FetchHistory {
+                                chat_jid: &chat_jid,
+                                oldest_msg_id: &oldest_msg_id,
+                                oldest_from_me,
+                                oldest_ts_ms,
+                                count,
+                            };
+                            if let Ok(mut line) = serde_json::to_string(&payload) {
+                                line.push('\n');
+                                if let Err(e) = child_stdin.write_all(line.as_bytes()).await {
+                                    tracing::debug!("failed writing fetch_history to baileys stdin: {e}");
+                                } else {
+                                    let _ = child_stdin.flush().await;
+                                }
+                            }
+                        }
                     }
                 }
                 line = lines::read(&mut reader, MAX_BRIDGE_LINE) => match line {
@@ -259,51 +344,55 @@ pub async fn run(
                             Ok(BaileysOutput::Paired { self_jid, self_lid }) => {
                                 tracing::debug!(?self_jid, ?self_lid, "baileys paired event");
                             }
-                            Ok(BaileysOutput::Message(msg)) => {
-                                let BaileysMessage {
-                                    upsert_type,
-                                    id,
-                                    remote_jid,
-                                    remote_jid_alt,
-                                    participant,
-                                    participant_alt,
-                                    resolved_chat_e164,
-                                    resolved_sender_e164,
-                                    from_me,
-                                    is_group,
-                                    is_self_chat,
-                                    push_name,
-                                    timestamp_ms,
-                                    text,
-                                    quoted_text,
-                                    media_placeholder,
-                                } = *msg;
+                            Ok(BaileysOutput::ChatMetaBatch { items }) => {
+                                let records: Vec<ChatMetaRecord> = items
+                                    .into_iter()
+                                    .filter_map(normalize_baileys_chat_meta)
+                                    .collect();
+                                if !records.is_empty() {
+                                    let _ = tx.send(RawAdapterEvent::ChatMetaBatch(records)).await;
+                                }
+                            }
+                            Ok(BaileysOutput::HistoryBatch {
+                                sync_type,
+                                progress,
+                                is_latest,
+                                messages,
+                            }) => {
+                                let pct = progress
+                                    .map(|p| p.round().clamp(0.0, 100.0) as u8)
+                                    .or_else(|| is_latest.then_some(100));
+                                let normalized: Vec<InboundRawMessage> = messages
+                                    .into_iter()
+                                    .map(convert_baileys_message)
+                                    .collect();
                                 tracing::debug!(
                                     platform = "whatsapp",
-                                    %upsert_type,
-                                    from_me,
-                                    is_group,
-                                    is_self_chat,
+                                    %sync_type,
+                                    ?pct,
+                                    is_latest,
+                                    count = normalized.len(),
+                                    "received whatsapp history batch"
+                                );
+                                let _ = tx
+                                    .send(RawAdapterEvent::HistoryBatch {
+                                        platform: Platform::Whatsapp,
+                                        progress: pct,
+                                        messages: normalized,
+                                    })
+                                    .await;
+                            }
+                            Ok(BaileysOutput::Message(msg)) => {
+                                tracing::debug!(
+                                    platform = "whatsapp",
+                                    upsert_type = %msg.upsert_type,
+                                    from_me = msg.from_me,
+                                    is_group = msg.is_group,
+                                    is_self_chat = msg.is_self_chat,
                                     "received whatsapp upsert"
                                 );
-                                let inbound = normalize_baileys_message(
-                                    id,
-                                    remote_jid,
-                                    remote_jid_alt,
-                                    participant,
-                                    participant_alt,
-                                    resolved_chat_e164,
-                                    resolved_sender_e164,
-                                    from_me,
-                                    is_group,
-                                    is_self_chat,
-                                    push_name,
-                                    timestamp_ms,
-                                    text,
-                                    quoted_text,
-                                    media_placeholder,
-                                );
-                                let _ = tx.send(RawAdapterEvent::Message(inbound)).await;
+                                let inbound = convert_baileys_message(*msg);
+                                let _ = tx.send(RawAdapterEvent::Message(Box::new(inbound))).await;
                             }
                             Err(e) => {
                                 tracing::debug!("ignoring unparseable baileys line: {e}");
@@ -321,6 +410,7 @@ pub async fn run(
             }
         }
 
+        drop(child_stdin);
         let status = child.wait().await;
         stderr_task.abort();
 
@@ -371,6 +461,78 @@ pub async fn run(
     }
 }
 
+fn normalize_baileys_chat_meta(item: BaileysChatMeta) -> Option<ChatMetaRecord> {
+    let norm_raw = normalize_jid(&item.raw_jid);
+    if norm_raw.is_empty()
+        || norm_raw == "status@broadcast"
+        || norm_raw.ends_with("@broadcast")
+        || norm_raw.ends_with("@newsletter")
+    {
+        return None;
+    }
+    let is_group = item.is_group || norm_raw.ends_with("@g.us");
+    let e164 = if is_group {
+        None
+    } else {
+        item.resolved_e164
+            .as_deref()
+            .and_then(normalize_e164)
+            .or_else(|| normalize_e164(&norm_raw))
+    };
+    let chat_id = if is_group {
+        normalize_identifier(&norm_raw)
+    } else if let Some(num) = &e164 {
+        num.clone()
+    } else {
+        normalize_identifier(&norm_raw)
+    };
+
+    let mut aliases = Vec::new();
+    aliases.push(normalize_identifier(&norm_raw));
+    if let Some(num) = &e164 {
+        aliases.push(num.clone());
+    }
+    for a in item.aliases {
+        if !a.trim().is_empty() {
+            aliases.push(normalize_identifier(&a));
+        }
+    }
+
+    Some(ChatMetaRecord {
+        platform: Platform::Whatsapp,
+        chat_id,
+        aliases,
+        is_group,
+        is_self_chat: false,
+        title: item
+            .title
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty()),
+        raw_jid: Some(norm_raw),
+    })
+}
+
+fn convert_baileys_message(msg: BaileysMessage) -> InboundRawMessage {
+    normalize_baileys_message(
+        msg.id,
+        msg.remote_jid,
+        msg.remote_jid_alt,
+        msg.participant,
+        msg.participant_alt,
+        msg.resolved_chat_e164,
+        msg.resolved_sender_e164,
+        msg.from_me,
+        msg.is_group,
+        msg.is_self_chat,
+        msg.push_name,
+        msg.chat_title,
+        msg.timestamp_ms,
+        msg.text,
+        msg.quoted_text,
+        msg.media_placeholder,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn normalize_baileys_message(
     id: String,
@@ -384,6 +546,7 @@ fn normalize_baileys_message(
     is_group: bool,
     is_self_chat: bool,
     push_name: Option<String>,
+    chat_title: Option<String>,
     timestamp_ms: i64,
     text: String,
     quoted_text: Option<String>,
@@ -455,11 +618,34 @@ fn normalize_baileys_message(
         sender_aliases.extend(chat_aliases.iter().cloned());
     }
 
+    let raw_jid = if !norm_remote.is_empty() {
+        Some(norm_remote)
+    } else {
+        None
+    };
+
+    let clean_chat_title = chat_title
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            if !is_group && !from_me && !is_self_chat {
+                push_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+            } else {
+                None
+            }
+        });
+
     InboundRawMessage {
         id,
         platform: Platform::Whatsapp,
         chat_id,
         chat_aliases,
+        raw_jid,
+        chat_title: clean_chat_title,
         sender_id,
         sender_aliases,
         sender_name: push_name.unwrap_or_default(),
@@ -478,11 +664,15 @@ pub async fn pair_whatsapp(config: &BridgeConfig) -> Result<()> {
     let session_dir = whatsapp_session_dir(config)?;
     let _pair_lock = PairingLockGuard::acquire(&session_dir);
     let (program, base_args) = reader_program(config);
-    let status = Command::new(&program)
-        .args(&base_args)
+    let mut cmd = Command::new(&program);
+    cmd.args(&base_args)
         .arg("--pair-only")
         .arg("--session")
-        .arg(&session_dir)
+        .arg(&session_dir);
+    if !config.whatsapp.sync_full_history {
+        cmd.arg("--no-full-history");
+    }
+    let status = cmd
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
