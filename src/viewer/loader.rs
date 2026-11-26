@@ -612,10 +612,10 @@ Scheduled Actions Loading (Overview + Inspector)
 -------------------------------------------------------------------------- */
 
 fn schedule_mode(job: &ScheduleRecord) -> &'static str {
-    if job.no_agent {
-        "no-agent"
-    } else if job.script.contains("distill") || job.name.contains("distill") {
+    if job.script.contains("distill") || job.name.contains("distill") {
         "distill"
+    } else if job.no_agent {
+        "no-agent"
     } else if !job.script.trim().is_empty() {
         "collector + agent"
     } else {
@@ -768,4 +768,58 @@ pub fn load_schedule_detail(
         recent_runs,
         latest_turn,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hey_computer::store::FailureDeliver;
+
+    fn sample_schedule(name: &str, script: &str, no_agent: bool) -> ScheduleRecord {
+        ScheduleRecord {
+            id: 1,
+            name: name.to_string(),
+            enabled: true,
+            managed: true,
+            schedule_spec: "0 18 * * 0".to_string(),
+            prompt: String::new(),
+            profile: String::new(),
+            script: script.to_string(),
+            no_agent,
+            suppress_token: None,
+            failure_deliver: FailureDeliver::Notify,
+            max_runs: None,
+            expires_at: None,
+            run_count: 0,
+            consecutive_failures: 0,
+            next_run_at: None,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn schedule_mode_prioritizes_distill_over_no_agent() {
+        let weekly_distill = sample_schedule(
+            "weekly-distill",
+            "hey-computer distill --since 7d --background >/dev/null",
+            true,
+        );
+        assert_eq!(schedule_mode(&weekly_distill), "distill");
+
+        let script_distill = sample_schedule("cleanup", "hey-computer distill --since 3d", true);
+        assert_eq!(schedule_mode(&script_distill), "distill");
+
+        let plain_no_agent = sample_schedule("reminder", "echo hi", true);
+        assert_eq!(schedule_mode(&plain_no_agent), "no-agent");
+
+        let collector_agent = sample_schedule("morning-digest", "collect_morning_digest", false);
+        assert_eq!(schedule_mode(&collector_agent), "collector + agent");
+
+        let agent_only = sample_schedule("pre-daily", "", false);
+        assert_eq!(schedule_mode(&agent_only), "agent");
+    }
 }

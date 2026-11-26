@@ -3758,6 +3758,32 @@ pub fn record_schedule_outcome(
     Ok(new_failures.max(0) as u64)
 }
 
+/// Record a collector-skipped schedule firing without clobbering any prior
+/// outcome (`last_status`, `last_run_at`, `last_error`, `run_count`, or
+/// `consecutive_failures`).
+///
+/// For a brand-new schedule (`last_status IS NULL`), records `'skipped'`.
+/// When `force_disable` is true (e.g. a one-shot schedule with no next run),
+/// disables the schedule and clears `next_run_at` without incrementing `run_count`.
+pub fn record_schedule_skip(
+    state_dir: &Path,
+    id: u64,
+    updated_at: i64,
+    force_disable: bool,
+) -> Result<()> {
+    let conn = open_migrated_writer(state_dir)?;
+    conn.execute(
+        "UPDATE schedules
+         SET last_status = COALESCE(last_status, 'skipped'),
+             enabled = CASE WHEN ?3 = 1 THEN 0 ELSE enabled END,
+             next_run_at = CASE WHEN ?3 = 1 THEN NULL ELSE next_run_at END,
+             updated_at = ?2
+         WHERE id = ?1",
+        params![id as i64, updated_at, i64::from(force_disable)],
+    )?;
+    Ok(())
+}
+
 /// Lifecycle state of a persisted stateless notification draft checkpoint (schema v5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -5312,6 +5338,198 @@ mod tests {
         // Recent terminal drafts (cp1/cp2/cp3) are retained within 7 days.
         assert!(get_draft_checkpoint(&dir, &cp1.token).unwrap().is_some());
         store2.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn record_schedule_skip_preserves_prior_outcome_and_counts() {
+        let dir = scratch("schedule-skip");
+        let now = unix_timestamp_ms();
+        let next_run = now + 300_000;
+
+        // 1. Brand-new schedule (`last_status == None`) -> skip sets `Some("skipped")`,
+        //    leaves `last_run_at == None` and `run_count == 0`.
+        let recurring = create_schedule(
+            &dir,
+            &NewSchedule {
+                name: "morning-digest".to_string(),
+                schedule_spec: "*/5 5-14 * * *".to_string(),
+                prompt: "digest".to_string(),
+                profile: "deep".to_string(),
+                script: "true".to_string(),
+                no_agent: false,
+                suppress_token: Some("HEARTBEAT_OK".to_string()),
+                failure_deliver: FailureDeliver::Notify,
+                max_runs: Some(2),
+                expires_at: None,
+                next_run_at: next_run,
+            },
+            128,
+        )
+        .unwrap();
+        assert_eq!(recurring.last_status, None);
+        assert_eq!(recurring.last_run_at, None);
+        assert_eq!(recurring.run_count, 0);
+
+        record_schedule_skip(&dir, recurring.id, now + 1_000, false).unwrap();
+        let after_initial_skip = get_schedule(&dir, "morning-digest").unwrap().unwrap();
+        assert_eq!(after_initial_skip.last_status.as_deref(), Some("skipped"));
+        assert_eq!(after_initial_skip.last_run_at, None);
+        assert_eq!(after_initial_skip.run_count, 0);
+        assert!(after_initial_skip.enabled);
+        assert_eq!(after_initial_skip.next_run_at, Some(next_run));
+
+        // 2. Schedule with `last_status = Some("ok")`, `last_run_at = Some(t)`, `run_count = 1`,
+        //    `max_runs = Some(2)` -> skip preserves `"ok"`, `Some(t)`, `run_count = 1`, `enabled = true`.
+        let ok_ts = now + 2_000;
+        record_schedule_outcome(
+            &dir,
+            recurring.id,
+            ok_ts,
+            ok_ts + 50,
+            "ok",
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        record_schedule_skip(&dir, recurring.id, ok_ts + 5_000, false).unwrap();
+        let after_ok_skip = get_schedule(&dir, "morning-digest").unwrap().unwrap();
+        assert_eq!(after_ok_skip.last_status.as_deref(), Some("ok"));
+        assert_eq!(after_ok_skip.last_run_at, Some(ok_ts));
+        assert_eq!(after_ok_skip.run_count, 1);
+        assert!(after_ok_skip.enabled);
+        assert_eq!(after_ok_skip.next_run_at, Some(next_run));
+
+        // 3. Schedule with `last_status = Some("suppressed")` -> skip preserves `"suppressed"`,
+        //    `last_run_at`, and `run_count`.
+        let suppressed_job = create_schedule(
+            &dir,
+            &NewSchedule {
+                name: "quiet-watch".to_string(),
+                schedule_spec: "every 5m".to_string(),
+                prompt: "check".to_string(),
+                profile: String::new(),
+                script: "true".to_string(),
+                no_agent: false,
+                suppress_token: Some("HEARTBEAT_OK".to_string()),
+                failure_deliver: FailureDeliver::Notify,
+                max_runs: None,
+                expires_at: None,
+                next_run_at: next_run,
+            },
+            128,
+        )
+        .unwrap();
+        let supp_ts = now + 3_000;
+        record_schedule_outcome(
+            &dir,
+            suppressed_job.id,
+            supp_ts,
+            supp_ts + 50,
+            "suppressed",
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        record_schedule_skip(&dir, suppressed_job.id, supp_ts + 5_000, false).unwrap();
+        let after_supp_skip = get_schedule(&dir, "quiet-watch").unwrap().unwrap();
+        assert_eq!(after_supp_skip.last_status.as_deref(), Some("suppressed"));
+        assert_eq!(after_supp_skip.last_run_at, Some(supp_ts));
+        assert_eq!(after_supp_skip.run_count, 1);
+        assert!(after_supp_skip.enabled);
+
+        // 4. Schedule with `last_status = Some("failed")`, `last_error = Some("boom")`,
+        //    `consecutive_failures = 2` -> skip preserves `"failed"`, `Some("boom")`, `consecutive_failures = 2`.
+        let failing_job = create_schedule(
+            &dir,
+            &NewSchedule {
+                name: "flaky-watch".to_string(),
+                schedule_spec: "every 5m".to_string(),
+                prompt: "check".to_string(),
+                profile: String::new(),
+                script: "true".to_string(),
+                no_agent: false,
+                suppress_token: None,
+                failure_deliver: FailureDeliver::Notify,
+                max_runs: None,
+                expires_at: None,
+                next_run_at: next_run,
+            },
+            128,
+        )
+        .unwrap();
+        let fail1_ts = now + 4_000;
+        let fail2_ts = now + 5_000;
+        assert_eq!(
+            record_schedule_outcome(
+                &dir,
+                failing_job.id,
+                fail1_ts,
+                fail1_ts + 10,
+                "failed",
+                Some("first"),
+                true,
+                false,
+                false,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            record_schedule_outcome(
+                &dir,
+                failing_job.id,
+                fail2_ts,
+                fail2_ts + 10,
+                "failed",
+                Some("boom"),
+                true,
+                false,
+                false,
+            )
+            .unwrap(),
+            2
+        );
+        record_schedule_skip(&dir, failing_job.id, fail2_ts + 5_000, false).unwrap();
+        let after_fail_skip = get_schedule(&dir, "flaky-watch").unwrap().unwrap();
+        assert_eq!(after_fail_skip.last_status.as_deref(), Some("failed"));
+        assert_eq!(after_fail_skip.last_error.as_deref(), Some("boom"));
+        assert_eq!(after_fail_skip.last_run_at, Some(fail2_ts));
+        assert_eq!(after_fail_skip.consecutive_failures, 2);
+        assert_eq!(after_fail_skip.run_count, 2);
+
+        // 5. One-shot skip (`force_disable = true`) -> disables schedule and clears
+        //    `next_run_at` while keeping `run_count = 0`.
+        let oneshot = create_schedule(
+            &dir,
+            &NewSchedule {
+                name: "once-check".to_string(),
+                schedule_spec: "in 5m".to_string(),
+                prompt: "check once".to_string(),
+                profile: String::new(),
+                script: "true".to_string(),
+                no_agent: false,
+                suppress_token: None,
+                failure_deliver: FailureDeliver::Notify,
+                max_runs: None,
+                expires_at: None,
+                next_run_at: next_run,
+            },
+            128,
+        )
+        .unwrap();
+        record_schedule_skip(&dir, oneshot.id, now + 10_000, true).unwrap();
+        let after_oneshot_skip = get_schedule(&dir, "once-check").unwrap().unwrap();
+        assert!(!after_oneshot_skip.enabled);
+        assert_eq!(after_oneshot_skip.next_run_at, None);
+        assert_eq!(after_oneshot_skip.run_count, 0);
+        assert_eq!(after_oneshot_skip.last_status.as_deref(), Some("skipped"));
+        assert_eq!(after_oneshot_skip.last_run_at, None);
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -717,10 +717,23 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
 
     let config_path = cli.config.clone();
     let config = match (&cli.command, cli.config.as_deref()) {
-        (Command::Ask { .. }, None) => match Config::load(None) {
+        (
+            Command::Ask { .. }
+            | Command::Schedule {
+                action: None | Some(ScheduleCommand::List { .. } | ScheduleCommand::Show { .. }),
+            }
+            | Command::Tasks {
+                action: None | Some(TasksCommand::List { .. } | TasksCommand::Show { .. }),
+            }
+            | Command::Recall { .. }
+            | Command::Draft {
+                action: None | Some(DraftCommand::List { .. } | DraftCommand::Show { .. }),
+            },
+            None,
+        ) => match Config::load(None) {
             Ok(cfg) => cfg,
             Err(e) => {
-                tracing::debug!("falling back to default client config for ask: {e:#}");
+                tracing::debug!("falling back to default client config: {e:#}");
                 Config::default()
             }
         },

@@ -929,8 +929,8 @@ async fn execute_job(
             JobOutcome::Failed(format!("{e:#}"))
         } else {
             let timeout = Duration::from_secs_f64(config.scheduler.script_timeout_secs.max(0.1));
-            match run_collector_script(&job.script, &state_dir, job.id, manual, timeout).await {
-                Ok(stdout) if stdout.trim().is_empty() => {
+            match run_collector_script(&job.script, &state_dir, &job, manual, timeout).await {
+                Ok(stdout) if !job.no_agent && stdout.trim().is_empty() => {
                     tracing::info!(
                         "schedule #{} ({}): collector empty, skipped",
                         job.id,
@@ -940,12 +940,14 @@ async fn execute_job(
                 }
                 Ok(stdout) if job.no_agent => {
                     let body = stdout.trim().to_string();
-                    presenter.present(Presentation::Notice {
-                        summary: format!("Schedule: {}", job.name),
-                        body,
-                        urgency: Urgency::Normal,
-                        replaces_id: None,
-                    });
+                    if !body.is_empty() {
+                        presenter.present(Presentation::Notice {
+                            summary: format!("Schedule: {}", job.name),
+                            body,
+                            urgency: Urgency::Normal,
+                            replaces_id: None,
+                        });
+                    }
                     JobOutcome::Ok
                 }
                 Ok(stdout) => {
@@ -992,17 +994,25 @@ async fn execute_job(
     };
 
     let finished_ms = store::unix_timestamp_ms();
-    let (status_str, error_msg, failed) = match &outcome {
-        JobOutcome::Ok => ("ok", None, false),
-        JobOutcome::Skipped => ("skipped", None, false),
-        JobOutcome::Suppressed => ("suppressed", None, false),
-        JobOutcome::Failed(msg) => ("failed", Some(msg.clone()), true),
-    };
-
     let is_one_shot = ScheduleSpec::parse(&job.schedule_spec)
         .map(|s| s.is_one_shot())
         .unwrap_or(false);
     let force_disable = !manual && (is_one_shot || !has_next_run);
+
+    let (status_str, error_msg, failed) = match &outcome {
+        JobOutcome::Ok => ("ok", None, false),
+        JobOutcome::Suppressed => ("suppressed", None, false),
+        JobOutcome::Failed(msg) => ("failed", Some(msg.clone()), true),
+        JobOutcome::Skipped => {
+            let sd = state_dir.clone();
+            let id = job.id;
+            let _ = tokio::task::spawn_blocking(move || {
+                store::record_schedule_skip(&sd, id, finished_ms, force_disable)
+            })
+            .await;
+            return;
+        }
+    };
 
     let sd = state_dir.clone();
     let id = job.id;
@@ -1330,7 +1340,7 @@ fn parse_cron_dow_index(atom: &str) -> Option<usize> {
 async fn run_collector_script(
     script: &str,
     state_dir: &Path,
-    job_id: u64,
+    job: &ScheduleRecord,
     manual: bool,
     timeout: Duration,
 ) -> std::result::Result<String, String> {
@@ -1338,7 +1348,16 @@ async fn run_collector_script(
         .args(["-c", script])
         .env("HEY_COMPUTER_STATE_DIR", state_dir)
         .env("HEY_COMPUTER_ARTIFACTS_DIR", state_dir.join("artifacts"))
-        .env("HEY_COMPUTER_SCHEDULE_ID", job_id.to_string())
+        .env("HEY_COMPUTER_SCHEDULE_ID", job.id.to_string())
+        .env("HEY_COMPUTER_SCHEDULE_NAME", &job.name)
+        .env(
+            "HEY_COMPUTER_SCHEDULE_LAST_STATUS",
+            job.last_status.as_deref().unwrap_or(""),
+        )
+        .env(
+            "HEY_COMPUTER_SCHEDULE_LAST_RUN_AT",
+            job.last_run_at.map(|v| v.to_string()).unwrap_or_default(),
+        )
         .env(
             "HEY_COMPUTER_SCHEDULE_MANUAL",
             if manual { "1" } else { "0" },
@@ -1550,32 +1569,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collector_script_receives_schedule_id_and_manual_env_vars() {
+    async fn collector_script_receives_schedule_metadata_and_manual_env_vars() {
         let dir = std::env::temp_dir().join(format!("hc-sched-env-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let auto_out = run_collector_script(
-            "printf '%s:%s' \"$HEY_COMPUTER_SCHEDULE_ID\" \"$HEY_COMPUTER_SCHEDULE_MANUAL\"",
-            &dir,
-            42,
-            false,
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
-        assert_eq!(auto_out, "42:0");
+        let script = "printf '%s|%s|%s|%s|%s' \
+            \"$HEY_COMPUTER_SCHEDULE_ID\" \
+            \"$HEY_COMPUTER_SCHEDULE_NAME\" \
+            \"$HEY_COMPUTER_SCHEDULE_LAST_STATUS\" \
+            \"$HEY_COMPUTER_SCHEDULE_LAST_RUN_AT\" \
+            \"$HEY_COMPUTER_SCHEDULE_MANUAL\"";
 
-        let manual_out = run_collector_script(
-            "printf '%s:%s' \"$HEY_COMPUTER_SCHEDULE_ID\" \"$HEY_COMPUTER_SCHEDULE_MANUAL\"",
-            &dir,
-            42,
-            true,
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
-        assert_eq!(manual_out, "42:1");
+        let mut job = ScheduleRecord {
+            id: 42,
+            name: "morning-digest".to_string(),
+            enabled: true,
+            managed: true,
+            schedule_spec: "*/5 5-14 * * *".to_string(),
+            prompt: String::new(),
+            profile: "deep".to_string(),
+            script: script.to_string(),
+            no_agent: false,
+            suppress_token: None,
+            failure_deliver: FailureDeliver::Notify,
+            max_runs: None,
+            expires_at: None,
+            run_count: 1,
+            consecutive_failures: 0,
+            next_run_at: None,
+            last_run_at: Some(1_764_144_000_000),
+            last_status: Some("ok".to_string()),
+            last_error: None,
+            created_at: 1_764_000_000_000,
+            updated_at: 1_764_144_000_000,
+        };
+
+        let auto_out = run_collector_script(script, &dir, &job, false, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(auto_out, "42|morning-digest|ok|1764144000000|0");
+
+        job.last_status = None;
+        job.last_run_at = None;
+        let manual_out = run_collector_script(script, &dir, &job, true, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(manual_out, "42|morning-digest|||1");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
