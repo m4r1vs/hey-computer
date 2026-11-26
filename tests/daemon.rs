@@ -4289,3 +4289,341 @@ async fn self_chat_initial_icons_survive_escalation_and_group_notify_hold_uses_g
     h.stop().await;
     let _ = std::fs::remove_dir_all(&bridge_dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_collector_skip_preserves_status_and_no_agent_records_ok() {
+    use hey_computer::store::{self, FailureDeliver, NewSchedule};
+
+    let script = r#"{
+        "turns": [
+            {"match": "MORNING_GATE", "steps": [{"chunk": "Good morning brief"}]}
+        ],
+        "default": ["echo"]
+    }"#;
+    let h = Harness::start(script, |c| {
+        c.scheduler.enabled = true;
+        c.scheduler.min_interval_secs = 1.0;
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    let state_dir = h.dir.join("state");
+    let now = store::unix_timestamp_ms();
+    let skip_marker = h.dir.join("collector-skipped.marker");
+    let collector_script = format!(
+        "if [ \"$HEY_COMPUTER_SCHEDULE_LAST_STATUS\" = \"ok\" ]; then \
+            printf '%s:%s' \"$HEY_COMPUTER_SCHEDULE_NAME\" \"$HEY_COMPUTER_SCHEDULE_LAST_RUN_AT\" > '{}'; \
+            exit 0; \
+         fi; \
+         echo 'calendar: 09:00 standup'",
+        skip_marker.display()
+    );
+
+    // 1. Once-per-day collector gated by $HEY_COMPUTER_SCHEDULE_LAST_STATUS.
+    let daily = store::create_schedule(
+        &state_dir,
+        &NewSchedule {
+            name: "daily-gate".to_string(),
+            schedule_spec: "every 5m".to_string(),
+            prompt: "MORNING_GATE".to_string(),
+            profile: String::new(),
+            script: collector_script,
+            no_agent: false,
+            suppress_token: None,
+            failure_deliver: FailureDeliver::Notify,
+            max_runs: None,
+            expires_at: None,
+            next_run_at: now + 300_000,
+        },
+        128,
+    )
+    .unwrap();
+
+    // Run 1: last_status is empty -> collector prints payload -> agent executes and records "ok".
+    let res1 = ipc::request(
+        &h.socket,
+        &Request::ScheduleRun {
+            target: "daily-gate".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(res1, Reply::Ok { .. }), "{res1:?}");
+
+    h.recorder
+        .wait_for(Duration::from_secs(10), |items| {
+            items.iter().any(|i| {
+                matches!(
+                    i,
+                    Presentation::TaskComplete { text, .. } if text == "Good morning brief"
+                )
+            })
+        })
+        .await
+        .expect("run 1 TaskComplete");
+    h.eventually("daily-gate run 1 recorded ok", || {
+        store::get_schedule(&state_dir, "daily-gate")
+            .ok()
+            .flatten()
+            .is_some_and(|j| j.last_status.as_deref() == Some("ok") && j.run_count == 1)
+    })
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.status().await.running_schedules.contains(&daily.id) {
+        assert!(Instant::now() < deadline, "daily-gate run 1 still running");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let after_run1 = store::get_schedule(&state_dir, "daily-gate")
+        .unwrap()
+        .expect("daily-gate after run 1");
+    let t1 = after_run1.last_run_at.expect("run 1 last_run_at");
+    assert_eq!(after_run1.last_status.as_deref(), Some("ok"));
+    assert_eq!(after_run1.run_count, 1);
+    assert_eq!(h.log_count("MORNING_GATE"), 1);
+
+    // Run 2: collector sees HEY_COMPUTER_SCHEDULE_LAST_STATUS=ok, writes marker, exits 0 with
+    // empty stdout. Status, run_count, and last_run_at must stay preserved (not "skipped").
+    let res2 = ipc::request(
+        &h.socket,
+        &Request::ScheduleRun {
+            target: "daily-gate".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(res2, Reply::Ok { .. }), "{res2:?}");
+
+    h.eventually("run 2 collector skip marker written", || {
+        skip_marker.exists()
+    })
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.status().await.running_schedules.contains(&daily.id) {
+        assert!(Instant::now() < deadline, "daily-gate run 2 still running");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let marker_contents = std::fs::read_to_string(&skip_marker).unwrap();
+    assert_eq!(marker_contents, format!("daily-gate:{t1}"));
+
+    let after_run2 = store::get_schedule(&state_dir, "daily-gate")
+        .unwrap()
+        .expect("daily-gate after run 2");
+    assert_eq!(after_run2.last_status.as_deref(), Some("ok"));
+    assert_eq!(after_run2.run_count, 1);
+    assert_eq!(after_run2.last_run_at, Some(t1));
+    assert_eq!(h.log_count("MORNING_GATE"), 1);
+
+    // 2. --no-agent --script "true" (quiet action script like weekly-distill) records "ok"
+    //    with run_count = 1 and last_run_at = Some(...) without emitting a desktop Notice.
+    let quiet = store::create_schedule(
+        &state_dir,
+        &NewSchedule {
+            name: "quiet-no-agent".to_string(),
+            schedule_spec: "every 1d".to_string(),
+            prompt: String::new(),
+            profile: String::new(),
+            script: "true".to_string(),
+            no_agent: true,
+            suppress_token: None,
+            failure_deliver: FailureDeliver::Notify,
+            max_runs: None,
+            expires_at: None,
+            next_run_at: now + 86_400_000,
+        },
+        128,
+    )
+    .unwrap();
+    let res3 = ipc::request(
+        &h.socket,
+        &Request::ScheduleRun {
+            target: "quiet-no-agent".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(res3, Reply::Ok { .. }), "{res3:?}");
+
+    h.eventually("quiet-no-agent recorded ok", || {
+        store::get_schedule(&state_dir, "quiet-no-agent")
+            .ok()
+            .flatten()
+            .is_some_and(|j| j.last_status.as_deref() == Some("ok") && j.run_count == 1)
+    })
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.status().await.running_schedules.contains(&quiet.id) {
+        assert!(Instant::now() < deadline, "quiet-no-agent still running");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let quiet_after = store::get_schedule(&state_dir, "quiet-no-agent")
+        .unwrap()
+        .expect("quiet-no-agent after run");
+    assert_eq!(quiet_after.last_status.as_deref(), Some("ok"));
+    assert_eq!(quiet_after.run_count, 1);
+    assert!(quiet_after.last_run_at.is_some());
+    assert_eq!(h.log_count("prompt "), 1);
+    assert!(
+        !h.recorder
+            .items()
+            .iter()
+            .any(|i| matches!(i, Presentation::Notice { .. })),
+        "quiet --no-agent --script must not emit a desktop Notice: {:?}",
+        h.recorder.items()
+    );
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notify_hold_bypasses_saturated_background_task_pool() {
+    use hey_computer::notify_filter::NotificationAppRule;
+    use hey_computer::protocol::NotifyReleaseAction;
+
+    let script = r##"{
+      "turns": [
+        {"match": "slow_bg_task", "steps": [
+          {"chunk": "bg-started "},
+          {"wait_for": "release_bg"},
+          {"chunk": "bg-finished"}
+        ]},
+        {"match": "dinner at 8", "steps": [
+          {"chunk": "CONTEXT: Dinner invite\nDRAFT: Sounds great, see you at 8!"}
+        ]},
+        {"match": "release_bg_now", "steps": [
+          {"signal": "release_bg"},
+          {"chunk": "released"}
+        ]}
+      ],
+      "default": ["echo"]
+    }"##;
+
+    let h = Harness::start(script, |c| {
+        c.agent.inactivity_timeout_secs = 15.0;
+        c.tasks.max_concurrent = 1;
+        c.notifications.enabled = true;
+        c.notifications.max_concurrent = 4;
+        c.notifications.max_hold_secs = 30.0;
+        c.notifications.max_turn_secs = 20.0;
+        c.notifications.max_tool_calls = 0;
+        c.notifications.per_sender_cooldown_secs = 0.0;
+        c.notifications.dedupe_window_secs = 0.0;
+        c.present.clipboard = Vec::new();
+        c.notifications.apps.insert(
+            "signal".to_string(),
+            NotificationAppRule {
+                match_apps: vec!["signal".to_string()],
+                allow_senders: vec!["Alice".to_string()],
+                ..NotificationAppRule::default()
+            },
+        );
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    // 1. Saturate the single tasks.max_concurrent = 1 background slot with a slow task blocked on
+    //    the `release_bg` barrier.
+    let (bg_id, mut bg_client) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "slow_bg_task".to_string(),
+            wait: true,
+            new: false,
+            profile: None,
+            background: true,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
+            schedule_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    h.wait_log("prompt mock-2 slow_bg_task").await;
+
+    let st = h.status().await;
+    assert_eq!(st.background_running, 1);
+    assert_eq!(st.background_queued, 0);
+
+    // 2. While the regular background pool is completely saturated, send NotifyHold.
+    //    It must run on the dedicated restricted pool and return ShowEnriched promptly BEFORE
+    //    `slow_bg_task` finishes.
+    let hold_started = Instant::now();
+    let mut notify_client = Client::send(
+        &h.socket,
+        &Request::NotifyHold {
+            noti_id: 42,
+            replaces_id: 0,
+            app_name: "Signal".to_string(),
+            desktop_entry: "signal".to_string(),
+            summary: "Alice".to_string(),
+            body: "Are we still on for dinner at 8?".to_string(),
+            category: "im.received".to_string(),
+            urgency: "normal".to_string(),
+            has_default_action: true,
+            dnd: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        notify_client
+            .next(Some(Duration::from_secs(5)))
+            .await
+            .unwrap(),
+        Reply::NotifyAccepted { max_hold_ms: 30000 }
+    ));
+    let release = notify_client
+        .next(Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert!(
+        hold_started.elapsed() < Duration::from_secs(5),
+        "NotifyHold took too long while background pool was saturated: {:?}",
+        hold_started.elapsed()
+    );
+    match release {
+        Reply::NotifyRelease {
+            action: NotifyReleaseAction::ShowEnriched,
+            context_note: Some(ctx),
+            draft_text: Some(draft),
+            readonly: Some(true),
+            ..
+        } => {
+            assert_eq!(ctx, "Dinner invite");
+            assert_eq!(draft, "Sounds great, see you at 8!");
+        }
+        other => panic!("expected ShowEnriched, got {other:?}"),
+    }
+
+    // Confirm the slow background task is still actively occupying its slot.
+    assert_eq!(h.status().await.background_running, 1);
+
+    // 3. Release the slow background task and verify it finishes cleanly.
+    let release_reply = h.ask("release_bg_now", false).await;
+    assert_eq!(answer(&release_reply), "released");
+
+    let bg_reply = bg_client.next(Some(Duration::from_secs(10))).await.unwrap();
+    match &bg_reply {
+        Reply::Answer { id, text, .. } => {
+            assert_eq!(*id, bg_id);
+            assert_eq!(text, "bg-started bg-finished");
+        }
+        other => panic!("expected background Answer, got {other:?}"),
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.status().await.background_running != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "background_running never returned to 0"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    h.stop().await;
+}
