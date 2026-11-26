@@ -233,8 +233,8 @@
   "the default viewer passes the turn id placeholder";
   assert lib.assertMsg ((settingsOf withMemory).present.speak.voice_only == true)
   "speak defaults to voice_only = true";
-  assert lib.assertMsg (lib.length (settingsOf full).instructions.skills == 9)
-  "nine skills with a vault and openhue: hyprland-desktop, recall, tmux, schedule, four from obsidian-skills, and openhue";
+  assert lib.assertMsg (lib.length (settingsOf full).instructions.skills == 10)
+  "ten skills with a vault, openhue, and messengerBridge: hyprland-desktop, recall, tmux, schedule, four from obsidian-skills, openhue, and messenger";
   assert lib.assertMsg ((settingsOf full).instructions.memory_file == "/home/alice/.config/hey-computer/memory.md")
   "the module defaults instructions.memory_file to xdg.configHome";
   assert lib.assertMsg (lib.hasSuffix "/bin/wl-copy" (lib.head (settingsOf full).present.clipboard))
@@ -277,7 +277,7 @@ in
       export XDG_STATE_HOME=$TMPDIR/state
       $hc --config ${configFile} debug prepare
       skills=$XDG_STATE_HOME/hey-computer/agy/config/skills
-      for skill in hyprland-desktop recall tmux schedule obsidian-cli obsidian-markdown obsidian-bases json-canvas openhue; do
+      for skill in hyprland-desktop recall tmux schedule obsidian-cli obsidian-markdown obsidian-bases json-canvas openhue messenger; do
         test -e "$skills/$skill/SKILL.md" || { echo "missing skill $skill" >&2; exit 1; }
       done
       test -d "$XDG_STATE_HOME/hey-computer/artifacts" || { echo "missing artifacts dir" >&2; exit 1; }
@@ -305,15 +305,17 @@ in
       grep -qx 'ProtectSystem=strict' ${bridgeUnit}
       grep -qx 'ProtectHome=tmpfs' ${bridgeUnit}
       grep -q 'BindPaths=' ${bridgeUnit}
+      grep -q 'BindReadOnlyPaths=' ${bridgeUnit}
       agent_path=$(sed -n 's/^Environment=PATH=//p' ${unit})
       test -n "$agent_path"
 
-      # The agent's PATH: the shim first, then openhue, agy, the extras and the basics.
+      # The agent's PATH: the shim first, then openhue, agy, bridge, the extras and the basics.
       PATH=$agent_path
       test "$(obsidian help)" = "obsidian-cli stub: help"
       test "$(openhue version)" = "openhue stub: version"
       test "$(agy --version)" = "agy stub: --version"
-      for tool in hey-computer tmux hello jq notify-send playerctl wpctl bash rg curl; do
+      test "$(hey-computer-bridge status)" = "bridge stub: status"
+      for tool in hey-computer hey-computer-bridge tmux hello jq notify-send playerctl wpctl bash rg curl; do
         command -v $tool > /dev/null || { echo "$tool is not on the agent's PATH" >&2; exit 1; }
       done
       touch $out
