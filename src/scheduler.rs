@@ -1007,7 +1007,7 @@ async fn execute_job(
             let sd = state_dir.clone();
             let id = job.id;
             let _ = tokio::task::spawn_blocking(move || {
-                store::record_schedule_skip(&sd, id, finished_ms, force_disable)
+                store::record_schedule_skip(&sd, id, started_ms, finished_ms, force_disable)
             })
             .await;
             return;

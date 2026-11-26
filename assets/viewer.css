@@ -1358,6 +1358,10 @@ math * {
   white-space: nowrap;
 }
 
+.w-btn[hidden] {
+  display: none;
+}
+
 .w-btn:hover {
   background-color: rgba(var(--primary-color), 0.12);
   border-color: rgba(var(--primary-color), 0.42);
@@ -2168,6 +2172,363 @@ math * {
 .skill-draft-preview[hidden],
 .template-preview-pre[hidden] {
   display: none;
+}
+
+/* 6b. Day Plan Interactive Widget */
+.hc-widget-day_plan.is-activated {
+  border-color: rgba(var(--fx-green-rgb), 0.38);
+}
+
+.hc-widget-day_plan.is-superseded {
+  opacity: 0.62;
+}
+
+.dp-header-left {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.48rem;
+  min-width: 0;
+}
+
+.dp-mode-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  border: 1px solid var(--hairline-border);
+  background-color: rgba(var(--tertiary-bg-color), 0.6);
+  color: rgb(var(--secondary-text-color));
+  white-space: nowrap;
+}
+
+.dp-mode-pill[data-mode="workday"] {
+  color: var(--fx-blue);
+  background-color: rgba(var(--fx-blue-rgb), 0.11);
+  border-color: rgba(var(--fx-blue-rgb), 0.28);
+}
+
+.dp-mode-pill[data-mode="day_off"] {
+  color: var(--fx-green);
+  background-color: rgba(var(--fx-green-rgb), 0.11);
+  border-color: rgba(var(--fx-green-rgb), 0.28);
+}
+
+.dp-live-counter {
+  font-variant-numeric: tabular-nums;
+}
+
+.dp-status-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem 0.52rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.dp-status-pill[hidden] {
+  display: none;
+}
+
+.dp-status-pill.is-activated {
+  color: var(--fx-green);
+  background-color: rgba(var(--fx-green-rgb), 0.14);
+  border: 1px solid rgba(var(--fx-green-rgb), 0.34);
+}
+
+.dp-status-pill.is-superseded {
+  color: rgb(var(--secondary-text-color));
+  background-color: rgba(var(--tertiary-bg-color), 0.72);
+  border: 1px solid var(--hairline-border);
+}
+
+.dp-roter-faden {
+  margin: 0.1rem 0 0.72rem 0;
+  padding: 0.56rem 0.84rem;
+  border-left: 2.5px solid rgb(var(--primary-color));
+  background-color: rgba(var(--bg-color), 0.55);
+  border-radius: 0 8px 8px 0;
+}
+
+.dp-roter-faden-label {
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: rgb(var(--primary-color));
+  margin-bottom: 0.2rem;
+}
+
+.dp-roter-faden-text {
+  margin: 0;
+  font-family: "Reforma 1969", "Reforma 2018", "EB Garamond", Georgia, serif;
+  font-size: 1.08rem;
+  line-height: 1.48;
+  font-style: italic;
+  color: rgb(var(--primary-text-color));
+}
+
+.dp-section + .dp-section {
+  margin-top: 0.72rem;
+  padding-top: 0.68rem;
+  border-top: 1px solid var(--hairline-border);
+}
+
+.dp-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  margin-bottom: 0.28rem;
+}
+
+.dp-section-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.055em;
+  color: rgb(var(--secondary-text-color));
+}
+
+.dp-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  transition: opacity 130ms ease;
+}
+
+.dp-row.is-skipped,
+.dp-block-row.is-skipped {
+  opacity: 0.46;
+}
+
+.dp-row.is-skipped .dp-task-title,
+.dp-row.is-skipped .dp-sender,
+.dp-row.is-skipped .dp-setup-title,
+.dp-block-row.is-skipped .agenda-event-title {
+  text-decoration: line-through;
+}
+
+.dp-checkbox {
+  accent-color: rgb(var(--primary-color));
+  margin: 0.2rem 0 0 0;
+  width: 0.96rem;
+  height: 0.96rem;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.dp-checkbox:disabled {
+  cursor: default;
+}
+
+.dp-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.22rem;
+}
+
+.dp-nudge-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.55rem;
+}
+
+.dp-nudge-meta {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.36rem;
+  min-width: 0;
+}
+
+.dp-channel-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.08rem 0.42rem;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  background-color: rgba(var(--tertiary-bg-color), 0.72);
+  color: rgb(var(--secondary-text-color));
+}
+
+.dp-channel-badge[data-channel="whatsapp"] {
+  background-color: rgba(var(--fx-green-rgb), 0.14);
+  color: var(--fx-green);
+}
+
+.dp-channel-badge[data-channel="signal"] {
+  background-color: rgba(var(--fx-blue-rgb), 0.14);
+  color: var(--fx-blue);
+}
+
+.dp-channel-badge[data-channel="gmail"] {
+  background-color: rgba(var(--fx-red-rgb), 0.13);
+  color: var(--fx-red);
+}
+
+.dp-channel-badge[data-channel="slack"] {
+  background-color: rgba(var(--fx-purple-rgb), 0.14);
+  color: var(--fx-purple);
+}
+
+.dp-sender {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: rgb(var(--primary-text-color));
+}
+
+.dp-nudge-kind {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.06rem 0.42rem;
+  border-radius: 999px;
+  font-size: 0.69rem;
+  font-weight: 600;
+}
+
+.dp-nudge-kind[data-kind="promised_followup"] {
+  background-color: rgba(var(--fx-orange-rgb), 0.13);
+  color: var(--fx-orange);
+}
+
+.dp-nudge-kind[data-kind="unanswered"] {
+  background-color: rgba(var(--fx-cyan-rgb), 0.13);
+  color: var(--fx-cyan);
+}
+
+.dp-draft-btn {
+  flex-shrink: 0;
+}
+
+.dp-nudge-summary {
+  font-size: 0.8rem;
+  line-height: 1.44;
+  color: rgb(var(--primary-text-color));
+}
+
+.dp-nudge-quote {
+  font-size: 0.76rem;
+  line-height: 1.42;
+  font-style: italic;
+  color: rgb(var(--secondary-text-color));
+  padding-left: 0.56rem;
+  border-left: 2px solid var(--hairline-border);
+}
+
+.dp-task-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.55rem;
+}
+
+.dp-task-title-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.44rem;
+  min-width: 0;
+}
+
+.dp-task-title {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: rgb(var(--primary-text-color));
+}
+
+.dp-task-pills {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.32rem;
+}
+
+.dp-ref-pill {
+  font-weight: 700;
+  color: rgb(var(--primary-color));
+  background-color: rgba(var(--primary-color), 0.12);
+}
+
+.dp-subtasks {
+  margin: 0.14rem 0 0 0;
+  padding-left: 1.2rem;
+  font-size: 0.77rem;
+  line-height: 1.48;
+  color: rgb(var(--secondary-text-color));
+  display: flex;
+  flex-direction: column;
+  gap: 0.12rem;
+}
+
+.dp-block-row {
+  grid-template-columns: auto 3px 8.6rem 1fr;
+}
+
+.dp-setup-main,
+.dp-checkin-main {
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.36rem 0.48rem;
+}
+
+.dp-setup-title {
+  font-size: 0.81rem;
+  color: rgb(var(--primary-text-color));
+}
+
+.dp-checkin-time {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.08rem 0.42rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  background-color: rgba(var(--primary-color), 0.13);
+  color: rgb(var(--primary-color));
+}
+
+.dp-checkin-reason {
+  font-size: 0.76rem;
+  color: rgb(var(--secondary-text-color));
+}
+
+.dp-empty-note {
+  padding: 0.25rem 0;
+  font-size: 0.76rem;
+  font-style: italic;
+  color: rgb(var(--secondary-text-color));
+}
+
+.dp-footer-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.42rem;
+}
+
+.dp-btn-activated {
+  background-color: rgba(var(--fx-green-rgb), 0.14);
+  border-color: rgba(var(--fx-green-rgb), 0.38);
+  color: var(--fx-green);
+  font-weight: 700;
+  cursor: default;
+}
+
+.dp-btn-activated:hover {
+  background-color: rgba(var(--fx-green-rgb), 0.14);
+  border-color: rgba(var(--fx-green-rgb), 0.38);
 }
 
 /* 7. Custom HTML show_widget + 8. skill_template_draft */
@@ -3082,6 +3443,10 @@ math * {
 
   .agenda-item {
     grid-template-columns: 3px 1fr;
+  }
+
+  .dp-block-row {
+    grid-template-columns: auto 3px 1fr;
   }
 
   .agenda-bar {

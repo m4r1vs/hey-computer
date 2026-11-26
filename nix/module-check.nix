@@ -180,6 +180,26 @@
     memory.file = null;
   };
 
+  noDayPlan = evaluate {
+    dayPlan.enable = false;
+  };
+
+  withSubagents = evaluate {
+    subagents = {
+      enable = true;
+      profile = "lean";
+      maxConcurrent = 4;
+      maxQueued = 16;
+      maxTurnSecs = 120;
+      maxToolCalls = 30;
+    };
+    settings.profiles.lean.model = "gemini-3.8-flash-low";
+  };
+
+  withSubagentsDisabled = evaluate {
+    subagents.enable = false;
+  };
+
   memorySample = pkgs.writeText "memory.md" "Prefer concise answers.\n";
   memoryExtra = pkgs.writeText "memory-extra.md" "Local state note.\n";
   withMemory = evaluate {
@@ -242,8 +262,28 @@
   "the default viewer passes the turn id placeholder";
   assert lib.assertMsg ((settingsOf withMemory).present.speak.voice_only == true)
   "speak defaults to voice_only = true";
-  assert lib.assertMsg (lib.length (settingsOf full).instructions.skills == 10)
-  "ten skills with a vault, openhue, and messengerBridge: hyprland-desktop, recall, tmux, schedule, four from obsidian-skills, openhue, and messenger";
+  assert lib.assertMsg (lib.length (settingsOf full).instructions.skills == 11)
+  "eleven skills with a vault, openhue, and messengerBridge: hyprland-desktop, recall, tmux, schedule, day-plan, four from obsidian-skills, openhue, and messenger";
+  assert lib.assertMsg (lib.any (lib.hasSuffix "/skills/day-plan") (settingsOf full).instructions.skills)
+  "dayPlan.enable defaults to true and links the day-plan skill";
+  assert lib.assertMsg (lib.length (settingsOf noDayPlan).instructions.skills == 4 && !(lib.any (lib.hasSuffix "/skills/day-plan") (settingsOf noDayPlan).instructions.skills))
+  "dayPlan.enable = false omits the bundled day-plan skill";
+  assert lib.assertMsg (!((settingsOf full) ? subagents))
+  "unset subagents.* options keep settings free of [subagents]";
+  assert lib.assertMsg (
+    (settingsOf withSubagents).subagents
+    == {
+      enabled = true;
+      profile = "lean";
+      max_concurrent = 4;
+      max_queued = 16;
+      max_turn_secs = 120;
+      max_tool_calls = 30;
+    }
+  )
+  "subagents.* options lower cleanly into settings.subagents";
+  assert lib.assertMsg ((settingsOf withSubagentsDisabled).subagents == {enabled = false;})
+  "setting only subagents.enable omits unset subagents fields";
   assert lib.assertMsg ((settingsOf full).instructions.memory_file == "/home/alice/.config/hey-computer/memory.md")
   "the module defaults instructions.memory_file to xdg.configHome";
   assert lib.assertMsg (lib.hasSuffix "/bin/wl-copy" (lib.head (settingsOf full).present.clipboard))
@@ -254,8 +294,8 @@
   "settings.mcp entries merge alongside programs.hey-computer.mcp.servers";
   assert lib.assertMsg ((settingsOf custom).present.clipboard == ["my-clip"])
   "a user's clipboard command replaces the default";
-  assert lib.assertMsg (lib.length (settingsOf custom).instructions.skills == 4)
-  "without a vault or openhue only the bundled hyprland-desktop, recall, tmux, and schedule skills";
+  assert lib.assertMsg (lib.length (settingsOf custom).instructions.skills == 5)
+  "without a vault or openhue only the bundled hyprland-desktop, recall, tmux, schedule, and day-plan skills";
   assert lib.assertMsg (!((settingsOf bare).instructions or {} ? skills))
   "skills.enable = false links no skills";
   assert lib.assertMsg (!((settingsOf bare).instructions or {} ? memory_file))
@@ -264,6 +304,7 @@
   "a misspelt option must fail"; true;
 
   configFile = full.xdg.configFile."hey-computer/config.toml".source;
+  subagentsConfig = withSubagents.xdg.configFile."hey-computer/config.toml".source;
   bridgeConfigFile = full.xdg.configFile."hey-computer/bridge.toml".source;
   bareConfig = bare.xdg.configFile."hey-computer/config.toml".source;
   memoryConfig = withMemory.xdg.configFile."hey-computer/config.toml".source;
@@ -279,6 +320,7 @@ in
       test -f "${package}/share/hey-computer/assets/viewer.css" || { echo "missing viewer.css asset" >&2; exit 1; }
 
       $hc --config ${configFile} debug config > /dev/null
+      $hc --config ${subagentsConfig} debug config > /dev/null
       $hc --config ${bareConfig} debug config > /dev/null
       $hc --config ${memoryConfig} debug config > /dev/null
 
@@ -286,10 +328,12 @@ in
       export XDG_STATE_HOME=$TMPDIR/state
       $hc --config ${configFile} debug prepare
       skills=$XDG_STATE_HOME/hey-computer/agy/config/skills
-      for skill in hyprland-desktop recall tmux schedule obsidian-cli obsidian-markdown obsidian-bases json-canvas openhue messenger; do
+      for skill in hyprland-desktop recall tmux schedule day-plan obsidian-cli obsidian-markdown obsidian-bases json-canvas openhue messenger; do
         test -e "$skills/$skill/SKILL.md" || { echo "missing skill $skill" >&2; exit 1; }
       done
       test -d "$XDG_STATE_HOME/hey-computer/artifacts" || { echo "missing artifacts dir" >&2; exit 1; }
+      test -f "$XDG_STATE_HOME/hey-computer/subagent-workspace/AGENTS.md" || { echo "missing subagent-workspace AGENTS.md" >&2; exit 1; }
+      grep -q '"subagents"' "$XDG_STATE_HOME/hey-computer/agy/config/mcp_config.json"
       test -f "$XDG_STATE_HOME/hey-computer/restricted-workspace/AGENTS.md" || { echo "missing restricted-workspace AGENTS.md" >&2; exit 1; }
       test -f "$XDG_STATE_HOME/hey-computer/restricted-enrich-workspace/AGENTS.md" || { echo "missing restricted-enrich-workspace AGENTS.md" >&2; exit 1; }
       grep -q "hey-computer-bridge" "$XDG_STATE_HOME/hey-computer/restricted-enrich-workspace/AGENTS.md"

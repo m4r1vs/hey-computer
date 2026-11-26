@@ -113,7 +113,7 @@ pub async fn serve_with_deps(
     // Prepared once here, so that a skill directory that does not exist
     // stops the daemon at start instead of failing every agent start after
     // it. The conductor prepares it again before each start.
-    let paths = match environment::prepare(&config) {
+    let paths = match environment::prepare_with_socket(&config, Some(socket)) {
         Ok(paths) => paths,
         Err(e) => {
             let _ = std::fs::remove_file(socket);
@@ -139,12 +139,13 @@ pub async fn serve_with_deps(
     tracing::info!("listening on {}", socket.display());
 
     let config = Arc::new(config);
-    let (handle, mut conductor) = conductor::spawn_with_deps(
+    let (handle, mut conductor) = conductor::spawn_with_deps_and_socket(
         Arc::clone(&config),
         Arc::clone(&presenter),
         context,
         Some((store.clone(), initial_last_id)),
         keyring,
+        Some(socket.to_path_buf()),
     );
     let (sched_handle, sched_task) = scheduler::spawn(
         Arc::clone(&config),
@@ -566,6 +567,84 @@ async fn connection(svc: &DaemonServices, stream: UnixStream) -> Result<()> {
         }
         Request::DraftResume { token, action } => {
             handle_draft_resume(svc, &mut write, token, action).await
+        }
+        Request::Delegate {
+            role,
+            prompt,
+            profile,
+            allowed_mcp_servers,
+            parent_session,
+        } => {
+            if role.trim().is_empty() || prompt.trim().is_empty() {
+                return send(
+                    &mut write,
+                    &Reply::Error {
+                        message: "delegate `role` and `prompt` must not be empty".to_string(),
+                    },
+                )
+                .await;
+            }
+            if !svc.config.subagents.enabled {
+                return send(
+                    &mut write,
+                    &Reply::Failed {
+                        id: 0,
+                        reason: FailReason::Denied,
+                        message: "subagents are disabled in configuration".to_string(),
+                    },
+                )
+                .await;
+            }
+            if let Err(message) = handle.validate_profile(profile.as_deref()) {
+                return send(&mut write, &Reply::Error { message }).await;
+            }
+            let conductor::DelegateHandle {
+                id,
+                token,
+                reply: rx,
+            } = match handle.delegate(conductor::DelegateParams {
+                role,
+                prompt,
+                profile,
+                allowed_mcp_servers,
+                parent_session,
+            }) {
+                Ok(delegated) => delegated,
+                Err((reason, message)) => {
+                    return send(
+                        &mut write,
+                        &Reply::Failed {
+                            id: 0,
+                            reason,
+                            message,
+                        },
+                    )
+                    .await;
+                }
+            };
+            let reply = tokio::select! {
+                reply = rx => reply,
+                () = hung_up(&mut reader) => {
+                    tracing::debug!("the client of subagent {id} left");
+                    token.cancel(FailReason::Cancelled);
+                    handle.wake();
+                    return Ok(());
+                }
+            };
+            match reply {
+                Ok(reply) => send(&mut write, &reply).await,
+                Err(_) => {
+                    send(
+                        &mut write,
+                        &Reply::Failed {
+                            id,
+                            reason: FailReason::AgentDown,
+                            message: "the daemon is shutting down".to_string(),
+                        },
+                    )
+                    .await
+                }
+            }
         }
     }
 }

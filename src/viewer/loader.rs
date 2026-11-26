@@ -831,6 +831,51 @@ pub fn load_schedule_detail(
     }))
 }
 
+/// Scan `<state_dir>/proactive/day-plan-YYYY-MM-DD.json` and return sorted
+/// unique `YYYY-MM-DD` dates for already-activated day plans so reopened
+/// viewer threads remember `Plan Activated ✓` across restarts.
+pub fn load_activated_day_plan_dates(state_dir: Option<&Path>) -> Vec<String> {
+    let Some(dir) = state_dir else {
+        return Vec::new();
+    };
+    let proactive_dir = dir.join("proactive");
+    let Ok(entries) = std::fs::read_dir(&proactive_dir) else {
+        return Vec::new();
+    };
+    let mut dates = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        let Some(date) = name
+            .strip_prefix("day-plan-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if is_valid_ymd(date) {
+            dates.push(date.to_string());
+        }
+    }
+    dates.sort();
+    dates.dedup();
+    dates
+}
+
+fn is_valid_ymd(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[0..4].iter().all(u8::is_ascii_digit)
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[8..10].iter().all(u8::is_ascii_digit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,5 +1012,26 @@ mod tests {
         );
         assert!(notif_thread.turns[0].hide_prompt);
         assert!(!notif_thread.turns[1].hide_prompt);
+    }
+
+    #[test]
+    fn scans_activated_day_plan_dates_from_proactive_dir() {
+        let dir = std::env::temp_dir().join(format!("hc-loader-dayplan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(load_activated_day_plan_dates(Some(&dir)).is_empty());
+
+        let proactive = dir.join("proactive");
+        std::fs::create_dir_all(&proactive).unwrap();
+        std::fs::write(proactive.join("day-plan-2026-11-28.json"), "{}").unwrap();
+        std::fs::write(proactive.join("day-plan-2026-11-26.json"), "{}").unwrap();
+        std::fs::write(proactive.join("day-plan-draft.json"), "{}").unwrap();
+        std::fs::write(proactive.join("workday.json"), "{}").unwrap();
+        std::fs::create_dir_all(proactive.join("day-plan-2026-11-27.json")).unwrap();
+
+        assert_eq!(
+            load_activated_day_plan_dates(Some(&dir)),
+            vec!["2026-11-26".to_string(), "2026-11-28".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -30,6 +30,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use hey_computer::config::Config;
 use hey_computer::ipc;
+use hey_computer::protocol::WidgetSpec;
 use hey_computer::store;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -46,8 +47,8 @@ use self::actions::{
     run_openhue_plan, save_skill_files, save_to_vault, toggle_vault_journal_task,
 };
 use self::loader::{
-    ViewerThread, load_schedule_detail, load_schedule_summaries, load_thread_for_turn,
-    query_history_entries, resolve_initial_thread,
+    ViewerThread, load_activated_day_plan_dates, load_schedule_detail, load_schedule_summaries,
+    load_thread_for_turn, query_history_entries, resolve_initial_thread,
 };
 use self::palette::{WallpaperPalette, detect_system_dark, load_wallpaper_palette};
 use self::stream::{
@@ -627,6 +628,7 @@ pub fn run() -> Result<()> {
     let theme_mode_str = cli.force_theme.map_or("auto", ForceTheme::as_str);
     let initial_palette = load_wallpaper_palette();
     let today_journal = format!("Journal/{}.md", store::local_today_ymd());
+    let activated_day_plan_dates = load_activated_day_plan_dates(state_dir.as_deref());
 
     let boot_payload = json!({
         "theme": theme_mode_str,
@@ -646,6 +648,7 @@ pub fn run() -> Result<()> {
         "skillsDirConfigured": skills_dir.is_some(),
         "stateDirConfigured": state_dir.is_some(),
         "todayJournalPath": today_journal,
+        "activatedDayPlanDates": activated_day_plan_dates,
         "headless": cli.snapshot.is_some(),
         "thread": initial_thread,
         "latestTurnId": latest_turn_id,
@@ -1351,7 +1354,7 @@ fn handle_ipc_message(
             }
             let explicit_reply = parse_optional_u64(msg.reply_to.as_ref());
             let profile = normalize_ask_profile(msg.profile.as_deref());
-            start_live_stream(state, webview, prompt, profile, explicit_reply, false);
+            start_live_stream(state, webview, prompt, profile, explicit_reply, false, None);
         }
         "save_vault" => {
             let markdown = msg
@@ -1484,6 +1487,7 @@ fn handle_ipc_message(
                     state.latest_turn_id.set(Some(latest_id));
                     *state.active_schedule_target.borrow_mut() = None;
                     window.set_title(Some(&format_window_title(&thread.title)));
+                    let activated_day_plan_dates = load_activated_day_plan_dates(Some(dir));
                     dispatch_to_js(
                         webview,
                         &json!({
@@ -1491,6 +1495,7 @@ fn handle_ipc_message(
                             "turnId": turn_id,
                             "latestTurnId": latest_id,
                             "thread": &thread,
+                            "activatedDayPlanDates": activated_day_plan_dates,
                         }),
                     );
                     *state.active_thread.borrow_mut() = thread;
@@ -1659,6 +1664,7 @@ fn handle_widget_action(msg: &IncomingMessage, state: &Rc<AppState>, webview: &W
                             None,
                             None,
                             true,
+                            None,
                         );
                     }
                 }
@@ -1735,7 +1741,7 @@ fn handle_widget_action(msg: &IncomingMessage, state: &Rc<AppState>, webview: &W
                 format!(" (task id `{id}`)")
             };
             let prompt = format!("Mark Google Task \"{text}\"{id_clause} as {status_word}.");
-            start_live_stream(state, webview, prompt, None, None, true);
+            start_live_stream(state, webview, prompt, None, None, true, None);
         }
         ("transit_board", "refresh") => {
             let origin = payload
@@ -1749,7 +1755,7 @@ fn handle_widget_action(msg: &IncomingMessage, state: &Rc<AppState>, webview: &W
             let prompt = format!(
                 "Refresh live transit departures from {origin} to {destination} and display an updated transit_board widget."
             );
-            start_live_stream(state, webview, prompt, None, None, true);
+            start_live_stream(state, webview, prompt, None, None, true, None);
         }
         ("dev_triage", "move_issue_review") => {
             let ident = payload
@@ -1757,7 +1763,40 @@ fn handle_widget_action(msg: &IncomingMessage, state: &Rc<AppState>, webview: &W
                 .and_then(Value::as_str)
                 .unwrap_or("issue");
             let prompt = format!("Move Linear issue {ident} to In Review and summarize readiness.");
-            start_live_stream(state, webview, prompt, None, None, true);
+            start_live_stream(state, webview, prompt, None, None, true, None);
+        }
+        ("day_plan", "draft_reply") => {
+            let empty_obj = json!({});
+            let p = payload.unwrap_or(&empty_obj);
+            let prompt = format_day_plan_draft_reply_prompt(p);
+            let fast_profile = resolve_fast_profile(&state.config);
+            start_live_stream(state, webview, prompt, fast_profile, None, true, None);
+        }
+        ("day_plan", "confirm_plan") => {
+            let empty_obj = json!({});
+            let p = payload.unwrap_or(&empty_obj);
+            let now = local_now_ymd_hm();
+            let prompt = format_day_plan_confirm_prompt(p, (&now.0, now.1, now.2));
+            let widget_id = p
+                .get("widgetId")
+                .or_else(|| p.get("widget_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            start_live_stream(
+                state,
+                webview,
+                prompt,
+                None,
+                None,
+                true,
+                Some(WidgetActionOrigin {
+                    widget_kind: "day_plan".to_string(),
+                    action: "confirm_plan".to_string(),
+                    widget_id,
+                }),
+            );
         }
         _ => {
             dispatch_to_js(
@@ -1789,6 +1828,501 @@ fn find_active_widget_data(state: &AppState, widget_kind: &str, payload: &Value)
     None
 }
 
+#[derive(Debug, Clone)]
+struct WidgetActionOrigin {
+    widget_kind: String,
+    action: String,
+    widget_id: Option<String>,
+}
+
+impl WidgetActionOrigin {
+    fn is_day_plan_confirm(&self) -> bool {
+        self.widget_kind == "day_plan" && self.action == "confirm_plan"
+    }
+}
+
+fn resolve_fast_profile(config: &Config) -> Option<String> {
+    let configured = config.routing.fast_profile.trim();
+    if !configured.is_empty() && configured != "default" && config.profiles.contains_key(configured)
+    {
+        return Some(configured.to_string());
+    }
+    if config.profiles.contains_key("fast") {
+        return Some("fast".to_string());
+    }
+    if config.routing.enabled && configured == "default" {
+        return Some("default".to_string());
+    }
+    None
+}
+
+fn is_day_plan_confirm_clean(markdown: &str, widgets: &[WidgetSpec], denied: &[String]) -> bool {
+    if !denied.is_empty() {
+        return false;
+    }
+    let mut saw_activated = false;
+    for w in widgets {
+        if w.kind == "day_plan" {
+            let status = w
+                .data
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if status == "error" || status == "failed" {
+                return false;
+            }
+            if status == "activated" {
+                saw_activated = true;
+            }
+        }
+    }
+    saw_activated || !markdown.trim().is_empty()
+}
+
+fn local_now_ymd_hm() -> (String, u32, u32) {
+    unsafe extern "C" {
+        fn tzset();
+    }
+    let secs = store::unix_timestamp_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        tzset();
+        !libc::localtime_r(&secs, &mut tm).is_null()
+    };
+    if !ok {
+        return (store::local_today_ymd(), 0, 0);
+    }
+    let ymd = format!(
+        "{:04}-{:02}-{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday
+    );
+    (
+        ymd,
+        u32::try_from(tm.tm_hour).unwrap_or(0),
+        u32::try_from(tm.tm_min).unwrap_or(0),
+    )
+}
+
+fn parse_hh_mm(raw: &str) -> Option<(u32, u32)> {
+    let trimmed = raw.trim();
+    let (h_str, m_str) = trimmed.split_once(':')?;
+    let h: u32 = h_str.trim().parse().ok()?;
+    let m: u32 = m_str.trim().parse().ok()?;
+    (h < 24 && m < 60).then_some((h, m))
+}
+
+fn is_checkin_in_past(plan_date: &str, hh_mm: &str, now_ymd: &str, now_h: u32, now_m: u32) -> bool {
+    let Some((h, m)) = parse_hh_mm(hh_mm) else {
+        return false;
+    };
+    if plan_date.len() == 10 && now_ymd.len() == 10 {
+        match plan_date.cmp(now_ymd) {
+            std::cmp::Ordering::Less => return true,
+            std::cmp::Ordering::Greater => return false,
+            std::cmp::Ordering::Equal => return (h, m) <= (now_h, now_m),
+        }
+    }
+    false
+}
+
+fn format_day_plan_draft_reply_prompt(payload: &Value) -> String {
+    let str_field = |camel: &str, snake: &str| -> String {
+        payload
+            .get(camel)
+            .or_else(|| payload.get(snake))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let sender = str_field("sender", "sender");
+    let channel = str_field("channel", "channel");
+    let location = str_field("location", "location");
+    let age = str_field("age", "age");
+    let kind = str_field("kind", "kind");
+    let summary = str_field("summary", "summary");
+    let quote = str_field("quote", "quote");
+
+    let mut out = String::from(
+        "Draft a concise, ready-to-send reply for this open-loop nudge from today's Day Plan.\n\n",
+    );
+    out.push_str(&format!(
+        "- **Sender:** {}\n",
+        if sender.is_empty() {
+            "Unknown"
+        } else {
+            &sender
+        }
+    ));
+    if !channel.is_empty() {
+        if location.is_empty() {
+            out.push_str(&format!("- **Channel:** {channel}\n"));
+        } else {
+            out.push_str(&format!("- **Channel:** {channel} ({location})\n"));
+        }
+    }
+    if !age.is_empty() {
+        out.push_str(&format!("- **Age:** {age}\n"));
+    }
+    if !kind.is_empty() {
+        let label = if kind.eq_ignore_ascii_case("promised_followup") {
+            "Promised follow-up"
+        } else {
+            &kind
+        };
+        out.push_str(&format!("- **Status:** {label}\n"));
+    }
+    if !summary.is_empty() {
+        out.push_str(&format!("- **Context:** {summary}\n"));
+    }
+    if !quote.is_empty() {
+        out.push_str(&format!("- **Prior promise/quote:** \"{quote}\"\n"));
+    }
+    out.push_str(
+        "\nInstructions:\n\
+         - Match the conversation's language and natural tone, keeping the draft brief and ready to copy-paste.\n\
+         - Strictly read-only: do NOT send any message, do NOT modify files, calendars, tasks, or schedules, and do NOT emit or activate a `day_plan` widget.",
+    );
+    out
+}
+
+fn format_day_plan_confirm_prompt(payload: &Value, now_local: (&str, u32, u32)) -> String {
+    let (now_ymd, now_h, now_m) = now_local;
+    let obj = payload.as_object();
+    let get = |camel: &str, snake: &str| -> Option<&Value> {
+        let m = obj?;
+        m.get(camel).or_else(|| m.get(snake))
+    };
+
+    let plan_date = get("date", "date")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(now_ymd);
+    let mode = get("mode", "mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("workday");
+    let mode_detail = get("modeDetail", "mode_detail")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let roter_faden = get("roterFaden", "roter_faden")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Confirm and activate my Day Plan for **{plan_date}** (Phase 3 — Activate using the `day-plan` skill). Enact ONLY the selected items below and skip anything unselected.\n\n"
+    ));
+    match mode_detail {
+        Some(detail) => out.push_str(&format!("- **Mode:** {mode} ({detail})\n")),
+        None => out.push_str(&format!("- **Mode:** {mode}\n")),
+    }
+    if let Some(rf) = roter_faden {
+        out.push_str(&format!("- **Roter Faden:** {rf}\n"));
+    }
+
+    // Selected reply nudges
+    let mut selected_nudges = Vec::new();
+    if let Some(arr) = get("replyNudges", "reply_nudges").and_then(Value::as_array) {
+        for item in arr {
+            let selected = item
+                .get("selected")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if !selected {
+                continue;
+            }
+            let sender = item
+                .get("sender")
+                .and_then(Value::as_str)
+                .unwrap_or("Contact")
+                .trim();
+            let channel = item
+                .get("channel")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let summary = item
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let mut line = format!("- Reply to **{sender}**");
+            if !channel.is_empty() {
+                line.push_str(&format!(" ({channel})"));
+            }
+            if !summary.is_empty() {
+                line.push_str(&format!(" — {summary}"));
+            }
+            selected_nudges.push(line);
+        }
+    }
+    out.push_str("\n### Selected Reply Nudges\n");
+    if selected_nudges.is_empty() {
+        out.push_str("- None selected.\n");
+    } else {
+        for line in selected_nudges {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
+    // Selected tasks & subtasks
+    let mut selected_tasks = Vec::new();
+    if let Some(arr) = get("tasks", "tasks").and_then(Value::as_array) {
+        for item in arr {
+            let selected = item
+                .get("selected")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if !selected {
+                continue;
+            }
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("Untitled task")
+                .trim();
+            let mut meta = Vec::new();
+            if let Some(r) = item
+                .get("ref")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                meta.push(r.trim().to_string());
+            }
+            if let Some(src) = item
+                .get("source")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                meta.push(src.trim().to_string());
+            }
+            if let Some(dest) = item
+                .get("destination")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                meta.push(format!("dest: {}", dest.trim()));
+            }
+            if let Some(due) = item
+                .get("due")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                meta.push(format!("due: {}", due.trim()));
+            }
+            let mut block = if meta.is_empty() {
+                format!("- [ ] {title}")
+            } else {
+                format!("- [ ] {title} ({})", meta.join(" · "))
+            };
+            if let Some(subs) = item.get("subtasks").and_then(Value::as_array) {
+                for sub in subs {
+                    if let Some(st) = sub.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        block.push_str(&format!("\n  - [ ] {st}"));
+                    }
+                }
+            }
+            selected_tasks.push(block);
+        }
+    }
+    out.push_str("\n### Selected Tasks & Sub-TODOs\n");
+    if selected_tasks.is_empty() {
+        out.push_str("- None selected.\n");
+    } else {
+        for block in selected_tasks {
+            out.push_str(&block);
+            out.push('\n');
+        }
+    }
+
+    // Selected calendar blocks
+    let mut selected_blocks = Vec::new();
+    if let Some(arr) = get("calendarBlocks", "calendar_blocks").and_then(Value::as_array) {
+        for item in arr {
+            let selected = item
+                .get("selected")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if !selected {
+                continue;
+            }
+            let id = item.get("id").and_then(Value::as_str).unwrap_or("").trim();
+            let start = item
+                .get("start")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .trim();
+            let end = item
+                .get("end")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .trim();
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("Focus Block")
+                .trim();
+            let cal = item
+                .get("calendar")
+                .and_then(Value::as_str)
+                .unwrap_or("work")
+                .trim();
+            let transp = item
+                .get("transparency")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let note = item
+                .get("note")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            let mut line = format!("- `{start}–{end}` **{title}** ({cal}");
+            if !transp.is_empty() {
+                line.push_str(&format!(" · {transp}"));
+            }
+            if !id.is_empty() {
+                line.push_str(&format!(" · id `{id}`"));
+            }
+            line.push(')');
+            if let Some(n) = note {
+                line.push_str(&format!(" — {n}"));
+            }
+            selected_blocks.push(line);
+        }
+    }
+    out.push_str("\n### Selected Calendar Blocks\n");
+    if selected_blocks.is_empty() {
+        out.push_str("- None selected (do not create calendar blocks).\n");
+    } else {
+        for line in selected_blocks {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
+    // Daily setup & future check-ins
+    out.push_str("\n### Daily Setup & Check-ins\n");
+    if let Some(dn) = get("dailyNote", "daily_note").and_then(Value::as_object) {
+        let enabled = dn.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+        let path = dn
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Journal/YYYY-MM-DD.md");
+        let write_plan = dn
+            .get("writeDayPlan")
+            .or_else(|| dn.get("write_day_plan"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let sync_todos = dn
+            .get("syncTodos")
+            .or_else(|| dn.get("sync_todos"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if enabled {
+            out.push_str(&format!(
+                "- **Daily Note Sync:** Enabled (`{path}`, writeDayPlan={write_plan}, syncTodos={sync_todos})\n"
+            ));
+        } else {
+            out.push_str("- **Daily Note Sync:** Disabled (do not edit daily note)\n");
+        }
+    }
+    if let Some(pds) = get("preDailySync", "pre_daily_sync").and_then(Value::as_object) {
+        let enabled = pds.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+        let label = pds
+            .get("label")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Anchor pre-daily brief on Roter Faden");
+        out.push_str(&format!(
+            "- **Pre-Daily Sync:** {} ({label})\n",
+            if enabled { "Enabled" } else { "Disabled" }
+        ));
+    }
+
+    let mut future_checkins = Vec::new();
+    if let Some(arr) = get("checkins", "checkins").and_then(Value::as_array) {
+        for item in arr {
+            let selected = item
+                .get("selected")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if !selected {
+                continue;
+            }
+            let time = item
+                .get("time")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if time.is_empty() || is_checkin_in_past(plan_date, time, now_ymd, now_h, now_m) {
+                continue;
+            }
+            let normalized_time = parse_hh_mm(time)
+                .map(|(h, m)| format!("{h:02}:{m:02}"))
+                .unwrap_or_else(|| time.to_string());
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("checkin");
+            let label = item
+                .get("label")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Check-in");
+            let reason = item
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            let mut line = format!(
+                "- Schedule `day-plan-checkin-{id}` for `at {plan_date} {normalized_time}` — **{label}**"
+            );
+            if let Some(r) = reason {
+                line.push_str(&format!(" ({r})"));
+            }
+            future_checkins.push(line);
+        }
+    }
+    if future_checkins.is_empty() {
+        out.push_str("- **Check-ins:** None (do not schedule any check-ins).\n");
+    } else {
+        out.push_str("- **Check-ins to schedule:**\n");
+        for line in future_checkins {
+            out.push_str("  ");
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
+    out.push_str("\nPersist `$HEY_COMPUTER_STATE_DIR/proactive/day-plan-");
+    out.push_str(plan_date);
+    out.push_str(
+        ".json` and finish by emitting one `show_widget(kind=\"day_plan\")` with `\"status\": \"activated\"` reflecting the enacted plan.",
+    );
+    out
+}
+
 fn start_live_stream(
     state: &Rc<AppState>,
     webview: &WebView,
@@ -1796,6 +2330,7 @@ fn start_live_stream(
     profile: Option<String>,
     explicit_reply_to: Option<u64>,
     emit_optimistic_card: bool,
+    origin_widget_action: Option<WidgetActionOrigin>,
 ) {
     if emit_optimistic_card {
         dispatch_to_js(
@@ -1812,6 +2347,21 @@ fn start_live_stream(
 
     let Some(socket_path) = state.socket.clone() else {
         let msg = "No daemon socket path available (set --socket or XDG_RUNTIME_DIR)";
+        if let Some(ref origin) = origin_widget_action
+            && origin.is_day_plan_confirm()
+        {
+            dispatch_to_js(
+                webview,
+                &json!({
+                    "type": "widget_ack",
+                    "ok": false,
+                    "widgetKind": origin.widget_kind,
+                    "action": origin.action,
+                    "widgetId": origin.widget_id,
+                    "error": msg,
+                }),
+            );
+        }
         dispatch_to_js(webview, &json!({ "type": "stream_error", "message": msg }));
         dispatch_to_js(
             webview,
@@ -1951,6 +2501,8 @@ fn start_live_stream(
                     drop_cap_hint: state_clone.cli.drop_cap,
                 });
 
+            let activated_day_plan_dates =
+                load_activated_day_plan_dates(state_clone.state_dir.as_deref());
             dispatch_to_js(
                 &wv,
                 &json!({
@@ -1967,8 +2519,26 @@ fn start_live_stream(
                     "badge": badge,
                     "durationMs": duration_ms,
                     "createdAt": created_at,
+                    "activatedDayPlanDates": activated_day_plan_dates,
                 }),
             );
+
+            if let Some(ref origin) = origin_widget_action
+                && origin.is_day_plan_confirm()
+            {
+                let clean_ok = is_day_plan_confirm_clean(&markdown, &widgets, &denied);
+                dispatch_to_js(
+                    &wv,
+                    &json!({
+                        "type": "widget_ack",
+                        "ok": clean_ok,
+                        "widgetKind": origin.widget_kind,
+                        "action": origin.action,
+                        "widgetId": origin.widget_id,
+                        "activatedDayPlanDates": activated_day_plan_dates,
+                    }),
+                );
+            }
 
             let history = query_history_entries(state_clone.state_dir.as_deref(), "", 30);
             dispatch_to_js(
@@ -1982,6 +2552,21 @@ fn start_live_stream(
             );
         }
         StreamUiEvent::Error { id, message } => {
+            if let Some(ref origin) = origin_widget_action
+                && origin.is_day_plan_confirm()
+            {
+                dispatch_to_js(
+                    &wv,
+                    &json!({
+                        "type": "widget_ack",
+                        "ok": false,
+                        "widgetKind": origin.widget_kind,
+                        "action": origin.action,
+                        "widgetId": origin.widget_id,
+                        "error": message,
+                    }),
+                );
+            }
             dispatch_to_js(
                 &wv,
                 &json!({
@@ -2985,5 +3570,160 @@ mod tests {
         assert_eq!(parse_optional_u64(Some(&json!("19"))), Some(19));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn formats_day_plan_draft_reply_and_confirm_prompts_filtering_past_checkins() {
+        use super::{
+            format_day_plan_confirm_prompt, format_day_plan_draft_reply_prompt,
+            is_day_plan_confirm_clean, resolve_fast_profile,
+        };
+        use hey_computer::config::Profile;
+
+        // 1. Fast profile resolution for draft_reply.
+        let mut cfg = Config::default();
+        assert_eq!(resolve_fast_profile(&cfg), None);
+        cfg.profiles.insert("fast".to_string(), Profile::default());
+        assert_eq!(resolve_fast_profile(&cfg).as_deref(), Some("fast"));
+        cfg.profiles.insert("quick".to_string(), Profile::default());
+        cfg.routing.fast_profile = "quick".to_string();
+        assert_eq!(resolve_fast_profile(&cfg).as_deref(), Some("quick"));
+
+        // 2. Read-only draft_reply prompt formatting.
+        let draft = format_day_plan_draft_reply_prompt(&json!({
+            "sender": "Robin",
+            "channel": "slack",
+            "location": "DM",
+            "age": "yesterday",
+            "kind": "promised_followup",
+            "summary": "Confirm webhook payload backwards compatibility",
+            "quote": "Let me check the schema and get back to you"
+        }));
+        assert!(draft.contains("Robin"), "{draft}");
+        assert!(draft.contains("slack (DM)"), "{draft}");
+        assert!(draft.contains("Promised follow-up"), "{draft}");
+        assert!(draft.contains("Let me check the schema"), "{draft}");
+        assert!(draft.contains("do NOT send any message"), "{draft}");
+        assert!(
+            draft.contains("do NOT emit or activate a `day_plan` widget"),
+            "{draft}"
+        );
+
+        // 3. Deterministic confirm_plan prompt with toggle filtering & past check-in drop.
+        let confirm = format_day_plan_confirm_prompt(
+            &json!({
+                "date": "2026-11-26",
+                "mode": "workday",
+                "modeDetail": "09:30–18:00 · Office",
+                "roterFaden": "Land the auth refresh fix before lunch.",
+                "replyNudges": [
+                    { "id": "r1", "channel": "slack", "sender": "Robin", "summary": "Schema reply", "selected": true },
+                    { "id": "r2", "channel": "whatsapp", "sender": "Sam", "summary": "Dinner plans", "selected": false }
+                ],
+                "tasks": [
+                    {
+                        "id": "t1",
+                        "title": "Fix integration test",
+                        "ref": "!142",
+                        "source": "gitlab",
+                        "destination": "vault",
+                        "selected": true,
+                        "subtasks": ["Reproduce locally", "Push fix"]
+                    },
+                    {
+                        "id": "t2",
+                        "title": "Unselected backlog task",
+                        "selected": false
+                    }
+                ],
+                "calendarBlocks": [
+                    {
+                        "id": "b1",
+                        "start": "10:30",
+                        "end": "12:00",
+                        "title": "Focus: Auth Fix",
+                        "calendar": "work",
+                        "transparency": "opaque",
+                        "selected": true
+                    },
+                    {
+                        "id": "b2",
+                        "start": "17:00",
+                        "end": "17:30",
+                        "title": "Skipped block",
+                        "calendar": "personal",
+                        "selected": false
+                    }
+                ],
+                "dailyNote": {
+                    "enabled": true,
+                    "path": "Journal/2026-11-26.md",
+                    "writeDayPlan": true,
+                    "syncTodos": true
+                },
+                "preDailySync": {
+                    "enabled": true,
+                    "label": "Anchor StandUp brief"
+                },
+                "checkins": [
+                    { "id": "early", "time": "11:00", "label": "Past Slot", "selected": true },
+                    { "id": "now", "time": "13:15", "label": "Exact Now Slot", "selected": true },
+                    { "id": "afternoon", "time": "15:45", "label": "Afternoon Pulse", "reason": "After meetings", "selected": true },
+                    { "id": "skipped", "time": "16:30", "label": "Unchecked Slot", "selected": false }
+                ]
+            }),
+            ("2026-11-26", 13, 15),
+        );
+        assert!(confirm.contains("Robin"), "{confirm}");
+        assert!(!confirm.contains("Sam"), "{confirm}");
+        assert!(confirm.contains("Fix integration test"), "{confirm}");
+        assert!(confirm.contains("Reproduce locally"), "{confirm}");
+        assert!(!confirm.contains("Unselected backlog task"), "{confirm}");
+        assert!(confirm.contains("Focus: Auth Fix"), "{confirm}");
+        assert!(!confirm.contains("Skipped block"), "{confirm}");
+        // Past (11:00) and equal (13:15) and unchecked (16:30) check-ins are dropped; future (15:45) kept.
+        assert!(!confirm.contains("Past Slot"), "{confirm}");
+        assert!(!confirm.contains("Exact Now Slot"), "{confirm}");
+        assert!(!confirm.contains("Unchecked Slot"), "{confirm}");
+        assert!(
+            confirm.contains("at 2026-11-26 15:45"),
+            "future check-in must use explicit dated spec: {confirm}"
+        );
+        assert!(confirm.contains("day-plan-2026-11-26.json"), "{confirm}");
+
+        // 4. Scoped confirm ack cleanliness check.
+        let activated_widget = WidgetSpec {
+            id: "dp-1".to_string(),
+            kind: "day_plan".to_string(),
+            title: "Plan".to_string(),
+            data: json!({ "status": "activated", "roterFaden": "Done" }),
+        };
+        let error_widget = WidgetSpec {
+            id: "dp-err".to_string(),
+            kind: "day_plan".to_string(),
+            title: "Plan".to_string(),
+            data: json!({ "status": "failed", "roterFaden": "Nope" }),
+        };
+        assert!(is_day_plan_confirm_clean(
+            "Activated.",
+            std::slice::from_ref(&activated_widget),
+            &[]
+        ));
+        assert!(is_day_plan_confirm_clean(
+            "",
+            std::slice::from_ref(&activated_widget),
+            &[]
+        ));
+        assert!(!is_day_plan_confirm_clean("", &[], &[]));
+        assert!(!is_day_plan_confirm_clean(
+            "Activated.",
+            std::slice::from_ref(&activated_widget),
+            &["sudo rm".to_string()]
+        ));
+        assert!(!is_day_plan_confirm_clean(
+            "Failed.",
+            std::slice::from_ref(&error_widget),
+            &[]
+        ));
     }
 }

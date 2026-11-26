@@ -1187,6 +1187,862 @@
   }
 
   /* ------------------------------------------------------------------------
+     6b. day_plan — Interactive Morning Brief & Day Plan Card
+     ------------------------------------------------------------------------ */
+  function dayPlanPlural(n, singular, plural) {
+    return n + " " + (n === 1 ? singular : plural);
+  }
+
+  function formatChannelBadge(rawChannel) {
+    const lower = String(rawChannel || "").trim().toLowerCase();
+    if (lower === "whatsapp" || lower === "wa") return { key: "whatsapp", label: "WhatsApp" };
+    if (lower === "signal") return { key: "signal", label: "Signal" };
+    if (lower === "gmail" || lower === "mail" || lower === "email") {
+      return { key: "gmail", label: lower === "gmail" ? "Gmail" : "Mail" };
+    }
+    if (lower === "slack") return { key: "slack", label: "Slack" };
+    return { key: "other", label: rawChannel ? String(rawChannel) : "Message" };
+  }
+
+  function formatNudgeKind(rawKind) {
+    const lower = String(rawKind || "unanswered").trim().toLowerCase();
+    if (
+      lower === "promised_followup" ||
+      lower === "promised-followup" ||
+      lower === "promised" ||
+      lower === "open_loop"
+    ) {
+      return { key: "promised_followup", label: "Promised follow-up" };
+    }
+    return { key: "unanswered", label: "Unanswered" };
+  }
+
+  function formatTaskSourceLabel(rawSource) {
+    const lower = String(rawSource || "").trim().toLowerCase();
+    if (lower === "gitlab") return "GitLab";
+    if (lower === "linear") return "Linear";
+    if (lower === "vault" || lower === "obsidian") return "Vault";
+    if (lower === "gtasks" || lower === "google_tasks" || lower === "google-tasks") return "GTasks";
+    if (lower === "personal") return "Personal";
+    return rawSource ? String(rawSource) : "";
+  }
+
+  function getKnownActivatedDayPlanDates() {
+    const set = new Set();
+    const list = window.__HC_ACTIVATED_DAY_PLAN_DATES__;
+    if (Array.isArray(list)) {
+      list.forEach(function (d) {
+        if (typeof d === "string" && d.trim()) set.add(d.trim());
+      });
+    }
+    return set;
+  }
+
+  function renderDayPlan(widget, data) {
+    const widgetId = widget.id ? String(widget.id) : ("day-plan-" + Date.now());
+    const planDate = String(data.date || "").trim();
+    const rawMode = String(data.mode || "workday").trim().toLowerCase();
+    const isDayOff = rawMode === "day_off" || rawMode === "day-off" || rawMode === "dayoff";
+    const modeKey = isDayOff ? "day_off" : "workday";
+    const modeLabel = isDayOff ? "Day Off" : "Workday";
+    const modeDetail = String(data.modeDetail || data.mode_detail || "").trim();
+    const initialStatus = String(data.status || "proposed").trim().toLowerCase();
+    const roterFaden = String(data.roterFaden || data.roter_faden || "").trim();
+
+    const rawNudges = Array.isArray(data.replyNudges || data.reply_nudges)
+      ? (data.replyNudges || data.reply_nudges)
+      : [];
+    const replyNudges = rawNudges.map(function (n, idx) {
+      const sel = n.selected !== false;
+      return {
+        id: String(n.id || ("r" + (idx + 1))),
+        channel: String(n.channel || ""),
+        sender: String(n.sender || "Contact"),
+        location: String(n.location || ""),
+        age: String(n.age || ""),
+        kind: String(n.kind || "unanswered"),
+        summary: String(n.summary || ""),
+        quote: String(n.quote || ""),
+        selected: sel,
+        initialSelected: sel
+      };
+    });
+
+    const rawTasks = Array.isArray(data.tasks) ? data.tasks : [];
+    const tasks = rawTasks.map(function (t, idx) {
+      const sel = t.selected !== false;
+      return {
+        id: String(t.id || ("t" + (idx + 1))),
+        title: String(t.title || ""),
+        source: String(t.source || ""),
+        ref: String(t.ref || ""),
+        priority: String(t.priority || "medium"),
+        destination: String(t.destination || ""),
+        due: t.due ? String(t.due) : "",
+        selected: sel,
+        initialSelected: sel,
+        subtasks: Array.isArray(t.subtasks)
+          ? t.subtasks.map(function (s) { return String(s || "").trim(); }).filter(Boolean)
+          : []
+      };
+    });
+
+    const rawBlocks = Array.isArray(data.calendarBlocks || data.calendar_blocks)
+      ? (data.calendarBlocks || data.calendar_blocks)
+      : [];
+    const calendarBlocks = rawBlocks.map(function (b, idx) {
+      const sel = b.selected !== false;
+      const cal = String(b.calendar || (isDayOff ? "personal" : "work")).toLowerCase() === "personal"
+        ? "personal"
+        : "work";
+      return {
+        id: String(b.id || ("b" + (idx + 1))),
+        start: String(b.start || ""),
+        end: String(b.end || ""),
+        title: String(b.title || "Focus Block"),
+        calendar: cal,
+        transparency: String(b.transparency || (cal === "work" ? "opaque" : "")),
+        taskRef: b.taskRef || b.task_ref || null,
+        note: b.note ? String(b.note) : "",
+        selected: sel,
+        initialSelected: sel
+      };
+    });
+
+    const rawDailyNote = data.dailyNote || data.daily_note || null;
+    const dailyNote = rawDailyNote && typeof rawDailyNote === "object"
+      ? {
+          enabled: rawDailyNote.enabled !== false,
+          initialEnabled: rawDailyNote.enabled !== false,
+          path: String(rawDailyNote.path || defaultTodayJournalPath()),
+          writeDayPlan:
+            (rawDailyNote.writeDayPlan !== undefined
+              ? rawDailyNote.writeDayPlan
+              : rawDailyNote.write_day_plan) !== false,
+          syncTodos:
+            (rawDailyNote.syncTodos !== undefined
+              ? rawDailyNote.syncTodos
+              : rawDailyNote.sync_todos) !== false
+        }
+      : null;
+
+    const rawPreDaily = data.preDailySync || data.pre_daily_sync || null;
+    const preDailySync = rawPreDaily && typeof rawPreDaily === "object" && !isDayOff
+      ? {
+          enabled: rawPreDaily.enabled !== false,
+          initialEnabled: rawPreDaily.enabled !== false,
+          label: String(rawPreDaily.label || "Anchor StandUp brief on this Roter Faden")
+        }
+      : null;
+
+    const rawCheckins = Array.isArray(data.checkins) ? data.checkins : [];
+    const checkins = rawCheckins.map(function (c, idx) {
+      const sel = c.selected !== false;
+      return {
+        id: String(c.id || ("c" + (idx + 1))),
+        time: String(c.time || ""),
+        label: String(c.label || "Check-in"),
+        reason: String(c.reason || ""),
+        selected: sel,
+        initialSelected: sel
+      };
+    });
+
+    const shell = buildWidgetShell(widget, "");
+    shell.card.dataset.widgetId = widgetId;
+    if (planDate) shell.card.dataset.dayPlanDate = planDate;
+
+    /* Header left: title + mode pill */
+    const titleWrap = el("div", "dp-header-left");
+    shell.header.replaceChild(titleWrap, shell.header.firstChild);
+    titleWrap.appendChild(el("h3", "widget-title", widget.title || "Day Plan"));
+
+    const modePill = el(
+      "span",
+      "dp-mode-pill",
+      modeDetail ? modeLabel + " · " + modeDetail : modeLabel
+    );
+    modePill.dataset.mode = modeKey;
+    titleWrap.appendChild(modePill);
+
+    /* Header right: live counter + status badge */
+    const headerCounter = el("span", "dp-live-counter", "");
+    const statusBadge = el("span", "dp-status-pill", "");
+    statusBadge.hidden = true;
+    shell.headerRight.appendChild(headerCounter);
+    shell.headerRight.appendChild(statusBadge);
+
+    const allCheckboxes = [];
+    const draftButtons = [];
+
+    /* Roter Faden banner */
+    if (roterFaden) {
+      const rfBox = el("div", "dp-roter-faden");
+      rfBox.appendChild(el("div", "dp-roter-faden-label", "Roter Faden"));
+      rfBox.appendChild(el("p", "dp-roter-faden-text", roterFaden));
+      shell.body.appendChild(rfBox);
+    }
+
+    const sectionCounters = {};
+
+    function computeLiveCountsText() {
+      const parts = [];
+      if (replyNudges.length > 0) {
+        const c = replyNudges.filter(function (n) { return n.selected; }).length;
+        parts.push(dayPlanPlural(c, "reply", "replies"));
+      }
+      if (tasks.length > 0) {
+        const c = tasks.filter(function (t) { return t.selected; }).length;
+        parts.push(dayPlanPlural(c, "task", "tasks"));
+      }
+      if (calendarBlocks.length > 0) {
+        const c = calendarBlocks.filter(function (b) { return b.selected; }).length;
+        parts.push(dayPlanPlural(c, "block", "blocks"));
+      }
+      if (checkins.length > 0) {
+        const c = checkins.filter(function (ci) { return ci.selected; }).length;
+        parts.push(dayPlanPlural(c, "check-in", "check-ins"));
+      }
+      return parts.join(" · ");
+    }
+
+    const footerSummary = el("span", "dp-footer-summary", "");
+
+    function refreshCounts() {
+      const text = computeLiveCountsText();
+      headerCounter.textContent = text;
+      footerSummary.textContent = text || "No items selected";
+      if (sectionCounters.nudges) {
+        const c = replyNudges.filter(function (n) { return n.selected; }).length;
+        sectionCounters.nudges.textContent = c + "/" + replyNudges.length;
+      }
+      if (sectionCounters.tasks) {
+        const c = tasks.filter(function (t) { return t.selected; }).length;
+        sectionCounters.tasks.textContent = c + "/" + tasks.length;
+      }
+      if (sectionCounters.blocks) {
+        const c = calendarBlocks.filter(function (b) { return b.selected; }).length;
+        sectionCounters.blocks.textContent = c + "/" + calendarBlocks.length;
+      }
+    }
+
+    function makeSection(title, counterKey) {
+      const sec = el("div", "dp-section");
+      const head = el("div", "dp-section-header");
+      head.appendChild(el("span", "dp-section-label", title));
+      if (counterKey) {
+        const cnt = el("span", "w-muted", "");
+        sectionCounters[counterKey] = cnt;
+        head.appendChild(cnt);
+      }
+      sec.appendChild(head);
+      return sec;
+    }
+
+    /* Section 1: Reply Nudges */
+    if (replyNudges.length > 0) {
+      const sec = makeSection("Reply Nudges", "nudges");
+      replyNudges.forEach(function (nudge) {
+        const row = el("div", "w-row dp-row dp-nudge-row" + (nudge.selected ? "" : " is-skipped"));
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.className = "dp-checkbox";
+        cb.checked = nudge.selected;
+        cb.setAttribute("aria-label", "Include reply nudge for " + nudge.sender);
+        cb.addEventListener("change", function () {
+          nudge.selected = cb.checked;
+          row.classList.toggle("is-skipped", !nudge.selected);
+          refreshCounts();
+        });
+        allCheckboxes.push(cb);
+
+        const content = el("div", "dp-row-main");
+        const top = el("div", "dp-nudge-top");
+        const meta = el("div", "dp-nudge-meta");
+
+        const ch = formatChannelBadge(nudge.channel);
+        const chBadge = el("span", "dp-channel-badge", ch.label);
+        chBadge.dataset.channel = ch.key;
+        meta.appendChild(chBadge);
+
+        meta.appendChild(el("strong", "dp-sender", nudge.sender));
+        if (nudge.location) {
+          meta.appendChild(el("span", "w-muted", nudge.location));
+        }
+        if (nudge.age) {
+          meta.appendChild(el("span", "w-muted", "· " + nudge.age));
+        }
+
+        const kindInfo = formatNudgeKind(nudge.kind);
+        const kindPill = el("span", "dp-nudge-kind", kindInfo.label);
+        kindPill.dataset.kind = kindInfo.key;
+        meta.appendChild(kindPill);
+
+        const draftBtn = el("button", "w-btn dp-draft-btn", "Draft Reply");
+        draftBtn.type = "button";
+        draftBtn.title = "Draft a read-only reply via fast profile (never auto-sends)";
+        draftBtn.addEventListener("click", function () {
+          const prevLabel = draftBtn.textContent;
+          draftBtn.textContent = "Drafting…";
+          emitWidgetAction("day_plan", "draft_reply", {
+            widgetId: widgetId,
+            date: planDate || null,
+            id: nudge.id,
+            channel: nudge.channel,
+            sender: nudge.sender,
+            location: nudge.location || null,
+            age: nudge.age || null,
+            kind: nudge.kind,
+            summary: nudge.summary,
+            quote: nudge.quote || null
+          });
+          setTimeout(function () {
+            if (draftBtn.textContent === "Drafting…") {
+              draftBtn.textContent = prevLabel;
+            }
+          }, 2400);
+        });
+        draftButtons.push(draftBtn);
+
+        top.appendChild(meta);
+        top.appendChild(draftBtn);
+        content.appendChild(top);
+
+        if (nudge.summary) {
+          content.appendChild(el("div", "dp-nudge-summary", nudge.summary));
+        }
+        if (nudge.quote) {
+          content.appendChild(el("div", "dp-nudge-quote", "“" + nudge.quote + "”"));
+        }
+
+        row.appendChild(cb);
+        row.appendChild(content);
+        sec.appendChild(row);
+      });
+      shell.body.appendChild(sec);
+    }
+
+    /* Section 2: Priorities & Sub-TODOs */
+    if (tasks.length > 0) {
+      const sec = makeSection("Priorities & Tasks", "tasks");
+      tasks.forEach(function (task) {
+        const row = el("div", "w-row dp-row dp-task-row" + (task.selected ? "" : " is-skipped"));
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.className = "dp-checkbox";
+        cb.checked = task.selected;
+        cb.setAttribute("aria-label", "Include task " + task.title);
+        cb.addEventListener("change", function () {
+          task.selected = cb.checked;
+          row.classList.toggle("is-skipped", !task.selected);
+          refreshCounts();
+        });
+        allCheckboxes.push(cb);
+
+        const content = el("div", "dp-row-main");
+        const head = el("div", "dp-task-head");
+        const titleLeft = el("div", "dp-task-title-group");
+
+        const dot = el("span", "prio-dot");
+        dot.dataset.prio = String(task.priority || "medium").toLowerCase();
+        dot.title = "Priority: " + (task.priority || "medium");
+        titleLeft.appendChild(dot);
+        titleLeft.appendChild(el("span", "dp-task-title", task.title));
+        head.appendChild(titleLeft);
+
+        const pills = el("div", "dp-task-pills");
+        if (task.ref) {
+          pills.appendChild(el("span", "w-pill dp-ref-pill", task.ref));
+        }
+        const srcLabel = formatTaskSourceLabel(task.source);
+        if (srcLabel) {
+          pills.appendChild(el("span", "w-pill", srcLabel));
+        }
+        if (task.due) {
+          pills.appendChild(el("span", "due-chip", task.due));
+        }
+        if (pills.childNodes.length > 0) {
+          head.appendChild(pills);
+        }
+        content.appendChild(head);
+
+        if (task.subtasks.length > 0) {
+          const ul = el("ul", "dp-subtasks");
+          task.subtasks.forEach(function (st) {
+            ul.appendChild(el("li", "", st));
+          });
+          content.appendChild(ul);
+        }
+
+        row.appendChild(cb);
+        row.appendChild(content);
+        sec.appendChild(row);
+      });
+      shell.body.appendChild(sec);
+    }
+
+    /* Section 3: Proposed Calendar Blocks */
+    if (calendarBlocks.length > 0) {
+      const sec = makeSection("Proposed Calendar Blocks", "blocks");
+      const list = el("div", "agenda-list");
+      calendarBlocks.forEach(function (block) {
+        const row = el(
+          "div",
+          "w-row agenda-item dp-block-row" + (block.selected ? "" : " is-skipped")
+        );
+        row.dataset.calendar = block.calendar;
+
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.className = "dp-checkbox";
+        cb.checked = block.selected;
+        cb.setAttribute("aria-label", "Include calendar block " + block.title);
+        cb.addEventListener("change", function () {
+          block.selected = cb.checked;
+          row.classList.toggle("is-skipped", !block.selected);
+          refreshCounts();
+        });
+        allCheckboxes.push(cb);
+
+        const bar = el("div", "agenda-bar");
+
+        const timeCol = el("div", "agenda-time-col");
+        timeCol.appendChild(
+          el("span", "", (block.start || "—") + (block.end ? "–" + block.end : ""))
+        );
+        const isBusy = String(block.transparency || "").toLowerCase() === "opaque";
+        timeCol.appendChild(
+          el("span", "agenda-cal-label", isBusy ? block.calendar + " · busy" : block.calendar)
+        );
+
+        const main = el("div", "agenda-main");
+        const titleRow = el("div", "agenda-title-row");
+        const titleLeft = el("div", "agenda-title-left");
+        titleLeft.appendChild(el("span", "agenda-event-title", block.title));
+        titleRow.appendChild(titleLeft);
+        main.appendChild(titleRow);
+
+        if (block.note) {
+          main.appendChild(el("div", "agenda-subline", block.note));
+        }
+
+        row.appendChild(cb);
+        row.appendChild(bar);
+        row.appendChild(timeCol);
+        row.appendChild(main);
+        list.appendChild(row);
+      });
+      sec.appendChild(list);
+      shell.body.appendChild(sec);
+    }
+
+    /* Section 4: Daily Setup & Dynamic Check-ins */
+    if (dailyNote || preDailySync || checkins.length > 0 || isDayOff) {
+      const sec = makeSection("Daily Setup & Check-ins", null);
+
+      if (dailyNote) {
+        const row = el("div", "w-row dp-row dp-setup-row" + (dailyNote.enabled ? "" : " is-skipped"));
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.className = "dp-checkbox";
+        cb.checked = dailyNote.enabled;
+        cb.setAttribute("aria-label", "Sync daily note");
+        cb.addEventListener("change", function () {
+          dailyNote.enabled = cb.checked;
+          row.classList.toggle("is-skipped", !dailyNote.enabled);
+          refreshCounts();
+        });
+        allCheckboxes.push(cb);
+
+        const main = el("div", "dp-row-main dp-setup-main");
+        const descParts = [];
+        if (dailyNote.writeDayPlan) descParts.push("Write ## Day Plan");
+        if (dailyNote.syncTodos) descParts.push("sync top-level - [ ] tasks");
+        const labelText = descParts.length > 0
+          ? descParts.join(" & ")
+          : "Update daily note";
+        main.appendChild(el("span", "dp-setup-title", labelText));
+        if (dailyNote.path) {
+          main.appendChild(el("span", "w-pill", dailyNote.path));
+        }
+        row.appendChild(cb);
+        row.appendChild(main);
+        sec.appendChild(row);
+      }
+
+      if (preDailySync) {
+        const row = el(
+          "div",
+          "w-row dp-row dp-setup-row" + (preDailySync.enabled ? "" : " is-skipped")
+        );
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.className = "dp-checkbox";
+        cb.checked = preDailySync.enabled;
+        cb.setAttribute("aria-label", "Sync pre-daily StandUp brief");
+        cb.addEventListener("change", function () {
+          preDailySync.enabled = cb.checked;
+          row.classList.toggle("is-skipped", !preDailySync.enabled);
+          refreshCounts();
+        });
+        allCheckboxes.push(cb);
+
+        const main = el("div", "dp-row-main dp-setup-main");
+        main.appendChild(el("span", "dp-setup-title", preDailySync.label));
+        main.appendChild(el("span", "w-pill", "pre-daily"));
+        row.appendChild(cb);
+        row.appendChild(main);
+        sec.appendChild(row);
+      }
+
+      checkins.forEach(function (ci) {
+        const row = el("div", "w-row dp-row dp-setup-row" + (ci.selected ? "" : " is-skipped"));
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.className = "dp-checkbox";
+        cb.checked = ci.selected;
+        cb.setAttribute("aria-label", "Schedule check-in " + ci.label);
+        cb.addEventListener("change", function () {
+          ci.selected = cb.checked;
+          row.classList.toggle("is-skipped", !ci.selected);
+          refreshCounts();
+        });
+        allCheckboxes.push(cb);
+
+        const main = el("div", "dp-row-main dp-checkin-main");
+        if (ci.time) {
+          main.appendChild(el("span", "dp-checkin-time", ci.time));
+        }
+        main.appendChild(el("strong", "dp-setup-title", ci.label));
+        if (ci.reason) {
+          main.appendChild(el("span", "dp-checkin-reason", "— " + ci.reason));
+        }
+        row.appendChild(cb);
+        row.appendChild(main);
+        sec.appendChild(row);
+      });
+
+      if (isDayOff && checkins.length === 0) {
+        sec.appendChild(
+          el("div", "dp-empty-note", "No reassessment check-ins scheduled by default on days off.")
+        );
+      }
+
+      shell.body.appendChild(sec);
+    }
+
+    refreshCounts();
+
+    /* Footer */
+    const footer = el("footer", "widget-footer dp-footer");
+    footer.appendChild(footerSummary);
+
+    const footerActions = el("div", "dp-footer-actions");
+    const iterateBtn = el("button", "w-btn w-btn-ghost", "Iterate in Chat");
+    iterateBtn.type = "button";
+    iterateBtn.addEventListener("click", function () {
+      const hint =
+        "Adjust blocks, tasks, or check-ins… (your checkbox toggles are sent automatically)";
+      if (window.HCViewer && typeof window.HCViewer.focusComposer === "function") {
+        window.HCViewer.focusComposer(hint);
+      } else {
+        const input = document.querySelector(".composer-textarea");
+        if (input) {
+          input.placeholder = hint;
+          input.focus();
+        }
+      }
+    });
+
+    const confirmBtn = el("button", "w-btn w-btn-primary", "Confirm & Activate Plan");
+    confirmBtn.type = "button";
+
+    function buildLivePayload() {
+      return {
+        widgetId: widgetId,
+        date: planDate || null,
+        mode: modeKey,
+        modeDetail: modeDetail || null,
+        roterFaden: roterFaden,
+        replyNudges: replyNudges.map(function (n) {
+          return {
+            id: n.id,
+            channel: n.channel,
+            sender: n.sender,
+            location: n.location || null,
+            age: n.age || null,
+            kind: n.kind,
+            summary: n.summary,
+            quote: n.quote || null,
+            selected: n.selected
+          };
+        }),
+        tasks: tasks.map(function (t) {
+          return {
+            id: t.id,
+            title: t.title,
+            source: t.source || null,
+            ref: t.ref || null,
+            priority: t.priority,
+            destination: t.destination || null,
+            due: t.due || null,
+            selected: t.selected,
+            subtasks: t.subtasks.slice()
+          };
+        }),
+        calendarBlocks: calendarBlocks.map(function (b) {
+          return {
+            id: b.id,
+            start: b.start,
+            end: b.end,
+            title: b.title,
+            calendar: b.calendar,
+            transparency: b.transparency || null,
+            taskRef: b.taskRef,
+            note: b.note || null,
+            selected: b.selected
+          };
+        }),
+        dailyNote: dailyNote
+          ? {
+              enabled: dailyNote.enabled,
+              path: dailyNote.path,
+              writeDayPlan: dailyNote.writeDayPlan,
+              syncTodos: dailyNote.syncTodos
+            }
+          : null,
+        preDailySync: preDailySync
+          ? {
+              enabled: preDailySync.enabled,
+              label: preDailySync.label
+            }
+          : null,
+        checkins: checkins.map(function (ci) {
+          return {
+            id: ci.id,
+            time: ci.time,
+            label: ci.label,
+            reason: ci.reason || null,
+            selected: ci.selected
+          };
+        })
+      };
+    }
+
+    let cardState = initialStatus === "activated" ? "activated" : "proposed";
+    let isActivating = false;
+
+    function applyVisualState(nextState, isMutedOlder) {
+      cardState = nextState;
+      const isActivated = nextState === "activated";
+      const isSuperseded = nextState === "superseded";
+      const locked = isActivated || isSuperseded;
+
+      shell.card.classList.toggle("is-activated", isActivated);
+      shell.card.classList.toggle("is-superseded", isSuperseded || Boolean(isMutedOlder));
+      shell.card.classList.toggle("is-activating", isActivating);
+
+      allCheckboxes.forEach(function (cb) {
+        cb.disabled = locked || isActivating;
+      });
+      draftButtons.forEach(function (btn) {
+        btn.disabled = isSuperseded || Boolean(isMutedOlder);
+      });
+
+      if (isActivated) {
+        headerCounter.hidden = true;
+        statusBadge.hidden = false;
+        statusBadge.className = "dp-status-pill is-activated";
+        statusBadge.textContent = "Plan Activated ✓";
+        iterateBtn.hidden = true;
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = "Plan Activated ✓";
+        confirmBtn.className = "w-btn dp-btn-activated";
+      } else if (isSuperseded) {
+        headerCounter.hidden = true;
+        statusBadge.hidden = false;
+        statusBadge.className = "dp-status-pill is-superseded";
+        statusBadge.textContent = "Superseded by revision";
+        iterateBtn.hidden = true;
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = "Superseded by revision";
+        confirmBtn.className = "w-btn";
+      } else {
+        headerCounter.hidden = false;
+        statusBadge.hidden = true;
+        iterateBtn.hidden = false;
+        iterateBtn.disabled = isActivating;
+        confirmBtn.disabled = isActivating;
+        confirmBtn.textContent = isActivating ? "Activating…" : "Confirm & Activate Plan";
+        confirmBtn.className = "w-btn w-btn-primary";
+      }
+    }
+
+    confirmBtn.addEventListener("click", function () {
+      if (cardState !== "proposed" || isActivating) return;
+      isActivating = true;
+      applyVisualState("proposed", false);
+      emitWidgetAction("day_plan", "confirm_plan", buildLivePayload());
+    });
+
+    window.addEventListener("hc:widget_ack", function (ev) {
+      if (!shell.card.isConnected) return;
+      const d = ev && ev.detail ? ev.detail : {};
+      if (d.widgetKind !== "day_plan" || d.action !== "confirm_plan") return;
+      const ackId = d.widgetId ? String(d.widgetId) : null;
+      if (ackId && ackId !== widgetId) return;
+      isActivating = false;
+      if (d.ok === false) {
+        applyVisualState("proposed", false);
+      } else {
+        if (planDate) {
+          const dates = getKnownActivatedDayPlanDates();
+          dates.add(planDate);
+          window.__HC_ACTIVATED_DAY_PLAN_DATES__ = Array.from(dates);
+        }
+        applyVisualState("activated", false);
+        syncDayPlanStates(window.__HC_ACTIVATED_DAY_PLAN_DATES__);
+      }
+    });
+
+    footerActions.appendChild(iterateBtn);
+    footerActions.appendChild(confirmBtn);
+    footer.appendChild(footerActions);
+    shell.card.appendChild(footer);
+
+    function computeDelta() {
+      if (cardState !== "proposed" || isActivating) return null;
+      const unchecked = [];
+      const checked = [];
+
+      replyNudges.forEach(function (n) {
+        if (n.selected !== n.initialSelected) {
+          const tag = 'reply "' + n.sender + '"';
+          (n.selected ? checked : unchecked).push(tag);
+        }
+      });
+      tasks.forEach(function (t) {
+        if (t.selected !== t.initialSelected) {
+          const tag = 'task "' + (t.ref ? t.ref + " " : "") + t.title + '"';
+          (t.selected ? checked : unchecked).push(tag);
+        }
+      });
+      calendarBlocks.forEach(function (b) {
+        if (b.selected !== b.initialSelected) {
+          const range = b.start && b.end ? b.start + "–" + b.end + " " : "";
+          const tag = 'block "' + range + b.title + '"';
+          (b.selected ? checked : unchecked).push(tag);
+        }
+      });
+      if (dailyNote && dailyNote.enabled !== dailyNote.initialEnabled) {
+        (dailyNote.enabled ? checked : unchecked).push("daily note sync");
+      }
+      if (preDailySync && preDailySync.enabled !== preDailySync.initialEnabled) {
+        (preDailySync.enabled ? checked : unchecked).push("pre-daily sync");
+      }
+      checkins.forEach(function (ci) {
+        if (ci.selected !== ci.initialSelected) {
+          const tag = 'check-in "' + (ci.time ? ci.time + " " : "") + ci.label + '"';
+          (ci.selected ? checked : unchecked).push(tag);
+        }
+      });
+
+      if (unchecked.length === 0 && checked.length === 0) return null;
+      const parts = [];
+      if (unchecked.length > 0) parts.push("unchecked: " + unchecked.join(", "));
+      if (checked.length > 0) parts.push("checked: " + checked.join(", "));
+      return {
+        widgetId: widgetId,
+        date: planDate || null,
+        unchecked: unchecked,
+        checked: checked,
+        text: "[Live Day Plan UI selections: " + parts.join("; ") + "]"
+      };
+    }
+
+    shell.card.__hcDayPlanCtrl = {
+      widgetId: widgetId,
+      date: planDate,
+      initialStatus: initialStatus,
+      getState: function () { return cardState; },
+      applyVisualState: applyVisualState,
+      computeDelta: computeDelta
+    };
+
+    // Initial state check against known activated dates
+    const knownDates = getKnownActivatedDayPlanDates();
+    if (initialStatus === "activated" || (planDate && knownDates.has(planDate))) {
+      applyVisualState("activated", false);
+    } else {
+      applyVisualState("proposed", false);
+    }
+
+    return shell.card;
+  }
+
+  function syncDayPlanStates(activatedDatesList) {
+    const activatedDates = getKnownActivatedDayPlanDates();
+    if (Array.isArray(activatedDatesList)) {
+      activatedDatesList.forEach(function (d) {
+        if (typeof d === "string" && d.trim()) activatedDates.add(d.trim());
+      });
+      window.__HC_ACTIVATED_DAY_PLAN_DATES__ = Array.from(activatedDates);
+    }
+
+    const cards = Array.prototype.slice.call(
+      document.querySelectorAll(".hc-widget-day_plan")
+    );
+    if (cards.length === 0) return;
+
+    // Track whether any newer card has status=activated (globally or per date).
+    let hasActivatedCard = false;
+    cards.forEach(function (card) {
+      const ctrl = card.__hcDayPlanCtrl;
+      if (!ctrl) return;
+      if (ctrl.initialStatus === "activated" || ctrl.getState() === "activated") {
+        hasActivatedCard = true;
+        if (ctrl.date) activatedDates.add(ctrl.date);
+      }
+    });
+
+    cards.forEach(function (card, idx) {
+      const ctrl = card.__hcDayPlanCtrl;
+      if (!ctrl) return;
+      const isLatest = idx === cards.length - 1;
+      const dateActivated = Boolean(ctrl.date && activatedDates.has(ctrl.date));
+      const selfActivated =
+        ctrl.initialStatus === "activated" ||
+        ctrl.getState() === "activated" ||
+        dateActivated;
+
+      if (selfActivated) {
+        ctrl.applyVisualState("activated", !isLatest);
+      } else if (!isLatest) {
+        if (hasActivatedCard) {
+          ctrl.applyVisualState("activated", true);
+        } else {
+          ctrl.applyVisualState("superseded", true);
+        }
+      } else {
+        ctrl.applyVisualState("proposed", false);
+      }
+    });
+  }
+
+  function getActiveDayPlanDelta() {
+    const cards = Array.prototype.slice.call(
+      document.querySelectorAll(".hc-widget-day_plan")
+    );
+    for (let i = cards.length - 1; i >= 0; i -= 1) {
+      const ctrl = cards[i].__hcDayPlanCtrl;
+      if (ctrl && ctrl.getState() === "proposed") {
+        return ctrl.computeDelta();
+      }
+    }
+    return null;
+  }
+
+  /* ------------------------------------------------------------------------
      7. custom_html — Agent show_widget + Save as Template… + Error Boundary
      ------------------------------------------------------------------------ */
   function activateEmbeddedScripts(container) {
@@ -1426,6 +2282,8 @@
         return renderHueRooms(widget, data);
       case "distill_diff":
         return renderDistillDiff(widget, data);
+      case "day_plan":
+        return renderDayPlan(widget, data);
       case "custom_html":
       case "show_widget":
         return renderCustomHtml(widget, data);
@@ -1440,6 +2298,8 @@
   }
 
   window.HCWidgets = {
-    renderWidget: renderWidget
+    renderWidget: renderWidget,
+    getActiveDayPlanDelta: getActiveDayPlanDelta,
+    syncDayPlanStates: syncDayPlanStates
   };
 })();

@@ -3765,12 +3765,14 @@ pub fn record_schedule_outcome(
                  last_status = ?3,
                  last_error = ?4,
                  enabled = CASE
-                     WHEN ?7 = 1 OR (?6 = 0 AND max_runs IS NOT NULL AND run_count + 1 >= max_runs)
+                     WHEN (?7 = 1 AND (next_run_at IS NULL OR updated_at < ?2))
+                       OR (?6 = 0 AND max_runs IS NOT NULL AND run_count + 1 >= max_runs)
                      THEN 0
                      ELSE enabled
                  END,
                  next_run_at = CASE
-                     WHEN ?7 = 1 OR (?6 = 0 AND max_runs IS NOT NULL AND run_count + 1 >= max_runs)
+                     WHEN (?7 = 1 AND (next_run_at IS NULL OR updated_at < ?2))
+                       OR (?6 = 0 AND max_runs IS NOT NULL AND run_count + 1 >= max_runs)
                      THEN NULL
                      ELSE next_run_at
                  END,
@@ -3799,10 +3801,13 @@ pub fn record_schedule_outcome(
 ///
 /// For a brand-new schedule (`last_status IS NULL`), records `'skipped'`.
 /// When `force_disable` is true (e.g. a one-shot schedule with no next run),
-/// disables the schedule and clears `next_run_at` without incrementing `run_count`.
+/// disables the schedule and clears `next_run_at` without incrementing `run_count`,
+/// unless the collector script itself rescheduled the job (`next_run_at IS NOT NULL`
+/// and `updated_at >= started_at`).
 pub fn record_schedule_skip(
     state_dir: &Path,
     id: u64,
+    started_at: i64,
     updated_at: i64,
     force_disable: bool,
 ) -> Result<()> {
@@ -3810,11 +3815,19 @@ pub fn record_schedule_skip(
     conn.execute(
         "UPDATE schedules
          SET last_status = COALESCE(last_status, 'skipped'),
-             enabled = CASE WHEN ?3 = 1 THEN 0 ELSE enabled END,
-             next_run_at = CASE WHEN ?3 = 1 THEN NULL ELSE next_run_at END,
-             updated_at = ?2
+             enabled = CASE
+                 WHEN ?4 = 1 AND (next_run_at IS NULL OR updated_at < ?2)
+                 THEN 0
+                 ELSE enabled
+             END,
+             next_run_at = CASE
+                 WHEN ?4 = 1 AND (next_run_at IS NULL OR updated_at < ?2)
+                 THEN NULL
+                 ELSE next_run_at
+             END,
+             updated_at = ?3
          WHERE id = ?1",
-        params![id as i64, updated_at, i64::from(force_disable)],
+        params![id as i64, started_at, updated_at, i64::from(force_disable)],
     )?;
     Ok(())
 }
@@ -5406,7 +5419,7 @@ mod tests {
         assert_eq!(recurring.last_run_at, None);
         assert_eq!(recurring.run_count, 0);
 
-        record_schedule_skip(&dir, recurring.id, now + 1_000, false).unwrap();
+        record_schedule_skip(&dir, recurring.id, now + 900, now + 1_000, false).unwrap();
         let after_initial_skip = get_schedule(&dir, "morning-digest").unwrap().unwrap();
         assert_eq!(after_initial_skip.last_status.as_deref(), Some("skipped"));
         assert_eq!(after_initial_skip.last_run_at, None);
@@ -5429,7 +5442,7 @@ mod tests {
             false,
         )
         .unwrap();
-        record_schedule_skip(&dir, recurring.id, ok_ts + 5_000, false).unwrap();
+        record_schedule_skip(&dir, recurring.id, ok_ts + 4_900, ok_ts + 5_000, false).unwrap();
         let after_ok_skip = get_schedule(&dir, "morning-digest").unwrap().unwrap();
         assert_eq!(after_ok_skip.last_status.as_deref(), Some("ok"));
         assert_eq!(after_ok_skip.last_run_at, Some(ok_ts));
@@ -5470,7 +5483,14 @@ mod tests {
             false,
         )
         .unwrap();
-        record_schedule_skip(&dir, suppressed_job.id, supp_ts + 5_000, false).unwrap();
+        record_schedule_skip(
+            &dir,
+            suppressed_job.id,
+            supp_ts + 4_900,
+            supp_ts + 5_000,
+            false,
+        )
+        .unwrap();
         let after_supp_skip = get_schedule(&dir, "quiet-watch").unwrap().unwrap();
         assert_eq!(after_supp_skip.last_status.as_deref(), Some("suppressed"));
         assert_eq!(after_supp_skip.last_run_at, Some(supp_ts));
@@ -5529,7 +5549,14 @@ mod tests {
             .unwrap(),
             2
         );
-        record_schedule_skip(&dir, failing_job.id, fail2_ts + 5_000, false).unwrap();
+        record_schedule_skip(
+            &dir,
+            failing_job.id,
+            fail2_ts + 4_900,
+            fail2_ts + 5_000,
+            false,
+        )
+        .unwrap();
         let after_fail_skip = get_schedule(&dir, "flaky-watch").unwrap().unwrap();
         assert_eq!(after_fail_skip.last_status.as_deref(), Some("failed"));
         assert_eq!(after_fail_skip.last_error.as_deref(), Some("boom"));
@@ -5557,13 +5584,48 @@ mod tests {
             128,
         )
         .unwrap();
-        record_schedule_skip(&dir, oneshot.id, now + 10_000, true).unwrap();
+        record_schedule_skip(&dir, oneshot.id, now + 9_000, now + 10_000, true).unwrap();
         let after_oneshot_skip = get_schedule(&dir, "once-check").unwrap().unwrap();
         assert!(!after_oneshot_skip.enabled);
         assert_eq!(after_oneshot_skip.next_run_at, None);
         assert_eq!(after_oneshot_skip.run_count, 0);
         assert_eq!(after_oneshot_skip.last_status.as_deref(), Some("skipped"));
         assert_eq!(after_oneshot_skip.last_run_at, None);
+
+        // 6. One-shot collector self-deferral (`schedule edit --schedule "in 20m"`
+        //    running during the collector after `started_at`) preserves `enabled = true`
+        //    and the deferred `next_run_at`.
+        let defer_job = create_schedule(
+            &dir,
+            &NewSchedule {
+                name: "day-plan-checkin-midday".to_string(),
+                schedule_spec: "at 2026-11-26 12:45".to_string(),
+                prompt: "reassess".to_string(),
+                profile: String::new(),
+                script: "true".to_string(),
+                no_agent: false,
+                suppress_token: Some("HEARTBEAT_OK".to_string()),
+                failure_deliver: FailureDeliver::Notify,
+                max_runs: None,
+                expires_at: None,
+                next_run_at: next_run,
+            },
+            128,
+        )
+        .unwrap();
+        let started_at = now + 20_000;
+        advance_schedule_next_run(&dir, defer_job.id, None, started_at - 10).unwrap();
+        let deferred_next = started_at + 20 * 60_000;
+        advance_schedule_next_run(&dir, defer_job.id, Some(deferred_next), started_at + 100)
+            .unwrap();
+        record_schedule_skip(&dir, defer_job.id, started_at, started_at + 200, true).unwrap();
+        let after_defer_skip = get_schedule(&dir, "day-plan-checkin-midday")
+            .unwrap()
+            .unwrap();
+        assert!(after_defer_skip.enabled);
+        assert_eq!(after_defer_skip.next_run_at, Some(deferred_next));
+        assert_eq!(after_defer_skip.last_status.as_deref(), Some("skipped"));
+        assert_eq!(after_defer_skip.run_count, 0);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

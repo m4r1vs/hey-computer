@@ -279,6 +279,9 @@ enum Command {
     /// Internal stdio MCP server exposing structured UI widget tools.
     #[command(hide = true, name = "mcp-ui")]
     McpUi,
+    /// Internal stdio MCP server exposing synchronous subagent delegation.
+    #[command(hide = true, name = "mcp-subagent")]
+    McpSubagent,
     /// Check one part of the program on its own.
     #[command(hide = true)]
     Debug {
@@ -629,6 +632,15 @@ async fn main() -> ExitCode {
             }
         };
     }
+    if matches!(cli.command, Command::McpSubagent) {
+        return match mcp::run_stdio_subagent_server(cli.socket).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("hey-computer mcp-subagent: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if !matches!(
         cli.command,
         Command::Debug {
@@ -649,6 +661,10 @@ async fn main() -> ExitCode {
 async fn dispatch(cli: Cli) -> Result<ExitCode> {
     if matches!(cli.command, Command::McpUi) {
         tokio::task::block_in_place(mcp::run_stdio_ui_server)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if matches!(cli.command, Command::McpSubagent) {
+        mcp::run_stdio_subagent_server(cli.socket).await?;
         return Ok(ExitCode::SUCCESS);
     }
     if let Command::Debug {
@@ -886,7 +902,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             )
             .await
         }
-        Command::Speak { .. } | Command::View { .. } | Command::McpUi => {
+        Command::Speak { .. } | Command::View { .. } | Command::McpUi | Command::McpSubagent => {
             unreachable!("handled above")
         }
         Command::Status { json } => {

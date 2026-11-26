@@ -236,6 +236,20 @@ pub enum Request {
         token: String,
         action: DraftAction,
     },
+    /// Synchronously delegate a scoped sub-task to an isolated child ACP
+    /// session (`hey-computer mcp-subagent`). Always waits on the socket for a
+    /// single `Reply::Answer` or `Reply::Failed`; never presents desktop UI,
+    /// speaks TTS, or writes to `history.db`.
+    Delegate {
+        role: String,
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed_mcp_servers: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -566,6 +580,20 @@ mod tests {
             Request::DraftResume {
                 token: "hc_d_0123456789abcdef0123456789abcdef".to_string(),
                 action: DraftAction::Copy,
+            },
+            Request::Delegate {
+                role: "Personal Comms".to_string(),
+                prompt: "Summarize recent messages".to_string(),
+                profile: Some("fast".to_string()),
+                allowed_mcp_servers: Some(vec!["google-workspace".to_string()]),
+                parent_session: Some("sess-1".to_string()),
+            },
+            Request::Delegate {
+                role: "Quick Check".to_string(),
+                prompt: "Check status".to_string(),
+                profile: None,
+                allowed_mcp_servers: None,
+                parent_session: None,
             },
         ] {
             let line = encode(&request);

@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,6 +86,22 @@ pub struct AskParams {
     pub schedule_id: Option<u64>,
     pub schedule_has_script: bool,
     pub initial_icons: Vec<String>,
+}
+
+/// Parameters submitted to [`Handle::delegate`].
+pub struct DelegateParams {
+    pub role: String,
+    pub prompt: String,
+    pub profile: Option<String>,
+    pub allowed_mcp_servers: Option<Vec<String>>,
+    pub parent_session: Option<String>,
+}
+
+/// Handle returned by [`Handle::delegate`] to await or cancel a delegated subagent turn.
+pub struct DelegateHandle {
+    pub id: u64,
+    pub token: Arc<CancelToken>,
+    pub reply: oneshot::Receiver<Reply>,
 }
 
 /// What became of a request.
@@ -222,8 +239,144 @@ impl Ask {
     }
 }
 
+struct DelegateRequest {
+    id: u64,
+    params: DelegateParams,
+    reply: oneshot::Sender<Reply>,
+    token: Arc<CancelToken>,
+}
+
+struct SubagentTask {
+    id: u64,
+    role: String,
+    prompt: String,
+    profile: Option<String>,
+    allowed_mcp_servers: Option<Vec<String>>,
+    parent_turn_id: Option<u64>,
+    reply: oneshot::Sender<Reply>,
+    token: Arc<CancelToken>,
+}
+
+struct SubagentFinished {
+    id: u64,
+    role: String,
+    parent_turn_id: Option<u64>,
+    session: String,
+    started: Instant,
+    reply: oneshot::Sender<Reply>,
+    token: Arc<CancelToken>,
+    end: TurnEnd,
+}
+
+/// Shared correlation state between a running parent turn and any synchronous
+/// child `Delegate` turns it spawns.
+struct ParentDelegateState {
+    active_subagents: AtomicUsize,
+    closed: AtomicBool,
+    inflight_mcp_calls: Mutex<HashMap<String, Option<String>>>,
+    children: Mutex<Vec<Arc<CancelToken>>>,
+    activity: Notify,
+    wake_tx: mpsc::UnboundedSender<Message>,
+}
+
+impl ParentDelegateState {
+    fn new(wake_tx: mpsc::UnboundedSender<Message>) -> Self {
+        Self {
+            active_subagents: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            inflight_mcp_calls: Mutex::new(HashMap::new()),
+            children: Mutex::new(Vec::new()),
+            activity: Notify::new(),
+            wake_tx,
+        }
+    }
+
+    fn record_mcp_call(&self, tc_id: String, role: Option<String>) {
+        if let Ok(mut map) = self.inflight_mcp_calls.lock() {
+            map.insert(tc_id, role);
+        }
+    }
+
+    fn finish_mcp_call(&self, tc_id: &str) {
+        if let Ok(mut map) = self.inflight_mcp_calls.lock() {
+            map.remove(tc_id);
+        }
+    }
+
+    fn matches_role(&self, role: &str) -> bool {
+        let needle = role.trim();
+        self.inflight_mcp_calls.lock().ok().is_some_and(|map| {
+            map.values().any(|r| {
+                r.as_deref()
+                    .is_some_and(|r| r.trim().eq_ignore_ascii_case(needle))
+            })
+        })
+    }
+
+    fn has_inflight_mcp(&self) -> bool {
+        self.inflight_mcp_calls
+            .lock()
+            .ok()
+            .is_some_and(|map| !map.is_empty())
+    }
+
+    fn has_active_children(&self) -> bool {
+        self.active_subagents.load(Ordering::SeqCst) > 0
+    }
+
+    fn register_child(&self, token: Arc<CancelToken>) -> bool {
+        let Ok(mut children) = self.children.lock() else {
+            return false;
+        };
+        if self.closed.load(Ordering::SeqCst) {
+            return false;
+        }
+        children.push(token);
+        self.active_subagents.fetch_add(1, Ordering::SeqCst);
+        self.activity.notify_waiters();
+        true
+    }
+
+    fn finish_child(&self) {
+        let _ = self
+            .active_subagents
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_sub(1))
+            });
+        self.activity.notify_waiters();
+    }
+
+    fn close_and_cancel_children(&self, reason: FailReason) {
+        self.closed.store(true, Ordering::SeqCst);
+        let tokens: Vec<Arc<CancelToken>> = self
+            .children
+            .lock()
+            .map(|mut guard| guard.drain(..).collect())
+            .unwrap_or_default();
+        let mut any_cancelled = false;
+        for child in tokens {
+            if child.cancel(reason) {
+                any_cancelled = true;
+            }
+        }
+        if let Ok(mut map) = self.inflight_mcp_calls.lock() {
+            map.clear();
+        }
+        self.activity.notify_waiters();
+        if any_cancelled {
+            let _ = self.wake_tx.send(Message::Wake);
+        }
+    }
+}
+
+struct ActiveParent {
+    session: String,
+    state: Arc<ParentDelegateState>,
+}
+
 enum Message {
     Ask(Box<Ask>),
+    Delegate(Box<DelegateRequest>),
     TriageNotification {
         prompt: String,
         token: Arc<CancelToken>,
@@ -253,6 +406,9 @@ struct Shared {
     bg_running: usize,
     bg_queued: usize,
     restricted_queued: usize,
+    /// Active or queued delegated subagent turns indexed by monotonic id.
+    subagent_tasks: HashMap<u64, Arc<CancelToken>>,
+    subagent_queued: usize,
     agent: AgentState,
     /// Currently running interactive request `(id, started, profile)`.
     running: Option<(u64, Instant, Option<String>)>,
@@ -286,6 +442,76 @@ impl Handle {
     /// active foreground turn).
     pub fn validate_profile(&self, profile: Option<&str>) -> std::result::Result<(), String> {
         self.config.resolve_profile(profile).map(|_| ())
+    }
+
+    /// Wake the conductor loop so newly cancelled queued requests are evicted promptly.
+    pub fn wake(&self) {
+        let _ = self.messages.send(Message::Wake);
+    }
+
+    /// Queue a synchronous delegated subagent turn on the isolated subagent lane.
+    /// Never writes to `history.db` or invokes the desktop presenter.
+    pub fn delegate(
+        &self,
+        params: DelegateParams,
+    ) -> std::result::Result<DelegateHandle, (FailReason, String)> {
+        if !self.config.subagents.enabled {
+            return Err((
+                FailReason::Denied,
+                "subagents are disabled in configuration".to_string(),
+            ));
+        }
+        if let Some(profile) = params.profile.as_deref()
+            && let Err(msg) = self.config.resolve_profile(Some(profile))
+        {
+            return Err((FailReason::AgentError, msg));
+        }
+        let token = Arc::new(CancelToken::default());
+        let id = {
+            let mut shared = self
+                .shared
+                .lock()
+                .expect("the shared state is never poisoned");
+            if shared.subagent_queued >= self.config.subagents.max_queued {
+                return Err((
+                    FailReason::LimitReached,
+                    format!(
+                        "too many subagents queued (limit {})",
+                        self.config.subagents.max_queued
+                    ),
+                ));
+            }
+            shared.next_id += 1;
+            let id = shared.next_id;
+            shared.subagent_tasks.insert(id, Arc::clone(&token));
+            shared.subagent_queued += 1;
+            id
+        };
+        let (tx, rx) = oneshot::channel();
+        if let Err(mpsc::error::SendError(Message::Delegate(req))) =
+            self.messages
+                .send(Message::Delegate(Box::new(DelegateRequest {
+                    id,
+                    params,
+                    reply: tx,
+                    token: Arc::clone(&token),
+                })))
+        {
+            if let Ok(mut shared) = self.shared.lock() {
+                shared.subagent_tasks.remove(&id);
+                shared.subagent_queued = shared.subagent_queued.saturating_sub(1);
+            }
+            let _ = req.reply.send(Reply::Failed {
+                id,
+                reason: FailReason::AgentDown,
+                message: "the daemon is shutting down".to_string(),
+            });
+        }
+        Ok(DelegateHandle {
+            id,
+            token,
+            reply: rx,
+        })
     }
 
     /// Run Stage 1 ultra-fast binary notification triage (`true`/`false`) in
@@ -567,6 +793,8 @@ impl Handle {
                     token.cancel(reason).then_some(*id)
                 } else if let Some(token) = shared.bg_tasks.get(&target) {
                     token.cancel(reason).then_some(target)
+                } else if let Some(token) = shared.subagent_tasks.get(&target) {
+                    token.cancel(reason).then_some(target)
                 } else {
                     None
                 }
@@ -699,6 +927,19 @@ pub fn spawn_with_deps(
     store: Option<(Store, u64)>,
     keyring: Arc<dyn KeyringWatcher>,
 ) -> (Handle, JoinHandle<()>) {
+    spawn_with_deps_and_socket(config, presenter, context, store, keyring, None)
+}
+
+/// Start the conductor task with injectable store, keyring watcher, and daemon
+/// socket path (propagated into `mcp_config.json` for `hey-computer mcp-subagent`).
+pub fn spawn_with_deps_and_socket(
+    config: Arc<Config>,
+    presenter: Arc<dyn Presenter>,
+    context: Arc<dyn ContextProvider>,
+    store: Option<(Store, u64)>,
+    keyring: Arc<dyn KeyringWatcher>,
+    socket: Option<PathBuf>,
+) -> (Handle, JoinHandle<()>) {
     let (store, initial_last_id) = match store {
         Some((s, id)) => (Some(s), id),
         None => (None, 0),
@@ -722,6 +963,8 @@ pub fn spawn_with_deps(
         bg_running: 0,
         bg_queued: 0,
         restricted_queued: 0,
+        subagent_tasks: HashMap::new(),
+        subagent_queued: 0,
         agent: AgentState::Down,
         running: None,
         follow_up_until: None,
@@ -729,17 +972,21 @@ pub fn spawn_with_deps(
     }));
     let (messages, inbox) = mpsc::unbounded_channel();
     let (done_tx, done_rx) = mpsc::unbounded_channel();
+    let (subagent_done_tx, subagent_done_rx) = mpsc::unbounded_channel();
     let stop = Arc::new(CancelToken::default());
     let mut known_mcp_servers: Vec<String> = config.mcp.keys().cloned().collect();
-    if !known_mcp_servers
-        .iter()
-        .any(|s| s == crate::mcp::INTERNAL_UI_MCP_SERVER)
-    {
-        known_mcp_servers.push(crate::mcp::INTERNAL_UI_MCP_SERVER.to_string());
+    for internal in [
+        crate::mcp::INTERNAL_UI_MCP_SERVER,
+        crate::mcp::INTERNAL_SUBAGENT_MCP_SERVER,
+    ] {
+        if !known_mcp_servers.iter().any(|s| s == internal) {
+            known_mcp_servers.push(internal.to_string());
+        }
     }
     let conductor = Conductor {
         policy: Arc::new(
             LanePolicy::standard(&config.permissions.deny)
+                .with_subagents(config.subagents.enabled)
                 .with_known_mcp_servers(known_mcp_servers),
         ),
         config: Arc::clone(&config),
@@ -750,11 +997,14 @@ pub fn spawn_with_deps(
         fg_lock_deadline: None,
         store: store.clone(),
         state_dir: state_dir.clone(),
+        socket,
         shared: Arc::clone(&shared),
         inbox,
         inbox_tx: messages.clone(),
         done_tx,
         done_rx,
+        subagent_done_tx,
+        subagent_done_rx,
         stop: Arc::clone(&stop),
         live: None,
         paths: None,
@@ -765,6 +1015,10 @@ pub fn spawn_with_deps(
         bg_queue: VecDeque::new(),
         restricted_active: HashSet::new(),
         restricted_queue: VecDeque::new(),
+        subagent_active: HashSet::new(),
+        subagent_queue: VecDeque::new(),
+        active_parents: HashMap::new(),
+        recently_cancelled_sessions: VecDeque::new(),
         triage_active: 0,
         failures: 0,
         restart_at: None,
@@ -845,12 +1099,15 @@ struct Conductor {
     fg_lock_deadline: Option<Instant>,
     store: Option<Store>,
     state_dir: Option<PathBuf>,
+    socket: Option<PathBuf>,
     policy: Arc<LanePolicy>,
     shared: Arc<Mutex<Shared>>,
     inbox: mpsc::UnboundedReceiver<Message>,
     inbox_tx: mpsc::UnboundedSender<Message>,
     done_tx: mpsc::UnboundedSender<TurnFinished>,
     done_rx: mpsc::UnboundedReceiver<TurnFinished>,
+    subagent_done_tx: mpsc::UnboundedSender<SubagentFinished>,
+    subagent_done_rx: mpsc::UnboundedReceiver<SubagentFinished>,
     stop: Arc<CancelToken>,
     live: Option<Live>,
     paths: Option<Paths>,
@@ -861,6 +1118,10 @@ struct Conductor {
     bg_queue: VecDeque<Ask>,
     restricted_active: HashSet<u64>,
     restricted_queue: VecDeque<Ask>,
+    subagent_active: HashSet<u64>,
+    subagent_queue: VecDeque<SubagentTask>,
+    active_parents: HashMap<u64, ActiveParent>,
+    recently_cancelled_sessions: VecDeque<String>,
     triage_active: usize,
     /// Agent deaths in a row, for the restart back-off.
     failures: u32,
@@ -891,6 +1152,7 @@ struct TurnEnd {
 enum Step {
     Responded(Result<Result<Value, CallError>, oneshot::error::RecvError>),
     Event(Option<SessionEvent>),
+    DelegateActivity,
     Quiet,
     TurnTimeout,
     Cancelled(FailReason),
@@ -913,6 +1175,7 @@ struct TurnContext<'a> {
     speech: Option<&'a Arc<dyn Presenter>>,
     voice_stop: Option<&'a Arc<dyn Presenter>>,
     stream_tx: Option<&'a mpsc::UnboundedSender<Reply>>,
+    delegate_state: Option<&'a Arc<ParentDelegateState>>,
     agent_dir: Option<&'a Path>,
     id: u64,
 }
@@ -1194,7 +1457,9 @@ fn is_internal_mcp_schema_path(path_str: &str, agent_dir: Option<&Path>) -> bool
     }
     rel.components().any(|c| {
         let s = c.as_os_str();
-        s == "mcp" || s == crate::mcp::INTERNAL_UI_MCP_SERVER
+        s == "mcp"
+            || s == crate::mcp::INTERNAL_UI_MCP_SERVER
+            || s == crate::mcp::INTERNAL_SUBAGENT_MCP_SERVER
     })
 }
 
@@ -1389,6 +1654,12 @@ impl Conductor {
                         self.dispatch_ready().await;
                     }
                 }
+                sub_finished = self.subagent_done_rx.recv() => {
+                    if let Some(finished) = sub_finished {
+                        self.handle_subagent_finished(finished).await;
+                        self.dispatch_ready().await;
+                    }
+                }
                 () = poll_opt(&mut keyring_wait) => {
                     keyring_wait = None;
                     self.keyring_locked = false;
@@ -1400,6 +1671,7 @@ impl Conductor {
                         && self.fg_pending.is_none()
                         && self.bg_queue.is_empty()
                         && self.restricted_queue.is_empty()
+                        && self.subagent_queue.is_empty()
                     {
                         tokio::select! {
                             () = self.start_warm() => {}
@@ -1445,6 +1717,10 @@ impl Conductor {
                             }
                         }
                         self.enqueue(ask);
+                        self.dispatch_ready().await;
+                    }
+                    Some(Message::Delegate(req)) => {
+                        self.enqueue_delegate(*req);
                         self.dispatch_ready().await;
                     }
                     Some(Message::TriageNotification {
@@ -1508,6 +1784,10 @@ impl Conductor {
                     Some(finished) => self.handle_finished(finished).await,
                     None => break,
                 },
+                sub_finished = self.subagent_done_rx.recv() => match sub_finished {
+                    Some(finished) => self.handle_subagent_finished(finished).await,
+                    None => break,
+                },
                 () = tokio::time::sleep_until(shutdown_deadline) => break,
             }
         }
@@ -1533,6 +1813,9 @@ impl Conductor {
                 Vec::new(),
             );
         }
+        while let Some(task) = self.subagent_queue.pop_front() {
+            self.finish_subagent_early(task, cancelled(FailReason::AgentDown), true);
+        }
         while let Some(ask) = self.bg_queue.pop_front() {
             let profile = self.effective_display_profile(&ask);
             self.finish_request(
@@ -1557,6 +1840,17 @@ impl Conductor {
                         Vec::new(),
                     );
                 }
+                Message::Delegate(req) => {
+                    let req = *req;
+                    req.token.finish();
+                    if let Ok(mut shared) = self.shared.lock() {
+                        shared.subagent_tasks.remove(&req.id);
+                        shared.subagent_queued = shared.subagent_queued.saturating_sub(1);
+                    }
+                    let _ = req
+                        .reply
+                        .send(cancelled(FailReason::AgentDown).into_reply(req.id));
+                }
                 Message::TriageNotification { reply, .. } => {
                     let _ = reply.send(Err((
                         FailReason::Cancelled,
@@ -1573,6 +1867,7 @@ impl Conductor {
         self.fg_active.is_some()
             || !self.bg_active.is_empty()
             || !self.restricted_active.is_empty()
+            || !self.subagent_active.is_empty()
             || self.triage_active > 0
     }
 
@@ -1593,6 +1888,422 @@ impl Conductor {
         }
     }
 
+    fn enqueue_delegate(&mut self, req: DelegateRequest) {
+        let parent_turn_id =
+            match self.correlate_parent(req.params.parent_session.as_deref(), &req.params.role) {
+                Ok(pid) => pid,
+                Err(reason) => {
+                    let task = SubagentTask {
+                        id: req.id,
+                        role: req.params.role,
+                        prompt: req.params.prompt,
+                        profile: req.params.profile,
+                        allowed_mcp_servers: req.params.allowed_mcp_servers,
+                        parent_turn_id: None,
+                        reply: req.reply,
+                        token: req.token,
+                    };
+                    self.finish_subagent_early(
+                        task,
+                        Outcome::failed(reason, "The parent request was cancelled."),
+                        true,
+                    );
+                    return;
+                }
+            };
+        if let Some(pid) = parent_turn_id
+            && let Some(parent) = self.active_parents.get(&pid)
+            && !parent.state.register_child(Arc::clone(&req.token))
+        {
+            let task = SubagentTask {
+                id: req.id,
+                role: req.params.role,
+                prompt: req.params.prompt,
+                profile: req.params.profile,
+                allowed_mcp_servers: req.params.allowed_mcp_servers,
+                parent_turn_id: None,
+                reply: req.reply,
+                token: req.token,
+            };
+            self.finish_subagent_early(
+                task,
+                Outcome::failed(FailReason::Cancelled, "The parent request was cancelled."),
+                true,
+            );
+            return;
+        }
+        self.subagent_queue.push_back(SubagentTask {
+            id: req.id,
+            role: req.params.role,
+            prompt: req.params.prompt,
+            profile: req.params.profile,
+            allowed_mcp_servers: req.params.allowed_mcp_servers,
+            parent_turn_id,
+            reply: req.reply,
+            token: req.token,
+        });
+    }
+
+    fn correlate_parent(
+        &self,
+        parent_session: Option<&str>,
+        role: &str,
+    ) -> std::result::Result<Option<u64>, FailReason> {
+        if let Some(sid) = parent_session.map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some((&turn_id, _)) = self
+                .active_parents
+                .iter()
+                .find(|(_, parent)| parent.session == sid)
+            {
+                return Ok(Some(turn_id));
+            }
+            if self
+                .recently_cancelled_sessions
+                .iter()
+                .any(|cancelled_sid| cancelled_sid == sid)
+            {
+                return Err(FailReason::Cancelled);
+            }
+            return Ok(None);
+        }
+        if let Some((&turn_id, _)) = self
+            .active_parents
+            .iter()
+            .find(|(_, parent)| parent.state.matches_role(role))
+        {
+            return Ok(Some(turn_id));
+        }
+        if let Some((&turn_id, _)) = self
+            .active_parents
+            .iter()
+            .find(|(_, parent)| parent.state.has_inflight_mcp())
+        {
+            return Ok(Some(turn_id));
+        }
+        Ok(None)
+    }
+
+    fn notify_parent_subagent_finished(&self, parent_turn_id: Option<u64>) {
+        if let Some(pid) = parent_turn_id
+            && let Some(parent) = self.active_parents.get(&pid)
+        {
+            parent.state.finish_child();
+        }
+    }
+
+    fn finish_subagent_early(&mut self, task: SubagentTask, outcome: Outcome, was_queued: bool) {
+        task.token.finish();
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.subagent_tasks.remove(&task.id);
+            if was_queued {
+                shared.subagent_queued = shared.subagent_queued.saturating_sub(1);
+            }
+        }
+        self.notify_parent_subagent_finished(task.parent_turn_id);
+        let _ = task.reply.send(outcome.into_reply(task.id));
+    }
+
+    async fn launch_subagent(&mut self, task: SubagentTask) {
+        if let Some(reason) = task.token.reason() {
+            self.finish_subagent_early(task, cancelled(reason), false);
+            return;
+        }
+        let requested_profile = task
+            .profile
+            .as_deref()
+            .or_else(|| self.config.default_subagent_profile());
+        let resolved = match self.config.resolve_profile(requested_profile) {
+            Ok(resolved) => resolved,
+            Err(msg) => {
+                self.finish_subagent_early(
+                    task,
+                    Outcome::failed(FailReason::AgentError, msg),
+                    false,
+                );
+                return;
+            }
+        };
+
+        let started = Instant::now();
+        tracing::info!(
+            "subagent {} ({:?}): {} characters{}",
+            task.id,
+            task.role,
+            task.prompt.chars().count(),
+            resolved
+                .name
+                .as_deref()
+                .map(|p| format!(", profile {p}"))
+                .unwrap_or_default(),
+        );
+        tracing::debug!("subagent {} prompt: {:?}", task.id, task.prompt);
+
+        let token = Arc::clone(&task.token);
+        let stop = Arc::clone(&self.stop);
+        let interrupts = Interrupts {
+            request: &token,
+            stop: &stop,
+        };
+
+        let mut retried_auth = false;
+        let session = loop {
+            let was_live = self.live.is_some();
+            if !was_live {
+                self.restart_at = None;
+                let start = tokio::select! {
+                    result = self.start_agent() => result,
+                    reason = stop.cancelled() => {
+                        self.set_agent(AgentState::Down);
+                        self.finish_subagent_early(task, cancelled(reason), false);
+                        return;
+                    }
+                };
+                if let Err(e) = start {
+                    self.schedule_restart_if_warm();
+                    self.finish_subagent_early(
+                        task,
+                        Outcome::failed(
+                            FailReason::AgentDown,
+                            format!("Cannot start the assistant: {e:#}"),
+                        ),
+                        false,
+                    );
+                    return;
+                }
+                if let Some(reason) = token.reason() {
+                    self.finish_subagent_early(task, cancelled(reason), false);
+                    return;
+                }
+            }
+            let Some(cwd) = self.paths.as_ref().map(|p| p.subagent_workspace.clone()) else {
+                self.finish_subagent_early(
+                    task,
+                    Outcome::failed(FailReason::AgentDown, "the assistant is not running"),
+                    false,
+                );
+                return;
+            };
+            let session_result = tokio::select! {
+                res = self.new_session_in_dir(&resolved, &cwd) => res,
+                reason = interrupts.wait() => {
+                    self.finish_subagent_early(task, cancelled(reason), false);
+                    return;
+                }
+            };
+            match session_result {
+                Ok(session) => break session,
+                Err(outcome) => {
+                    if was_live
+                        && !retried_auth
+                        && self.live.is_none()
+                        && matches!(
+                            outcome,
+                            Outcome::Failed {
+                                reason: FailReason::AgentError,
+                                ..
+                            }
+                        )
+                    {
+                        retried_auth = true;
+                        continue;
+                    }
+                    self.finish_subagent_early(task, outcome, false);
+                    return;
+                }
+            }
+        };
+
+        let Some(live) = &self.live else {
+            self.finish_subagent_early(
+                task,
+                Outcome::failed(FailReason::AgentDown, "the assistant exited"),
+                false,
+            );
+            return;
+        };
+
+        let client = live.conn.client();
+        let subscription = client.subscribe(&session);
+        self.subagent_active.insert(task.id);
+
+        let max_turn = secs(self.config.subagents.max_turn_secs);
+        let inactivity = max_turn
+            .map(|m| resolved.inactivity.min(m))
+            .unwrap_or(resolved.inactivity);
+        let budgets = Budgets {
+            inactivity,
+            max_turn,
+            max_tool_calls: (self.config.subagents.max_tool_calls > 0)
+                .then_some(self.config.subagents.max_tool_calls),
+            max_repeat_tool_calls: resolved.max_repeat_tool_calls,
+        };
+        let policy = Arc::new(LanePolicy::subagent(
+            &self.config.permissions.deny,
+            &resolved.mcp_servers,
+            task.allowed_mcp_servers.as_deref(),
+            self.policy.known_mcp_servers.clone(),
+        ));
+        let agent_dir = self.paths.as_ref().map(|p| p.agent_dir.clone());
+        let no_icons = Arc::new(IconResolver::from_config(&Config::default(), None));
+        let config = Arc::clone(&self.config);
+        let context_provider = Arc::clone(&self.context);
+        let done_tx = self.subagent_done_tx.clone();
+        let stop = Arc::clone(&self.stop);
+        let used_profile = resolved.name.clone();
+
+        tokio::spawn(async move {
+            let token = Arc::clone(&task.token);
+            let interrupts = Interrupts {
+                request: &token,
+                stop: &stop,
+            };
+            let ambient = if config.context.time {
+                let time_only = crate::config::Context {
+                    time: true,
+                    desktop: false,
+                };
+                tokio::select! {
+                    header = context_provider.gather(&time_only) => header,
+                    reason = interrupts.wait() => {
+                        let _ = done_tx.send(SubagentFinished {
+                            id: task.id,
+                            role: task.role,
+                            parent_turn_id: task.parent_turn_id,
+                            session,
+                            started,
+                            reply: task.reply,
+                            token: task.token,
+                            end: TurnEnd {
+                                outcome: cancelled(reason),
+                                tool_icons: Vec::new(),
+                                alive: true,
+                                wedged: false,
+                                broken: false,
+                                auth_required: false,
+                            },
+                        });
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let budget_header = context::format_turn_budget(
+                used_profile.as_deref(),
+                budgets.max_tool_calls,
+                budgets.max_turn,
+            );
+            let mut header_parts: Vec<&str> = Vec::new();
+            if let Some(b) = budget_header.as_deref() {
+                header_parts.push(b);
+            }
+            if let Some(a) = ambient.as_deref() {
+                header_parts.push(a);
+            }
+            let header = (!header_parts.is_empty()).then(|| header_parts.join("\n\n"));
+            let body = format!("Role: {}\n\n{}", task.role.trim(), task.prompt);
+            let full_prompt = context::prepend(header.as_deref(), &body);
+            let blocks = vec![json!({"type": "text", "text": full_prompt})];
+            let ctx = TurnContext {
+                policy: &policy,
+                icons: &no_icons,
+                initial_icons: &[],
+                budgets,
+                progress: None,
+                speech: None,
+                voice_stop: None,
+                stream_tx: None,
+                delegate_state: None,
+                agent_dir: agent_dir.as_deref(),
+                id: task.id,
+            };
+            let end = turn(&client, subscription, &session, blocks, interrupts, &ctx).await;
+            let _ = done_tx.send(SubagentFinished {
+                id: task.id,
+                role: task.role,
+                parent_turn_id: task.parent_turn_id,
+                session,
+                started,
+                reply: task.reply,
+                token: task.token,
+                end,
+            });
+        });
+    }
+
+    async fn handle_subagent_finished(&mut self, finished: SubagentFinished) {
+        let SubagentFinished {
+            id,
+            role,
+            parent_turn_id,
+            session,
+            started,
+            reply,
+            token,
+            mut end,
+        } = finished;
+
+        self.subagent_active.remove(&id);
+        token.finish();
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.subagent_tasks.remove(&id);
+        }
+        self.notify_parent_subagent_finished(parent_turn_id);
+
+        if end.alive {
+            if let Some(live) = &self.live {
+                drop(
+                    live.conn
+                        .start_call("session/close", json!({"sessionId": session})),
+                );
+            }
+            if end.auth_required {
+                if !self.has_active_turns() {
+                    self.stop_agent().await;
+                } else if let Some(live) = &mut self.live {
+                    live.auth_failed = true;
+                }
+            } else if end.wedged {
+                if !self.has_active_turns() {
+                    self.stop_agent().await;
+                    self.schedule_restart_if_warm();
+                } else if let Some(live) = &mut self.live {
+                    live.draining = true;
+                }
+            }
+        } else {
+            let detail = match self.live.take() {
+                Some(live) => {
+                    let detail = self.agent_died(live).await;
+                    self.last_death_detail = Some(detail.clone());
+                    detail
+                }
+                None => self.last_death_detail.clone().unwrap_or_default(),
+            };
+            if let Outcome::Failed {
+                reason: FailReason::AgentDown,
+                message,
+            } = &end.outcome
+                && !detail.is_empty()
+            {
+                end.outcome =
+                    Outcome::failed(FailReason::AgentDown, format!("{message} ({detail})"));
+            }
+        }
+
+        if matches!(end.outcome, Outcome::Answer { .. }) {
+            self.failures = 0;
+        }
+        self.last_used = Instant::now();
+        tracing::info!(
+            "subagent {} ({:?}) finished in {:.2} s",
+            id,
+            role,
+            started.elapsed().as_secs_f64()
+        );
+        let _ = reply.send(end.outcome.into_reply(id));
+    }
+
     fn fail_restricted_queue(&mut self, reason: FailReason, message: &str) {
         while let Some(ask) = self.restricted_queue.pop_front() {
             let profile = self.effective_display_profile(&ask);
@@ -1603,6 +2314,12 @@ impl Conductor {
                 true,
                 Vec::new(),
             );
+        }
+    }
+
+    fn fail_subagent_queue(&mut self, reason: FailReason, message: &str) {
+        while let Some(task) = self.subagent_queue.pop_front() {
+            self.finish_subagent_early(task, Outcome::failed(reason, message), true);
         }
     }
 
@@ -1625,6 +2342,15 @@ impl Conductor {
             }
         }
         self.restricted_queue = remaining_restricted;
+        let mut remaining_subagents = VecDeque::with_capacity(self.subagent_queue.len());
+        while let Some(task) = self.subagent_queue.pop_front() {
+            if let Some(reason) = task.token.reason() {
+                self.finish_subagent_early(task, cancelled(reason), true);
+            } else {
+                remaining_subagents.push_back(task);
+            }
+        }
+        self.subagent_queue = remaining_subagents;
         let mut remaining = VecDeque::with_capacity(self.bg_queue.len());
         while let Some(ask) = self.bg_queue.pop_front() {
             if let Some(reason) = ask.token.reason() {
@@ -1644,8 +2370,8 @@ impl Conductor {
         }
         // Finish draining a wedged or unauthenticated agent once all sibling
         // turns have completed. Fail queued restricted tasks (e.g. NotifyHold)
-        // immediately so held notifications release raw instead of stalling
-        // behind a multi-minute draining turn.
+        // and subagents immediately so held notifications and parent turns do
+        // not stall behind a draining turn.
         if let Some(live) = &self.live
             && (live.draining || live.auth_failed)
         {
@@ -1662,6 +2388,7 @@ impl Conductor {
                 )
             };
             self.fail_restricted_queue(reason, message);
+            self.fail_subagent_queue(reason, message);
             if self.has_active_turns() {
                 return;
             }
@@ -1680,16 +2407,22 @@ impl Conductor {
             let can_restricted = self.restricted_active.len()
                 < self.config.notifications.max_concurrent
                 && !self.restricted_queue.is_empty();
+            let can_subagent = self.subagent_active.len() < self.config.subagents.max_concurrent
+                && !self.subagent_queue.is_empty();
             let can_bg = self.bg_active.len() < self.config.tasks.max_concurrent
                 && !self.bg_queue.is_empty();
-            if !can_fg && !can_restricted && !can_bg {
+            if !can_fg && !can_restricted && !can_subagent && !can_bg {
                 return;
             }
 
             if self.live.is_none() && !self.ensure_keyring_ready().await {
-                // Fail restricted tasks (e.g. notification holds) immediately while
-                // locked; keep regular background/scheduled asks queued until unlock.
+                // Fail restricted tasks and subagents immediately while locked;
+                // keep regular background/scheduled asks queued until unlock.
                 self.fail_restricted_queue(
+                    FailReason::KeyringLocked,
+                    "The login keyring is still locked.",
+                );
+                self.fail_subagent_queue(
                     FailReason::KeyringLocked,
                     "The login keyring is still locked.",
                 );
@@ -1709,6 +2442,12 @@ impl Conductor {
                     shared.restricted_queued = shared.restricted_queued.saturating_sub(1);
                 }
                 self.launch_ask(ask).await;
+            } else if can_subagent {
+                let task = self.subagent_queue.pop_front().expect("checked");
+                if let Ok(mut shared) = self.shared.lock() {
+                    shared.subagent_queued = shared.subagent_queued.saturating_sub(1);
+                }
+                self.launch_subagent(task).await;
             } else if can_bg {
                 let ask = self.bg_queue.pop_front().expect("checked");
                 if let Ok(mut shared) = self.shared.lock() {
@@ -1718,7 +2457,7 @@ impl Conductor {
             }
 
             // If a turn aborted early or drained the agent, fail any remaining
-            // restricted holds immediately and wait for active turns to drain.
+            // restricted holds/subagents immediately and wait for active turns to drain.
             if let Some(live) = &self.live
                 && (live.draining || live.auth_failed)
             {
@@ -1734,6 +2473,7 @@ impl Conductor {
                     )
                 };
                 self.fail_restricted_queue(reason, message);
+                self.fail_subagent_queue(reason, message);
                 return;
             }
         }
@@ -2087,6 +2827,17 @@ impl Conductor {
         .flatten();
         let done_tx = self.done_tx.clone();
         let stop = Arc::clone(&self.stop);
+        let delegate_state = (!ask.restricted).then(|| {
+            let state = Arc::new(ParentDelegateState::new(self.inbox_tx.clone()));
+            self.active_parents.insert(
+                ask.id,
+                ActiveParent {
+                    session: session.clone(),
+                    state: Arc::clone(&state),
+                },
+            );
+            state
+        });
 
         tokio::spawn(async move {
             let token = Arc::clone(&ask.token);
@@ -2179,6 +2930,7 @@ impl Conductor {
                 speech: speech_presenter.as_ref(),
                 voice_stop: voice_stop_presenter.as_ref(),
                 stream_tx: stream_tx.as_ref(),
+                delegate_state: delegate_state.as_ref(),
                 agent_dir: agent_dir.as_deref(),
                 id: ask.id,
             };
@@ -2203,6 +2955,28 @@ impl Conductor {
             started,
             mut end,
         } = finished;
+
+        if let Some(parent) = self.active_parents.remove(&ask.id) {
+            parent
+                .state
+                .close_and_cancel_children(FailReason::Cancelled);
+            if matches!(
+                end.outcome,
+                Outcome::Failed {
+                    reason: FailReason::Cancelled
+                        | FailReason::Superseded
+                        | FailReason::Timeout
+                        | FailReason::LimitReached
+                        | FailReason::AgentDown,
+                    ..
+                }
+            ) {
+                if self.recently_cancelled_sessions.len() >= 32 {
+                    self.recently_cancelled_sessions.pop_front();
+                }
+                self.recently_cancelled_sessions.push_back(parent.session);
+            }
+        }
 
         if ask.is_restricted_bg() {
             self.restricted_active.remove(&ask.id);
@@ -2595,6 +3369,7 @@ impl Conductor {
             speech: None,
             voice_stop: None,
             stream_tx: None,
+            delegate_state: None,
             agent_dir: None,
             id: ask.id,
         };
@@ -2785,6 +3560,7 @@ impl Conductor {
             || self.fg_pending.is_some()
             || !self.bg_queue.is_empty()
             || !self.restricted_queue.is_empty()
+            || !self.subagent_queue.is_empty()
         {
             self.next_memory_check = None;
             return None;
@@ -2818,6 +3594,7 @@ impl Conductor {
             || self.fg_pending.is_some()
             || !self.bg_queue.is_empty()
             || !self.restricted_queue.is_empty()
+            || !self.subagent_queue.is_empty()
             || self.is_in_follow_up_window()
         {
             return;
@@ -2846,6 +3623,7 @@ impl Conductor {
             || self.fg_pending.is_some()
             || !self.bg_queue.is_empty()
             || !self.restricted_queue.is_empty()
+            || !self.subagent_queue.is_empty()
         {
             return None;
         }
@@ -3060,6 +3838,7 @@ impl Conductor {
                 speech: None,
                 voice_stop: None,
                 stream_tx: None,
+                delegate_state: None,
                 agent_dir: None,
                 id: 0,
             };
@@ -3132,8 +3911,8 @@ impl Conductor {
 
     async fn spawn_agent(&mut self) -> Result<()> {
         let started = Instant::now();
-        let paths =
-            environment::prepare(&self.config).context("preparing the agent's directory")?;
+        let paths = environment::prepare_with_socket(&self.config, self.socket.as_deref())
+            .context("preparing the agent's directory")?;
         // The agent is not running, so nothing it has open is deleted.
         environment::prune_history(&paths.agent_dir, self.config.agent.history_days);
         environment::prune_artifacts(&paths.artifacts, self.config.agent.history_days);
@@ -4109,20 +4888,46 @@ async fn turn(
         }
     };
 
+    let mut held_inactivity = false;
     let ended = loop {
+        let delegate_notified = ctx.delegate_state.map(|s| s.activity.notified());
+        tokio::pin!(delegate_notified);
+        if let Some(n) = delegate_notified.as_mut().as_pin_mut() {
+            n.enable();
+        }
+        let hold_inactivity = ctx.delegate_state.is_some_and(|s| s.has_active_children());
+        if held_inactivity && !hold_inactivity {
+            // All delegated children have finished; give the parent a fresh
+            // inactivity window to process their results.
+            deadline = Instant::now() + budgets.inactivity;
+        }
+        held_inactivity = hold_inactivity;
+
         // Events first: read_loop queues every update before it hands over the
         // response that follows them.
         let step = tokio::select! {
             biased;
             event = sub.recv() => Step::Event(event),
             result = &mut response => Step::Responded(result),
-            () = tokio::time::sleep_until(deadline.into()) => Step::Quiet,
+            () = async {
+                match delegate_notified.as_mut().as_pin_mut() {
+                    Some(n) => n.await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => Step::DelegateActivity,
+            () = sleep_until((!hold_inactivity).then_some(deadline)) => Step::Quiet,
             () = &mut turn_sleep => Step::TurnTimeout,
             reason = interrupts.wait() => Step::Cancelled(reason),
         };
         match step {
+            Step::DelegateActivity => {
+                deadline = Instant::now() + budgets.inactivity;
+            }
             Step::Responded(result) => break Ok(result),
             Step::Event(None) => {
+                if let Some(ds) = ctx.delegate_state {
+                    ds.close_and_cancel_children(FailReason::Cancelled);
+                }
                 return TurnEnd {
                     outcome: Outcome::failed(
                         FailReason::AgentDown,
@@ -4204,6 +5009,11 @@ async fn turn(
                             } else {
                                 if let Some(tc_id) = acp::tool_call_id(&update) {
                                     allowed_call_ids.insert(tc_id.to_string());
+                                    if let Some(ds) = ctx.delegate_state
+                                        && let Some(sub) = acp::extract_mcp_subagent_call(&update)
+                                    {
+                                        ds.record_mcp_call(tc_id.to_string(), sub.role);
+                                    }
                                 }
                                 stage_widget(
                                     &update,
@@ -4277,6 +5087,9 @@ async fn turn(
                             match update.get("status").and_then(Value::as_str) {
                                 Some("completed") => {
                                     if let Some(tc_id) = acp::tool_call_id(&update) {
+                                        if let Some(ds) = ctx.delegate_state {
+                                            ds.finish_mcp_call(tc_id);
+                                        }
                                         commit_widget(
                                             tc_id,
                                             &mut pending_widgets,
@@ -4287,10 +5100,20 @@ async fn turn(
                                 }
                                 Some("failed" | "cancelled") => {
                                     if let Some(tc_id) = acp::tool_call_id(&update) {
+                                        if let Some(ds) = ctx.delegate_state {
+                                            ds.finish_mcp_call(tc_id);
+                                        }
                                         pending_widgets.remove(tc_id);
                                     }
                                 }
-                                _ => {}
+                                _ => {
+                                    if let Some(ds) = ctx.delegate_state
+                                        && let Some(tc_id) = acp::tool_call_id(&update)
+                                        && let Some(sub) = acp::extract_mcp_subagent_call(&update)
+                                    {
+                                        ds.record_mcp_call(tc_id.to_string(), sub.role);
+                                    }
+                                }
                             }
                             if !is_denied_call
                                 && (is_allowed_status_delta || !policy.will_deny_update(&update))
@@ -4360,6 +5183,11 @@ async fn turn(
                         if let Some(tc) = params.get("toolCall") {
                             if let Some(tc_id) = acp::tool_call_id(tc) {
                                 allowed_call_ids.insert(tc_id.to_string());
+                                if let Some(ds) = ctx.delegate_state
+                                    && let Some(sub) = acp::extract_mcp_subagent_call(tc)
+                                {
+                                    ds.record_mcp_call(tc_id.to_string(), sub.role);
+                                }
                             }
                             stage_widget(tc, &mut ui_calls, &mut pending_widgets, &mut widget_seq);
                         }
@@ -4383,6 +5211,10 @@ async fn turn(
             Step::Cancelled(reason) => break Err(TurnAbort::Cancelled(reason)),
         }
     };
+
+    if let Some(ds) = ctx.delegate_state {
+        ds.close_and_cancel_children(FailReason::Cancelled);
+    }
 
     let result = match ended {
         Ok(result) => result,
@@ -4855,12 +5687,18 @@ mod tests {
         }));
         assert_eq!(tracker.budget_count(), 3);
 
-        // 5. Internal `mcp-ui` schema reads are also exempted from budget.
+        // 5. Internal `mcp-ui` and `subagents` schema reads are also exempted from budget.
         tracker.record_update(&json!({
             "toolCallId": "ui_s1",
             "name": "read_file",
             "kind": "read",
             "rawInput": {"Path": "/tmp/hc-state/agent/.gemini/antigravity-cli/mcp/mcp-ui/show_widget.json"}
+        }));
+        tracker.record_update(&json!({
+            "toolCallId": "sub_s1",
+            "name": "read_file",
+            "kind": "read",
+            "rawInput": {"Path": "/tmp/hc-state/agent/subagents/delegate.json"}
         }));
         assert_eq!(tracker.budget_count(), 3);
     }
@@ -5131,6 +5969,8 @@ mod tests {
             bg_running: 0,
             bg_queued: 0,
             restricted_queued: 0,
+            subagent_tasks: HashMap::new(),
+            subagent_queued: 0,
             agent: AgentState::Down,
             running: None,
             follow_up_until: None,
@@ -5138,8 +5978,12 @@ mod tests {
         }));
         let (tx, inbox) = mpsc::unbounded_channel();
         let (done_tx, done_rx) = mpsc::unbounded_channel();
+        let (subagent_done_tx, subagent_done_rx) = mpsc::unbounded_channel();
         let conductor = Conductor {
-            policy: Arc::new(LanePolicy::standard(&config.permissions.deny)),
+            policy: Arc::new(
+                LanePolicy::standard(&config.permissions.deny)
+                    .with_subagents(config.subagents.enabled),
+            ),
             config: Arc::new(config),
             presenter: crate::present::Recorder::new(),
             context: Arc::new(SystemContext),
@@ -5148,11 +5992,14 @@ mod tests {
             fg_lock_deadline: None,
             store: None,
             state_dir: None,
+            socket: None,
             shared,
             inbox,
             inbox_tx: tx.clone(),
             done_tx,
             done_rx,
+            subagent_done_tx,
+            subagent_done_rx,
             stop: Arc::new(CancelToken::default()),
             live: None,
             paths: None,
@@ -5163,6 +6010,10 @@ mod tests {
             bg_queue: VecDeque::new(),
             restricted_active: HashSet::new(),
             restricted_queue: VecDeque::new(),
+            subagent_active: HashSet::new(),
+            subagent_queue: VecDeque::new(),
+            active_parents: HashMap::new(),
+            recently_cancelled_sessions: VecDeque::new(),
             triage_active: 0,
             failures: 0,
             restart_at: None,

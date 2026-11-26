@@ -760,6 +760,13 @@ pub fn resolve_mcp_call(
                 (!tool.is_empty()).then(|| tool.to_string()),
             ));
         }
+        let subagent_prefix = format!("{}_", crate::mcp::INTERNAL_SUBAGENT_MCP_SERVER);
+        if let Some(tool) = rest.strip_prefix(&subagent_prefix) {
+            return Some((
+                crate::mcp::INTERNAL_SUBAGENT_MCP_SERVER.to_string(),
+                (!tool.is_empty()).then(|| tool.to_string()),
+            ));
+        }
         if let Some(server) = known_servers
             .iter()
             .filter(|s| rest.starts_with(&format!("{s}_")))
@@ -899,6 +906,56 @@ fn mcp_ui_progress_label(tool_name: &str, args: Option<&Value>) -> String {
     }
 }
 
+/// Extracted `subagents` tool invocation (`delegate`), supporting both lazy
+/// `call_mcp_tool` and eager `mcp_subagents_*` forms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpSubagentCall {
+    pub tool_call_id: Option<String>,
+    pub tool_name: String,
+    pub role: Option<String>,
+}
+
+/// Extract `(tool_call_id, tool_name, role)` when `call` targets the internal
+/// `subagents` server (`delegate`).
+pub fn extract_mcp_subagent_call(call: &Value) -> Option<McpSubagentCall> {
+    let tc_id = tool_call_id(call).map(String::from);
+    let name = call.get("name").and_then(Value::as_str);
+    if name == Some("call_mcp_tool") {
+        if mcp_server_name(call).as_deref() != Some(crate::mcp::INTERNAL_SUBAGENT_MCP_SERVER) {
+            return None;
+        }
+        let tool_name = mcp_tool_name(call)?;
+        let args = extract_mcp_ui_arguments(call, true);
+        let role = args
+            .as_ref()
+            .and_then(|a| a.get("role"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        return Some(McpSubagentCall {
+            tool_call_id: tc_id,
+            tool_name,
+            role,
+        });
+    }
+    let prefix = format!("mcp_{}_", crate::mcp::INTERNAL_SUBAGENT_MCP_SERVER);
+    let tool_name = name?.strip_prefix(&prefix)?;
+    let args = extract_mcp_ui_arguments(call, false);
+    let role = args
+        .as_ref()
+        .and_then(|a| a.get("role"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    Some(McpSubagentCall {
+        tool_call_id: tc_id,
+        tool_name: tool_name.to_string(),
+        role,
+    })
+}
+
 /// The shell command on a `toolCall` object, if it is one.
 ///
 /// Scoped to shell-execution tool calls (`kind == "execute"` or
@@ -973,6 +1030,17 @@ pub fn tool_progress(tool_call: &Value) -> Option<String> {
             return None;
         }
         let label = mcp_ui_progress_label(&ui.tool_name, ui.arguments.as_ref());
+        return sanitize_status(&label, PROGRESS_STATUS_CHARS);
+    }
+
+    if let Some(sub) = extract_mcp_subagent_call(tool_call) {
+        if is_update && sub.role.is_none() {
+            return None;
+        }
+        let label = match sub.role {
+            Some(role) => format!("Delegating: {role}…"),
+            None => "Delegating…".to_string(),
+        };
         return sanitize_status(&label, PROGRESS_STATUS_CHARS);
     }
 
@@ -1496,6 +1564,41 @@ mod tests {
         assert_eq!(
             tool_progress(&eager_ui).as_deref(),
             Some("Render widget: Skill Template · widget-ci-status")
+        );
+
+        let lazy_sub = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc_sub_1",
+            "name": "call_mcp_tool",
+            "kind": "execute",
+            "rawInput": {
+                "ServerName": "subagents",
+                "ToolName": "delegate",
+                "Arguments": {
+                    "role": "Personal Comms",
+                    "prompt": "Check personal inbox"
+                }
+            }
+        });
+        let extracted_sub = extract_mcp_subagent_call(&lazy_sub).unwrap();
+        assert_eq!(extracted_sub.tool_call_id.as_deref(), Some("tc_sub_1"));
+        assert_eq!(extracted_sub.tool_name, "delegate");
+        assert_eq!(extracted_sub.role.as_deref(), Some("Personal Comms"));
+        assert_eq!(
+            tool_progress(&lazy_sub).as_deref(),
+            Some("Delegating: Personal Comms…")
+        );
+
+        let eager_sub = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc_sub_2",
+            "name": "mcp_subagents_delegate",
+            "kind": "other",
+            "args": {"role": "Work Triage", "prompt": "Check work"}
+        });
+        assert_eq!(
+            tool_progress(&eager_sub).as_deref(),
+            Some("Delegating: Work Triage…")
         );
     }
 

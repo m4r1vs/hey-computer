@@ -36,7 +36,7 @@
 
 ## 3. New Features & Workflows
 
-- [ ] `[Upstream]` `[Config]` **`plan-my-day` workflow.**
+- [x] `[Upstream]` `[Config]` **`plan-my-day` workflow.**
   - Especially for workdays: build a *"roter Faden"* for the day with concrete tasks and sub-TODOs, periodically reassess progress throughout the day, and optionally block time in Google Calendar for specific tasks.
 - [ ] `[Upstream]` **WhatsApp message-to-self replies.**
   - Allow the agent to respond to Marius's own messages via WhatsApp (evaluate whitelisting self-chat so outbound write is enabled strictly for self-messages).

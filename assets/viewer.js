@@ -16,6 +16,7 @@
     dev_triage: ["linear: list_issues", "gitlab: list_merge_requests"],
     hue_rooms: ["openhue: list_rooms"],
     distill_diff: ["history.db: distill_diff"],
+    day_plan: ["day-plan: propose"],
     custom_html: ["mcp-ui: show_widget"],
     show_widget: ["mcp-ui: show_widget"],
     skill_template_draft: ["mcp-ui: propose_widget_template"]
@@ -591,6 +592,11 @@
       recallQuery: typeof boot.recallQuery === "string" ? boot.recallQuery : "",
       initialFindQuery: typeof boot.initialFindQuery === "string" ? boot.initialFindQuery : "",
       todayJournalPath: boot.todayJournalPath || localTodayJournalPath(),
+      activatedDayPlanDates: Array.isArray(
+        boot.activatedDayPlanDates || boot.activated_day_plan_dates
+      )
+        ? (boot.activatedDayPlanDates || boot.activated_day_plan_dates).slice()
+        : [],
       thread: thread,
       latestTurnId: latestTurnId,
       history: Array.isArray(boot.history || boot.recentTurns || boot.recent_turns)
@@ -616,8 +622,36 @@
      Application State & DOM References
      ------------------------------------------------------------------------ */
   const state = normalizeBootPayload(window.__HC_BOOT__);
+  window.__HC_ACTIVATED_DAY_PLAN_DATES__ = state.activatedDayPlanDates.slice();
   let dropCapEnabled = state.dropCap;
   let showTurnInfo = false;
+
+  const DEFAULT_COMPOSER_PLACEHOLDER =
+    "Ask Computer a follow-up… (i to focus, Ctrl+Enter to send, Esc for Normal)";
+
+  function updateActivatedDayPlanDates(dates) {
+    if (Array.isArray(dates)) {
+      const merged = new Set(state.activatedDayPlanDates);
+      dates.forEach(function (d) {
+        if (typeof d === "string" && d.trim()) merged.add(d.trim());
+      });
+      state.activatedDayPlanDates = Array.from(merged);
+      window.__HC_ACTIVATED_DAY_PLAN_DATES__ = state.activatedDayPlanDates.slice();
+    }
+    if (window.HCWidgets && typeof window.HCWidgets.syncDayPlanStates === "function") {
+      window.HCWidgets.syncDayPlanStates(state.activatedDayPlanDates);
+    }
+  }
+
+  window.HCViewer = {
+    focusComposer: function (placeholderHint) {
+      if (!dom.composerInput) return;
+      if (typeof placeholderHint === "string" && placeholderHint.trim()) {
+        dom.composerInput.placeholder = placeholderHint;
+      }
+      dom.composerInput.focus();
+    }
+  };
 
   const codeBlocksById = new Map();
   let lastRunCodeBlock = null;
@@ -1583,6 +1617,8 @@
       }
     });
 
+    updateActivatedDayPlanDates(null);
+
     if (!options.preserveScroll) {
       if (scrollEl && thread.turns.length > 1) {
         scrollEl.scrollIntoView({ behavior: "instant", block: "start" });
@@ -2017,6 +2053,7 @@
     }
 
     dom.readingColumn.appendChild(wrap);
+    updateActivatedDayPlanDates(null);
 
     if (pendingRestoreScrollY !== null) {
       const y = pendingRestoreScrollY;
@@ -2055,6 +2092,18 @@
     const replyTo =
       explicitReplyTo !== null ? explicitReplyTo : state.latestTurnId;
 
+    let promptToSend = cleanText;
+    if (
+      !options.skipDayPlanDelta &&
+      window.HCWidgets &&
+      typeof window.HCWidgets.getActiveDayPlanDelta === "function"
+    ) {
+      const delta = window.HCWidgets.getActiveDayPlanDelta();
+      if (delta && delta.text) {
+        promptToSend = cleanText + "\n\n" + delta.text;
+      }
+    }
+
     clearEmptyPlaceholder();
 
     const tempTurn = {
@@ -2088,8 +2137,8 @@
     refs.article.scrollIntoView({ behavior: "instant", block: "end" });
 
     const payload = {
-      prompt: cleanText,
-      text: cleanText,
+      prompt: promptToSend,
+      text: promptToSend,
       profile: profile || undefined,
       replyTo: replyTo !== null ? replyTo : undefined
     };
@@ -2257,6 +2306,7 @@
         window.HCWidgets.renderWidget(ev.widget)
       );
     }
+    updateActivatedDayPlanDates(null);
   }
 
   function handleStreamReset() {
@@ -2343,6 +2393,7 @@
     activeStreamRef.refs.article.scrollIntoView({ behavior: "instant", block: "end" });
     activeStreamRef = null;
     syncComposerBusy(false);
+    updateActivatedDayPlanDates(ev.activatedDayPlanDates || ev.activated_day_plan_dates || null);
   }
 
   function handleStreamError(ev) {
@@ -2883,12 +2934,27 @@
       case "thread_loaded": {
         activeStreamRef = null;
         syncComposerBusy(false);
+        if (Array.isArray(ev.activatedDayPlanDates || ev.activated_day_plan_dates)) {
+          state.activatedDayPlanDates = (
+            ev.activatedDayPlanDates || ev.activated_day_plan_dates
+          ).slice();
+          window.__HC_ACTIVATED_DAY_PLAN_DATES__ = state.activatedDayPlanDates.slice();
+        }
         state.thread = normalizeThread(ev.thread, dropCapEnabled);
         const latest = parsePositiveTurnId(ev.latestTurnId);
         if (latest !== null) {
           state.latestTurnId = latest;
         }
         renderActiveThread(ev.turnId);
+        break;
+      }
+
+      case "widget_ack": {
+        if (Array.isArray(ev.activatedDayPlanDates || ev.activated_day_plan_dates)) {
+          updateActivatedDayPlanDates(
+            ev.activatedDayPlanDates || ev.activated_day_plan_dates
+          );
+        }
         break;
       }
 
@@ -3122,8 +3188,12 @@
 
     const textarea = el("textarea", "composer-textarea");
     textarea.rows = 1;
-    textarea.placeholder =
-      "Ask Computer a follow-up… (i to focus, Ctrl+Enter to send, Esc for Normal)";
+    textarea.placeholder = DEFAULT_COMPOSER_PLACEHOLDER;
+    textarea.addEventListener("blur", function () {
+      if (!textarea.value.trim()) {
+        textarea.placeholder = DEFAULT_COMPOSER_PLACEHOLDER;
+      }
+    });
 
     function autoResizeComposer() {
       textarea.style.height = "auto";

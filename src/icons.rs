@@ -12,12 +12,19 @@ use serde_json::Value;
 
 use crate::acp;
 use crate::config::{Config, normalize_lexical};
-use crate::mcp::INTERNAL_UI_MCP_SERVER;
+use crate::mcp::{INTERNAL_SUBAGENT_MCP_SERVER, INTERNAL_UI_MCP_SERVER};
 use crate::policy;
 
 /// Valid keys under `[present.tool_icons.kinds]`.
 pub const VALID_ICON_KINDS: &[&str] = &[
-    "execute", "read", "edit", "search", "fetch", "mcp_ui", "vault",
+    "execute",
+    "read",
+    "edit",
+    "search",
+    "fetch",
+    "mcp_ui",
+    "subagents",
+    "vault",
 ];
 
 /// Default Nerd Font v3 glyphs for known MCP server names.
@@ -84,13 +91,14 @@ pub fn resolve_command_glyph(
 
 /// Default Nerd Font v3 glyphs for built-in tool kinds.
 pub const DEFAULT_KIND_ICONS: &[(&str, &str)] = &[
-    ("fetch", "\u{f059f}"),  // nf-md-web
-    ("search", "\u{f002}"),  // nf-fa-search
-    ("execute", "\u{f489}"), // nf-oct-terminal
-    ("read", "\u{f4a5}"),    // nf-oct-file
-    ("edit", "\u{f040}"),    // nf-fa-pencil
-    ("vault", "\u{f082e}"),  // nf-md-notebook
-    ("mcp_ui", "\u{f1355}"), // nf-md-widgets_outline
+    ("fetch", "\u{f059f}"),    // nf-md-web
+    ("search", "\u{f002}"),    // nf-fa-search
+    ("execute", "\u{f489}"),   // nf-oct-terminal
+    ("read", "\u{f4a5}"),      // nf-oct-file
+    ("edit", "\u{f040}"),      // nf-fa-pencil
+    ("vault", "\u{f082e}"),    // nf-md-notebook
+    ("mcp_ui", "\u{f1355}"),   // nf-md-widgets_outline
+    ("subagents", "\u{f0e8}"), // nf-fa-sitemap
 ];
 
 /// Resolved icon lookup table built from [`Config`] and the active `agent_dir`.
@@ -226,6 +234,9 @@ impl IconResolver {
         if server == INTERNAL_UI_MCP_SERVER {
             return self.kind_icon("mcp_ui");
         }
+        if server == INTERNAL_SUBAGENT_MCP_SERVER {
+            return self.kind_icon("subagents");
+        }
         if let Some(tool_name) = tool {
             if let Some(rules) = self.user_mcp_tool_rules.get(server)
                 && let Some(glyph) = match_tool_icon(rules, tool_name)
@@ -333,10 +344,12 @@ impl IconResolver {
                 if norm.file_name().and_then(|f| f.to_str()) == Some("SKILL.md") {
                     return true;
                 }
-                if rel
-                    .components()
-                    .any(|c| matches!(c.as_os_str().to_str(), Some("mcp" | "mcp-ui" | "skills")))
-                {
+                if rel.components().any(|c| {
+                    matches!(
+                        c.as_os_str().to_str(),
+                        Some("mcp" | "mcp-ui" | "subagents" | "skills")
+                    )
+                }) {
                     return true;
                 }
             }
@@ -1494,7 +1507,29 @@ mod tests {
                 "rawInput": {"Path": "/home/user/skills/transit/SKILL.md"}
             })
         ));
+        // Suppressed: internal `subagents` schema read under <agent_dir>.
+        assert!(!tracker.observe_update(
+            &resolver,
+            &json!({
+                "toolCallId": "r2b",
+                "name": "read_file",
+                "kind": "read",
+                "rawInput": {"Path": "/tmp/agent/subagents/delegate.json"}
+            })
+        ));
         assert!(tracker.icons().is_empty());
+
+        // `subagents` delegation emits its dedicated icon (`\u{f0e8}`).
+        assert!(tracker.observe_update(
+            &resolver,
+            &json!({
+                "toolCallId": "sub1",
+                "name": "call_mcp_tool",
+                "kind": "execute",
+                "rawInput": {"ServerName": "subagents", "ToolName": "delegate"}
+            })
+        ));
+        assert_eq!(tracker.icons(), &["\u{f0e8}"]);
 
         // Vault read -> vault icon (nf-md-notebook), NOT generic file read.
         assert!(tracker.observe_update(
@@ -1506,7 +1541,7 @@ mod tests {
                 "rawInput": {"Path": "/home/user/Vault/Journal/2026-11-25.md"}
             })
         ));
-        assert_eq!(tracker.icons(), &["\u{f082e}"]);
+        assert_eq!(tracker.icons(), &["\u{f0e8}", "\u{f082e}"]);
 
         // External file read & edit.
         assert!(tracker.observe_update(
@@ -1527,7 +1562,10 @@ mod tests {
                 "rawInput": {"Path": "/tmp/notes.txt"}
             })
         ));
-        assert_eq!(tracker.icons(), &["\u{f082e}", "\u{f4a5}", "\u{f040}"]);
+        assert_eq!(
+            tracker.icons(),
+            &["\u{f0e8}", "\u{f082e}", "\u{f4a5}", "\u{f040}"]
+        );
     }
 
     #[test]

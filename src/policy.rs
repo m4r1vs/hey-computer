@@ -155,18 +155,39 @@ pub const RESTRICTED_DENY_NAMES: &[&str] = &[
     "edit_file",
 ];
 
+/// Built-in agent orchestration/subagent tool names unconditionally denied in
+/// [`LanePolicy::subagent`] to enforce strictly depth <= 1 and prevent `agy`
+/// built-in subagent hangs.
+pub const SUBAGENT_DENY_NAMES: &[&str] = &[
+    "invoke_subagent",
+    "define_subagent",
+    "manage_subagents",
+    "run_workflow",
+    "swarm",
+    "send_message",
+];
+
 /// Per-lane permission profile hook.
 ///
 /// Interactive and background lanes enforce the configured shell deny list and
 /// allow configured MCP servers; restricted lanes (for Phase 6 reactive tasks)
 /// additionally refuse every mutating, network, search, subagent, workflow, and
-/// unknown tool kind/name and disable MCP.
+/// unknown tool kind/name and disable MCP; subagent lanes preserve main-agent
+/// read/write/shell/MCP parity while blocking `mcp-ui`, `subagents`, and
+/// built-in orchestration tools.
 #[derive(Debug, Clone)]
 pub struct LanePolicy {
     pub deny_commands: Policy,
     pub deny_tool_kinds: Vec<String>,
     pub deny_tool_names: Vec<String>,
     pub allow_mcp: bool,
+    /// Whether the internal `mcp-ui` server (`show_widget`, `propose_widget_template`)
+    /// is permitted on this lane. Checked before the internal-server early-allow.
+    pub allow_mcp_ui: bool,
+    /// Whether the internal `subagents` server (`delegate`) is permitted on this lane.
+    /// Checked before the internal-server early-allow (`false` on restricted and
+    /// subagent lanes so recursion depth is strictly <= 1).
+    pub allow_subagents: bool,
     /// Optional per-turn allowlist of MCP server names (`None` allows all
     /// configured servers when `allow_mcp` is true).
     pub allowed_mcp_servers: Option<Vec<String>>,
@@ -186,6 +207,8 @@ impl LanePolicy {
             deny_tool_kinds: Vec::new(),
             deny_tool_names: Vec::new(),
             allow_mcp: true,
+            allow_mcp_ui: true,
+            allow_subagents: true,
             allowed_mcp_servers: None,
             allowed_mcp_tools: Vec::new(),
             known_mcp_servers: Vec::new(),
@@ -195,8 +218,8 @@ impl LanePolicy {
     /// Restricted read-only lane: refuses mutating, network, search, and
     /// unknown tool kinds (`RESTRICTED_DENY_KINDS`), blocks risky tool names
     /// (`RESTRICTED_DENY_NAMES`) even if reported as `"read"`, and disables all
-    /// MCP servers (including internal `mcp-ui`) unless specific read-only
-    /// `"server/tool"` entries are added via [`Self::with_allowed_mcp_tools`].
+    /// MCP servers (including internal `mcp-ui` and `subagents`) unless specific
+    /// read-only `"server/tool"` entries are added via [`Self::with_allowed_mcp_tools`].
     pub fn restricted() -> Self {
         Self {
             deny_commands: Policy::new(&[]),
@@ -209,10 +232,57 @@ impl LanePolicy {
                 .map(|s| (*s).to_string())
                 .collect(),
             allow_mcp: false,
+            allow_mcp_ui: false,
+            allow_subagents: false,
             allowed_mcp_servers: None,
             allowed_mcp_tools: Vec::new(),
             known_mcp_servers: Vec::new(),
         }
+    }
+
+    /// Subagent worker lane: same read/write file, shell (`execute`), web, and
+    /// MCP capabilities as the main agent (enforcing `base_deny`), while
+    /// structurally blocking `mcp-ui` (`allow_mcp_ui = false`), `subagents`
+    /// (`allow_subagents = false`, depth <= 1), and built-in orchestration tools
+    /// (`SUBAGENT_DENY_NAMES`).
+    ///
+    /// When `caller_allowed_mcp_servers` is `Some`, it is intersected with
+    /// `profile_mcp_servers` so callers may narrow — never widen — the child
+    /// profile's MCP permissions.
+    pub fn subagent(
+        base_deny: &[String],
+        profile_mcp_servers: &[String],
+        caller_allowed_mcp_servers: Option<&[String]>,
+        known_mcp_servers: Vec<String>,
+    ) -> Self {
+        let effective_mcp = match caller_allowed_mcp_servers {
+            Some(requested) => profile_mcp_servers
+                .iter()
+                .filter(|s| requested.iter().any(|r| r == *s))
+                .cloned()
+                .collect(),
+            None => profile_mcp_servers.to_vec(),
+        };
+        Self {
+            deny_commands: Policy::new(base_deny),
+            deny_tool_kinds: Vec::new(),
+            deny_tool_names: SUBAGENT_DENY_NAMES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            allow_mcp: true,
+            allow_mcp_ui: false,
+            allow_subagents: false,
+            allowed_mcp_servers: Some(effective_mcp),
+            allowed_mcp_tools: Vec::new(),
+            known_mcp_servers,
+        }
+    }
+
+    /// Control whether this lane may call the internal `subagents` MCP server.
+    pub fn with_subagents(mut self, allow: bool) -> Self {
+        self.allow_subagents = allow;
+        self
     }
 
     /// Return a copy of this policy scoped to a specific MCP server allowlist.
@@ -300,7 +370,24 @@ impl LanePolicy {
                 }
             }
             if server.as_deref() == Some(crate::mcp::INTERNAL_UI_MCP_SERVER) {
-                return PermissionDecision::Allow;
+                return if self.allow_mcp_ui {
+                    PermissionDecision::Allow
+                } else {
+                    PermissionDecision::Deny {
+                        tag: "mcp".to_string(),
+                        detail,
+                    }
+                };
+            }
+            if server.as_deref() == Some(crate::mcp::INTERNAL_SUBAGENT_MCP_SERVER) {
+                return if self.allow_subagents {
+                    PermissionDecision::Allow
+                } else {
+                    PermissionDecision::Deny {
+                        tag: "mcp".to_string(),
+                        detail,
+                    }
+                };
             }
             if let Some(allowed) = &self.allowed_mcp_servers
                 && !server
@@ -335,7 +422,27 @@ impl LanePolicy {
                 }
             }
             if mcp_name.starts_with(&format!("mcp_{}_", crate::mcp::INTERNAL_UI_MCP_SERVER)) {
-                return PermissionDecision::Allow;
+                return if self.allow_mcp_ui {
+                    PermissionDecision::Allow
+                } else {
+                    PermissionDecision::Deny {
+                        tag: "mcp".to_string(),
+                        detail: mcp_name.to_string(),
+                    }
+                };
+            }
+            if mcp_name.starts_with(&format!(
+                "mcp_{}_",
+                crate::mcp::INTERNAL_SUBAGENT_MCP_SERVER
+            )) {
+                return if self.allow_subagents {
+                    PermissionDecision::Allow
+                } else {
+                    PermissionDecision::Deny {
+                        tag: "mcp".to_string(),
+                        detail: mcp_name.to_string(),
+                    }
+                };
             }
             if let Some(allowed) = &self.allowed_mcp_servers {
                 let is_allowed = if !self.known_mcp_servers.is_empty() {
@@ -1423,6 +1530,11 @@ mod tests {
                 "rawInput": {"ServerName": "mcp-ui", "ToolName": "show_widget"}
             }}),
             json!({"toolCall": {
+                "kind": "execute",
+                "name": "call_mcp_tool",
+                "rawInput": {"ServerName": "subagents", "ToolName": "delegate"}
+            }}),
+            json!({"toolCall": {
                 "kind": "read",
                 "name": "list_resources",
                 "rawInput": {"ServerName": "google-workspace"}
@@ -1439,6 +1551,127 @@ mod tests {
                     PermissionDecision::Deny { .. }
                 ),
                 "expected {blocked} to be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn lane_policy_subagent_has_rw_parity_blocks_ui_and_recursion_and_intersects_mcp() {
+        use serde_json::json;
+
+        // Standard lane allows `subagents` even with an explicit `mcp_servers` allowlist,
+        // and blocks it when `with_subagents(false)` is set.
+        let std_scoped = LanePolicy::standard(&["sudo".to_string()])
+            .with_subagents(true)
+            .with_mcp_servers(Some(vec!["nixos".to_string()]));
+        let std_disabled = LanePolicy::standard(&["sudo".to_string()])
+            .with_subagents(false)
+            .with_mcp_servers(Some(vec!["nixos".to_string()]));
+        for sub_call in [
+            json!({"toolCall": {
+                "kind": "execute",
+                "name": "call_mcp_tool",
+                "rawInput": {"ServerName": "subagents", "ToolName": "delegate"}
+            }}),
+            json!({"toolCall": {
+                "kind": "other",
+                "name": "mcp_subagents_delegate"
+            }}),
+        ] {
+            assert_eq!(
+                std_scoped.evaluate_permission(&sub_call),
+                PermissionDecision::Allow,
+                "standard lane with subagents enabled should allow {sub_call}"
+            );
+            assert!(
+                matches!(
+                    std_disabled.evaluate_permission(&sub_call),
+                    PermissionDecision::Deny { ref tag, .. } if tag == "mcp"
+                ),
+                "standard lane with subagents disabled must deny {sub_call}"
+            );
+        }
+
+        // Subagent lane: intersects caller allowlist with profile allowlist.
+        let profile_mcp = vec![
+            "google-workspace".to_string(),
+            "slack".to_string(),
+            "linear".to_string(),
+        ];
+        let caller_mcp = vec![
+            "google-workspace".to_string(),
+            "unconfigured-extra".to_string(),
+        ];
+        let sub_policy = LanePolicy::subagent(
+            &["sudo".to_string(), "pkexec".to_string()],
+            &profile_mcp,
+            Some(&caller_mcp),
+            vec![
+                "google-workspace".to_string(),
+                "slack".to_string(),
+                "linear".to_string(),
+                "mcp-ui".to_string(),
+                "subagents".to_string(),
+            ],
+        );
+        assert!(sub_policy.allow_mcp);
+        assert!(!sub_policy.allow_mcp_ui);
+        assert!(!sub_policy.allow_subagents);
+        assert_eq!(
+            sub_policy.allowed_mcp_servers.as_deref(),
+            Some(&["google-workspace".to_string()][..])
+        );
+
+        // Allowed in subagent lane: read/write/edit/execute/web + intersected MCP server.
+        for allowed in [
+            json!({"toolCall": {"kind": "read", "name": "read_file", "title": "note.md"}}),
+            json!({"toolCall": {"kind": "edit", "name": "write_file", "title": "note.md"}}),
+            json!({"toolCall": {"kind": "edit", "name": "edit_file", "title": "note.md"}}),
+            json!({"toolCall": {"kind": "execute", "name": "run_command", "rawInput": {"CommandLine": "rg TODO notes/"}}}),
+            json!({"toolCall": {"kind": "fetch", "name": "read_url_content"}}),
+            json!({"toolCall": {"kind": "search", "name": "search_web"}}),
+            json!({"toolCall": {
+                "kind": "execute",
+                "name": "call_mcp_tool",
+                "rawInput": {"ServerName": "google-workspace", "ToolName": "get_events"}
+            }}),
+            json!({"toolCall": {
+                "kind": "other",
+                "name": "mcp_google-workspace_get_events"
+            }}),
+        ] {
+            assert_eq!(
+                sub_policy.evaluate_permission(&allowed),
+                PermissionDecision::Allow,
+                "expected subagent policy to allow {allowed}"
+            );
+        }
+
+        // Denied in subagent lane: permissions.deny, mcp-ui, subagents, built-in orchestration,
+        // and MCP servers outside the intersection.
+        for blocked in [
+            json!({"toolCall": {"kind": "execute", "name": "run_command", "rawInput": {"CommandLine": "sudo id"}}}),
+            json!({"toolCall": {"kind": "execute", "name": "run_command", "rawInput": {"CommandLine": "pkexec sh"}}}),
+            json!({"toolCall": {"kind": "execute", "name": "call_mcp_tool", "rawInput": {"ServerName": "mcp-ui", "ToolName": "show_widget"}}}),
+            json!({"toolCall": {"kind": "other", "name": "mcp_mcp-ui_show_widget"}}),
+            json!({"toolCall": {"kind": "execute", "name": "call_mcp_tool", "rawInput": {"ServerName": "subagents", "ToolName": "delegate"}}}),
+            json!({"toolCall": {"kind": "other", "name": "mcp_subagents_delegate"}}),
+            json!({"toolCall": {"kind": "other", "name": "invoke_subagent"}}),
+            json!({"toolCall": {"kind": "other", "name": "define_subagent"}}),
+            json!({"toolCall": {"kind": "other", "name": "manage_subagents"}}),
+            json!({"toolCall": {"kind": "other", "name": "run_workflow"}}),
+            json!({"toolCall": {"kind": "other", "name": "swarm"}}),
+            json!({"toolCall": {"kind": "other", "name": "send_message"}}),
+            json!({"toolCall": {"kind": "execute", "name": "call_mcp_tool", "rawInput": {"ServerName": "slack", "ToolName": "conversations_history"}}}),
+            json!({"toolCall": {"kind": "other", "name": "mcp_slack_conversations_history"}}),
+            json!({"toolCall": {"kind": "execute", "name": "call_mcp_tool", "rawInput": {"ServerName": "unconfigured-extra", "ToolName": "ping"}}}),
+        ] {
+            assert!(
+                matches!(
+                    sub_policy.evaluate_permission(&blocked),
+                    PermissionDecision::Deny { .. }
+                ),
+                "expected subagent policy to deny {blocked}"
             );
         }
     }

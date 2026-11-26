@@ -280,6 +280,26 @@ restores ducked media.
 **schedule_reload / schedule_run** `{"type":"schedule_reload"}` or
 `{"type":"schedule_run","target":"…"}` → `{"type":"ok","message":"…"}`.
 
+**delegate**
+
+```json
+{"type":"delegate","role":"Personal Comms","prompt":"Summarize unread messages.","profile":"fast","allowed_mcp_servers":["google-workspace"],"parent_session":null}
+```
+
+Runs a synchronous subagent turn in the dedicated `[subagents]` lane on the same
+warm `agy acp` process (backed by the internal `subagents` MCP server's
+`delegate` tool, strictly opt-in). Only `type`, `role`, and `prompt` are
+required; `profile` (defaulting to `[subagents].profile`, else
+`routing.fast_profile` when routing is enabled, else `[agent]`),
+`allowed_mcp_servers` (intersected with the child profile's `mcp_servers`), and
+`parent_session` are optional. Always waits on the socket and replies with
+`{"type":"answer",…}` or `{"type":"failed",…}` without presenting
+notifications, opening the viewer, speaking TTS, or recording top-level turns in
+`history.db`. Delegated workers keep the main agent's read/write/shell/MCP
+capabilities (subject to `permissions.deny`) while structurally blocking
+`mcp-ui` and nested subagent/orchestration tools (depth ≤ 1). Closing the socket
+or cancelling the parent turn cancels the child ACP session immediately.
+
 **Errors.** A line the daemon cannot use (not JSON, an unknown type or field,
 an empty ask, not UTF-8, longer than 256 KiB) gets
 `{"type":"error","message":"…"}`. Several clients may be connected at once
@@ -366,6 +386,14 @@ media_duck = "none"                 # "none", "pause" (playerctl), or "lower" (p
 max_concurrent = 1                  # concurrent turns in the background lane (1..=8)
 max_queued = 32                     # queued background tasks before rejecting new ones (1..=256)
 # profile = "deep"                  # optional default profile for `ask --background`
+
+[subagents]
+enabled = true                      # expose internal `subagents` MCP server (`delegate` tool, depth <= 1)
+# profile = "fast"                  # default profile for delegated workers (falls back to routing.fast_profile or [agent])
+max_concurrent = 4                  # concurrent delegated subagent sessions (1..=16)
+max_queued = 16                     # queued subagent requests before rejecting (1..=64)
+max_turn_secs = 120                 # hard wall-clock cap per subagent turn (seconds)
+max_tool_calls = 25                 # maximum distinct tool calls per subagent turn
 
 [scheduler]
 enabled = true                      # run the SQLite-backed hybrid scheduler loop
@@ -508,9 +536,11 @@ told about Obsidian.
 | `tmux.enable` | true | puts `tmux` on the daemon/agent PATH (for `context.desktop` live tmux context) and links the bundled `tmux` skill |
 | `tmux.package` | `pkgs.tmux` | the tmux package |
 | `schedule.enable` | true | links the bundled `schedule` skill (uses `hey-computer schedule` from the agent's PATH) |
+| `dayPlan.enable` | true | links the bundled `day-plan` skill (interactive 4-phase daily planning workflow and `day_plan` widget) |
+| `subagents.{enable,profile,maxConcurrent,maxQueued,maxTurnSecs,maxToolCalls}` | `null` | lowers any non-null fields into `settings.subagents` (`enabled`, `profile`, `max_concurrent`, `max_queued`, `max_turn_secs`, `max_tool_calls`); omitted from `config.toml` when all are `null` |
 | `mcp.servers` | `{}` | MCP server definitions written to `config/mcp_config.json` and gated per profile; `{ file = "/abs/path"; }` entries in `env` or `headers` are lowered into `env_files` / `header_files` so secrets stay out of `/nix/store` |
 | `mcp.oauthTokensFile` | null | optional path to an existing `mcp_oauth_tokens.json` (e.g. from interactive `agy`) symlinked into the agent's private directory so OAuth-authenticated remote MCP servers share tokens |
-| `skills.enable` | true | the bundled `hyprland-desktop` skill, plus `recall`, `tmux`, `schedule`, Obsidian, and `openhue` skills when enabled |
+| `skills.enable` | true | the bundled `hyprland-desktop` skill, plus `recall`, `tmux`, `schedule`, `day-plan`, Obsidian, `openhue`, and `messenger` skills when enabled |
 | `skills.extra` | `[]` | more skill directories |
 | `viewer.package` | `null` | optional external viewer package; `null` uses the built-in `hey-computer-viewer` |
 | `viewer.command` | `["${cfg.package}/bin/hey-computer-viewer" "--turn-id" "{id}" "{file}"]` | started in its own `systemd-run --user --scope` |
@@ -538,7 +568,11 @@ Lua configuration through `hyprctl` (`hyprctl dispatch` now takes Lua
 expressions such as `hl.dsp.focus({ workspace = 3 })`; the old
 `hyprctl dispatch workspace 3` is an error), finding the live instance when
 `HYPRLAND_INSTANCE_SIGNATURE` is stale, starting applications through
-Hyprland, notifications, media players and volume. With a vault, four skills
+Hyprland, notifications, media players and volume. `day-plan` (bundled, enabled
+by default via `dayPlan.enable`) teaches the 4-phase interactive daily planning
+workflow (propose with zero side effects, iterate & read-only reply drafting,
+idempotent activation across calendars / daily notes / dated check-ins, and
+mid-day reassessment) using the structured `day_plan` widget. With a vault, four skills
 from [obsidian-skills](https://github.com/obsidianmd/obsidian-skills)
 (obsidian-cli, obsidian-markdown, obsidian-bases, json-canvas) are added; the
 other three need npm tools and are left out. With `openhue.enable = true`, the
@@ -579,7 +613,11 @@ for dark/light portal updates):
   `reply_to: ID`, resuming expired sessions from `history.db`), slide-over
   SQLite FTS5 **History & Recall** drawer (`h`), **Save to Vault** (`v` →
   `<vault>/Journal/YYYY-MM-DD.md` in local time), curated MCP cards (Calendar,
-  Transit, Tasks, Dev Triage, Hue Rooms, `distill` diff review), and custom
+  Transit, Tasks, Dev Triage, Hue Rooms, `distill` diff review, and interactive
+  `day_plan` cards with *Roter Faden*, toggleable Reply Nudges + fast read-only
+  `Draft Reply`, priorities & sub-TODOs, calendar blocks, dynamic check-ins,
+  live toggle syncing on composer iterations, and persistent `Plan Activated ✓`
+  state), and custom
   `show_widget` HTML/SVG surfaces (`window.sendPrompt`, `hc:widget-error`
   boundary, and `Save as Template…` writing reusable `SKILL.md` + `template.html`
   skills under `~/.config/hey-computer/skills/widget-<slug>/`).

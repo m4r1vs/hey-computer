@@ -5056,3 +5056,468 @@ async fn notify_hold_stage2_failure_releases_raw_and_emits_persistent_error_noti
 
     h.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagent_delegation_runs_concurrently_without_deadlock_or_history_pollution() {
+    let script = r#"{
+      "turns": [
+        {
+          "match": "bg_blocker",
+          "steps": [
+            {"signal": "bg_started"},
+            {"wait_for": "bg_release"},
+            {"chunk": "bg done"}
+          ]
+        },
+        {
+          "match": "worker_one",
+          "steps": [
+            {"wait_for": "w2_started"},
+            {"signal": "w1_ready"},
+            {"permission": {"command": "get_events", "server": "google-workspace", "arguments": {}}},
+            {"chunk": "w1 ok"}
+          ]
+        },
+        {
+          "match": "worker_two",
+          "steps": [
+            {"signal": "w2_started"},
+            {"wait_for": "w1_ready"},
+            {"chunk": "w2 ok"}
+          ]
+        },
+        {
+          "match": "try_slack",
+          "steps": [
+            {"permission": {"command": "conversations_history", "server": "slack", "arguments": {}}},
+            {"chunk": "should not reach"}
+          ]
+        },
+        {
+          "match": "try_mcp_ui",
+          "steps": [
+            {"permission": {"command": "show_widget", "server": "mcp-ui", "arguments": {"kind": "transit_board", "title": "T", "data": {}}}},
+            {"chunk": "should not reach"}
+          ]
+        },
+        {
+          "match": "try_nested_delegate",
+          "steps": [
+            {"permission": {"command": "delegate", "server": "subagents", "arguments": {"role": "Nested", "prompt": "boom"}}},
+            {"chunk": "should not reach"}
+          ]
+        },
+        {
+          "match": "release_all",
+          "steps": [
+            {"signal": "bg_release"},
+            {"chunk": "released"}
+          ]
+        }
+      ],
+      "default": ["config_info"]
+    }"#;
+
+    let h = Harness::start(script, |cfg| {
+        cfg.tasks.max_concurrent = 1;
+        cfg.subagents.enabled = true;
+        cfg.subagents.max_concurrent = 4;
+        cfg.subagents.max_turn_secs = 30.0;
+        cfg.profiles.insert(
+            "fast".to_string(),
+            hey_computer::config::Profile {
+                model: Some("fast-sub-model".to_string()),
+                thought_level: Some("low".to_string()),
+                ..hey_computer::config::Profile::default()
+            },
+        );
+        cfg.subagents.profile = Some("fast".to_string());
+        for srv in ["google-workspace", "slack"] {
+            cfg.mcp.insert(
+                srv.to_string(),
+                hey_computer::config::McpServer {
+                    command: "/bin/true".to_string(),
+                    ..hey_computer::config::McpServer::default()
+                },
+            );
+        }
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    // 1. Verify `mcp_config.json` propagated the daemon's custom socket path to `subagents`,
+    //    and `<state_dir>/subagent-workspace/AGENTS.md` was prepared.
+    let mcp_cfg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(h.dir.join("state/agy/config/mcp_config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        mcp_cfg["mcpServers"]["subagents"]["args"],
+        serde_json::json!(["mcp-subagent"])
+    );
+    assert_eq!(
+        mcp_cfg["mcpServers"]["subagents"]["env"]["HEY_COMPUTER_SOCKET"],
+        h.socket.to_string_lossy().as_ref()
+    );
+    assert!(h.dir.join("state/subagent-workspace/AGENTS.md").is_file());
+
+    // 2. Saturate `tasks.max_concurrent = 1` with a blocking background turn.
+    let (_bg_id, mut bg_client) = ipc::ask_request(
+        &h.socket,
+        &Request::Ask {
+            text: "bg_blocker".to_string(),
+            wait: true,
+            new: true,
+            profile: None,
+            background: true,
+            suppress_token: None,
+            attachments: vec![],
+            source: InputSource::Cli,
+            reply_to: None,
+            stream: false,
+            distill: false,
+            schedule_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    h.wait_log("bg_blocker").await;
+
+    // 3. Fire two concurrent `Request::Delegate` calls that require simultaneous
+    //    execution (via WaitFor/Signal handshake) while `tasks.max_concurrent = 1` is saturated!
+    let sock1 = h.socket.clone();
+    let sock2 = h.socket.clone();
+    let t1 = tokio::spawn(async move {
+        let mut c = Client::send(
+            &sock1,
+            &Request::Delegate {
+                role: "Personal".to_string(),
+                prompt: "worker_one".to_string(),
+                profile: None,
+                allowed_mcp_servers: Some(vec!["google-workspace".to_string()]),
+                parent_session: None,
+            },
+        )
+        .await
+        .unwrap();
+        c.next(Some(Duration::from_secs(10))).await.unwrap()
+    });
+    let t2 = tokio::spawn(async move {
+        let mut c = Client::send(
+            &sock2,
+            &Request::Delegate {
+                role: "Work".to_string(),
+                prompt: "worker_two".to_string(),
+                profile: None,
+                allowed_mcp_servers: None,
+                parent_session: None,
+            },
+        )
+        .await
+        .unwrap();
+        c.next(Some(Duration::from_secs(10))).await.unwrap()
+    });
+    let (r1, r2) = tokio::join!(t1, t2);
+    assert_eq!(answer(&r1.unwrap()), "w1 ok");
+    assert_eq!(answer(&r2.unwrap()), "w2 ok");
+
+    // 4. Verify `subagents.profile` (`fast` -> `fast-sub-model`) is applied by default.
+    let mut prof_client = Client::send(
+        &h.socket,
+        &Request::Delegate {
+            role: "ProfileCheck".to_string(),
+            prompt: "profile_check".to_string(),
+            profile: None,
+            allowed_mcp_servers: None,
+            parent_session: None,
+        },
+    )
+    .await
+    .unwrap();
+    let prof_reply = prof_client
+        .next(Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    assert!(
+        answer(&prof_reply).contains("model=fast-sub-model"),
+        "expected fast-sub-model, got {prof_reply:?}"
+    );
+
+    // 5. Verify policy enforcement in subagent lane:
+    //    disallowed MCP (`slack` when scoped to `google-workspace`), `mcp-ui`, and nested `subagents`.
+    for (prompt, allowed_mcp) in [
+        ("try_slack", Some(vec!["google-workspace".to_string()])),
+        ("try_mcp_ui", None),
+        ("try_nested_delegate", None),
+    ] {
+        let mut c = Client::send(
+            &h.socket,
+            &Request::Delegate {
+                role: "PolicyCheck".to_string(),
+                prompt: prompt.to_string(),
+                profile: None,
+                allowed_mcp_servers: allowed_mcp,
+                parent_session: None,
+            },
+        )
+        .await
+        .unwrap();
+        let reply = c.next(Some(Duration::from_secs(10))).await.unwrap();
+        let (reason, _) = failure(&reply);
+        assert_eq!(
+            reason,
+            FailReason::Denied,
+            "{prompt} must be denied in subagent lane, got {reply:?}"
+        );
+    }
+
+    // 6. Release the saturated background task via an interactive turn.
+    let rel = h.ask("release_all", true).await;
+    assert_eq!(answer(&rel), "released");
+    let bg_reply = bg_client.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert_eq!(answer(&bg_reply), "bg done");
+
+    // 7. Zero desktop presentations from subagents, and zero subagent rows in history.db.
+    assert!(
+        h.recorder.items().is_empty(),
+        "subagents must never present desktop UI: {:?}",
+        h.recorder.items()
+    );
+    let turns = hey_computer::store::list_turns(
+        &h.dir.join("state"),
+        &hey_computer::store::ListFilter {
+            include_suppressed: true,
+            limit: 50,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        turns.iter().all(|t| !t.request.contains("worker_one")
+            && !t.request.contains("worker_two")
+            && !t.request.contains("profile_check")
+            && !t.request.contains("try_slack")),
+        "subagents must never write rows to history.db: {turns:?}"
+    );
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagent_never_writes_history_db_and_handles_hangup_inactivity_hold_and_parent_cancel() {
+    let script = r#"{
+      "turns": [
+        {
+          "match": "hang_sub",
+          "steps": [
+            {"signal": "hang_sub_running"},
+            "hang"
+          ]
+        },
+        {
+          "match": "parent_hold_test",
+          "steps": [
+            {"update": {"sessionUpdate": "tool_call", "toolCallId": "tc_sub_hold", "name": "call_mcp_tool", "kind": "execute", "status": "in_progress", "rawInput": {"ServerName": "subagents", "ToolName": "delegate", "Arguments": {"role": "Long Worker", "prompt": "long_child"}}}},
+            {"signal": "parent_hold_ready"},
+            {"wait_for": "child_finished"},
+            {"update": {"sessionUpdate": "tool_call_update", "toolCallId": "tc_sub_hold", "status": "completed"}},
+            {"chunk": "parent survived inactivity"}
+          ]
+        },
+        {
+          "match": "long_child",
+          "steps": [
+            {"sleep_ms": 180},
+            {"chunk": "child "},
+            {"sleep_ms": 180},
+            {"chunk": "finished "},
+            {"sleep_ms": 220},
+            {"signal": "child_finished"},
+            {"chunk": "slowly"}
+          ]
+        },
+        {
+          "match": "parent_cancel_test",
+          "steps": [
+            {"update": {"sessionUpdate": "tool_call", "toolCallId": "tc_sub_cancel", "name": "call_mcp_tool", "kind": "execute", "status": "in_progress", "rawInput": {"ServerName": "subagents", "ToolName": "delegate", "Arguments": {"role": "Cancel Worker", "prompt": "cancel_child"}}}},
+            {"signal": "parent_cancel_ready"},
+            "hang"
+          ]
+        },
+        {
+          "match": "cancel_child",
+          "steps": [
+            {"signal": "cancel_child_running"},
+            "hang"
+          ]
+        }
+      ],
+      "default": ["echo"]
+    }"#;
+
+    let h = Harness::start(script, |cfg| {
+        cfg.agent.inactivity_timeout_secs = 0.3;
+        cfg.agent.max_turn_secs = 15.0;
+        cfg.subagents.enabled = true;
+        cfg.subagents.max_turn_secs = 10.0;
+    })
+    .await;
+    h.wait_log("new mock-1").await;
+
+    // 1. Standalone `Request::Delegate` writes ZERO rows to `history.db`.
+    let mut quick = Client::send(
+        &h.socket,
+        &Request::Delegate {
+            role: "Quick".to_string(),
+            prompt: "hello_only_delegate".to_string(),
+            profile: None,
+            allowed_mcp_servers: None,
+            parent_session: None,
+        },
+    )
+    .await
+    .unwrap();
+    let quick_reply = quick.next(Some(Duration::from_secs(10))).await.unwrap();
+    assert!(answer(&quick_reply).contains("hello_only_delegate"));
+    let turns = hey_computer::store::list_turns(
+        &h.dir.join("state"),
+        &hey_computer::store::ListFilter {
+            include_suppressed: true,
+            limit: 50,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        turns.is_empty(),
+        "subagent delegates must never write turns to history.db: {turns:?}"
+    );
+
+    // 2. Client socket hangup cancels the running child session immediately.
+    let hang_client = Client::send(
+        &h.socket,
+        &Request::Delegate {
+            role: "Hang".to_string(),
+            prompt: "hang_sub".to_string(),
+            profile: None,
+            allowed_mcp_servers: None,
+            parent_session: None,
+        },
+    )
+    .await
+    .unwrap();
+    h.wait_log("hang_sub").await;
+    let cancels_before = h.log_count("turn cancelled");
+    drop(hang_client);
+    h.eventually("child cancelled on hangup", || {
+        h.log_count("turn cancelled") > cancels_before
+    })
+    .await;
+
+    // 3. Parent inactivity deadline is held open while correlated child runs (> 2x parent inactivity timeout).
+    let (_p_id, mut parent_client) = h.ask_waiting("parent_hold_test").await;
+    h.wait_log("parent_hold_test").await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let mut child_client = Client::send(
+        &h.socket,
+        &Request::Delegate {
+            role: "Long Worker".to_string(),
+            prompt: "long_child".to_string(),
+            profile: None,
+            allowed_mcp_servers: None,
+            parent_session: None,
+        },
+    )
+    .await
+    .unwrap();
+    let child_reply = child_client
+        .next(Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    assert_eq!(answer(&child_reply), "child finished slowly");
+    let parent_reply = parent_client
+        .next(Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    assert!(
+        matches!(parent_reply, Reply::Answer { ref text, .. } if text == "parent survived inactivity"),
+        "expected parent answer, got {parent_reply:?}; mock log:\n{}",
+        h.log_lines().join("\n")
+    );
+
+    // 4. Cancelling the parent turn immediately cancels both an MCP-correlated child
+    //    (`parent_session: None`) and an explicitly session-correlated child (`parent_session: Some(...)`).
+    let (p2_id, mut parent2_client) = h.ask_waiting("parent_cancel_test").await;
+    h.wait_log("parent_cancel_test").await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let mut child2_client = Client::send(
+        &h.socket,
+        &Request::Delegate {
+            role: "Cancel Worker".to_string(),
+            prompt: "cancel_child".to_string(),
+            profile: None,
+            allowed_mcp_servers: None,
+            parent_session: None,
+        },
+    )
+    .await
+    .unwrap();
+    let mut child3_client = Client::send(
+        &h.socket,
+        &Request::Delegate {
+            role: "Explicit Session Worker".to_string(),
+            prompt: "cancel_child".to_string(),
+            profile: None,
+            allowed_mcp_servers: None,
+            parent_session: Some("mock-1".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    h.eventually("both cancel children running", || {
+        h.log_count("cancel_child") >= 2
+    })
+    .await;
+
+    let cancel_reply = ipc::request(&h.socket, &Request::Cancel { id: Some(p2_id) })
+        .await
+        .unwrap();
+    assert_eq!(cancel_reply, Reply::Cancelled { id: Some(p2_id) });
+
+    let child2_outcome = child2_client
+        .next(Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_eq!(failure(&child2_outcome).0, FailReason::Cancelled);
+    let child3_outcome = child3_client
+        .next(Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_eq!(failure(&child3_outcome).0, FailReason::Cancelled);
+    let parent2_outcome = parent2_client
+        .next(Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_eq!(failure(&parent2_outcome).0, FailReason::Cancelled);
+
+    // Final check: history.db only has the two parent asks, zero subagent turns.
+    let final_turns = hey_computer::store::list_turns(
+        &h.dir.join("state"),
+        &hey_computer::store::ListFilter {
+            include_suppressed: true,
+            limit: 50,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        final_turns
+            .iter()
+            .all(|t| !t.request.contains("hello_only_delegate")
+                && !t.request.contains("long_child")
+                && !t.request.contains("cancel_child")
+                && !t.request.contains("hang_sub")),
+        "history.db must not contain any delegated subagent turns: {final_turns:?}"
+    );
+
+    h.stop().await;
+}

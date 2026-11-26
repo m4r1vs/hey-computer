@@ -38,6 +38,7 @@
       ++ lib.optionals cfg.recall.enable ["${cfg.package}/share/hey-computer/skills/recall"]
       ++ lib.optionals cfg.tmux.enable ["${cfg.package}/share/hey-computer/skills/tmux"]
       ++ lib.optionals cfg.schedule.enable ["${cfg.package}/share/hey-computer/skills/schedule"]
+      ++ lib.optionals cfg.dayPlan.enable ["${cfg.package}/share/hey-computer/skills/day-plan"]
       ++ lib.optionals cfg.obsidian.enable obsidianSkillDirs
       ++ lib.optionals cfg.openhue.enable ["${cfg.package}/share/hey-computer/skills/openhue"]
       ++ lib.optionals cfg.messengerBridge.enable ["${cfg.package}/share/hey-computer/skills/messenger"]
@@ -221,6 +222,15 @@
   bridgeReadOnlyPaths =
     cfg.messengerBridge.extraBindReadOnlyPaths
     ++ lib.optional (cfg.messengerBridge.signalDesktopDir != null) cfg.messengerBridge.signalDesktopDir;
+
+  subagentsConfigured =
+    cfg.subagents.enable
+    != null
+    || cfg.subagents.profile != null
+    || cfg.subagents.maxConcurrent != null
+    || cfg.subagents.maxQueued != null
+    || cfg.subagents.maxTurnSecs != null
+    || cfg.subagents.maxToolCalls != null;
 in {
   options.programs.hey-computer = {
     enable = mkEnableOption "hey-computer, a voice assistant daemon that keeps one ACP agent warm";
@@ -429,6 +439,62 @@ in {
       '';
     };
 
+    dayPlan.enable = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Link the bundled `day-plan` skill (when {option}`skills.enable` is set)
+        teaching the interactive 4-phase daily planning workflow (propose,
+        iterate, activate, reassess) and `day_plan` widget schema.
+      '';
+    };
+
+    subagents = {
+      enable = mkOption {
+        type = types.nullOr types.bool;
+        default = null;
+        description = ''
+          Enable or disable native synchronous subagents (`settings.subagents.enabled`).
+          When `null`, `[subagents]` is omitted from `config.toml` unless another
+          `subagents.*` option is set (falling back to the daemon default).
+        '';
+      };
+
+      profile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          Default named profile for delegated subagents (`settings.subagents.profile`).
+          When `null`, the daemon falls back to `routing.fast_profile` (if routing
+          is enabled) or base `[agent]`.
+        '';
+      };
+
+      maxConcurrent = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        description = "Maximum concurrent delegated subagent sessions (`settings.subagents.max_concurrent`, 1..=16).";
+      };
+
+      maxQueued = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        description = "Maximum queued delegated subagent requests (`settings.subagents.max_queued`, 1..=64).";
+      };
+
+      maxTurnSecs = mkOption {
+        type = types.nullOr types.number;
+        default = null;
+        description = "Hard wall-clock timeout in seconds per delegated subagent turn (`settings.subagents.max_turn_secs`).";
+      };
+
+      maxToolCalls = mkOption {
+        type = types.nullOr types.ints.unsigned;
+        default = null;
+        description = "Maximum distinct tool calls per delegated subagent turn (`settings.subagents.max_tool_calls`).";
+      };
+    };
+
     mcp = {
       servers = mkOption {
         type = types.attrsOf (types.attrsOf types.anything);
@@ -476,9 +542,11 @@ in {
           Give the agent the bundled `hyprland-desktop` skill, the bundled
           `recall` skill when {option}`recall.enable` is set, the bundled
           `tmux` skill when {option}`tmux.enable` is set, the bundled
-          `schedule` skill when {option}`schedule.enable` is set, the Obsidian
-          skills when {option}`obsidian.enable` is set, and the bundled
-          `openhue` skill when {option}`openhue.enable` is set.
+          `schedule` skill when {option}`schedule.enable` is set, the bundled
+          `day-plan` skill when {option}`dayPlan.enable` is set, the Obsidian
+          skills when {option}`obsidian.enable` is set, the bundled `openhue`
+          skill when {option}`openhue.enable` is set, and the bundled `messenger`
+          skill when {option}`messengerBridge.enable` is set.
         '';
       };
 
@@ -940,6 +1008,14 @@ in {
         cooldown_secs = mkDefault cfg.messengerBridge.cooldownSecs;
         quiet_start = mkIf (cfg.messengerBridge.quietStart != "") (mkDefault cfg.messengerBridge.quietStart);
         quiet_end = mkIf (cfg.messengerBridge.quietEnd != "") (mkDefault cfg.messengerBridge.quietEnd);
+      };
+      subagents = mkIf subagentsConfigured {
+        enabled = mkIf (cfg.subagents.enable != null) (mkDefault cfg.subagents.enable);
+        profile = mkIf (cfg.subagents.profile != null) (mkDefault cfg.subagents.profile);
+        max_concurrent = mkIf (cfg.subagents.maxConcurrent != null) (mkDefault cfg.subagents.maxConcurrent);
+        max_queued = mkIf (cfg.subagents.maxQueued != null) (mkDefault cfg.subagents.maxQueued);
+        max_turn_secs = mkIf (cfg.subagents.maxTurnSecs != null) (mkDefault cfg.subagents.maxTurnSecs);
+        max_tool_calls = mkIf (cfg.subagents.maxToolCalls != null) (mkDefault cfg.subagents.maxToolCalls);
       };
     };
 

@@ -26,6 +26,7 @@ pub struct Config {
     pub mcp: BTreeMap<String, McpServer>,
     pub conversation: Conversation,
     pub tasks: Tasks,
+    pub subagents: Subagents,
     pub scheduler: Scheduler,
     pub routing: Routing,
     pub permissions: Permissions,
@@ -323,6 +324,39 @@ impl Default for Tasks {
             max_concurrent: 1,
             max_queued: 32,
             profile: None,
+        }
+    }
+}
+
+/// Configuration for native synchronous subagent delegation (`[subagents]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Subagents {
+    /// Enable the internal `subagents` MCP server (`delegate`) and socket delegation lane.
+    pub enabled: bool,
+    /// Default profile for delegated subagent turns (`None` falls back to
+    /// `routing.fast_profile` when `routing.enabled`, else base `[agent]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Maximum concurrent delegated subagent sessions (`1..=16`).
+    pub max_concurrent: usize,
+    /// Maximum queued delegated subagent turns (`1..=64`).
+    pub max_queued: usize,
+    /// Hard wall-clock cap per delegated subagent turn in seconds (`1.0..=3600.0`).
+    pub max_turn_secs: f64,
+    /// Maximum tool calls per delegated subagent turn (`0..=500`; `0` disables the cap).
+    pub max_tool_calls: usize,
+}
+
+impl Default for Subagents {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            profile: None,
+            max_concurrent: 4,
+            max_queued: 16,
+            max_turn_secs: 120.0,
+            max_tool_calls: 25,
         }
     }
 }
@@ -969,8 +1003,14 @@ impl Config {
                     "mcp.{name}: server names must be 1..={MAX_PROFILE_NAME_LEN} ASCII letters, digits, '-' or '_'"
                 );
             }
-            if name.eq_ignore_ascii_case("mcp-ui") {
+            if name.eq_ignore_ascii_case(crate::mcp::INTERNAL_UI_MCP_SERVER) {
                 bail!("mcp.{name}: \"mcp-ui\" is reserved for hey-computer's internal UI server");
+            }
+            if name.eq_ignore_ascii_case(crate::mcp::INTERNAL_SUBAGENT_MCP_SERVER) {
+                bail!(
+                    "mcp.{name}: \"{}\" is reserved for hey-computer's internal subagent server",
+                    crate::mcp::INTERNAL_SUBAGENT_MCP_SERVER
+                );
             }
             let has_cmd = !server.command.is_empty();
             let has_url = !server.url.is_empty();
@@ -1049,6 +1089,37 @@ impl Config {
             && let Err(msg) = self.resolve_profile(Some(profile))
         {
             bail!("tasks.profile: {msg}");
+        }
+        if !(1..=16).contains(&self.subagents.max_concurrent) {
+            bail!(
+                "subagents.max_concurrent must be between 1 and 16, not {}",
+                self.subagents.max_concurrent
+            );
+        }
+        if !(1..=64).contains(&self.subagents.max_queued) {
+            bail!(
+                "subagents.max_queued must be between 1 and 64, not {}",
+                self.subagents.max_queued
+            );
+        }
+        if !self.subagents.max_turn_secs.is_finite()
+            || !(1.0..=3600.0).contains(&self.subagents.max_turn_secs)
+        {
+            bail!(
+                "subagents.max_turn_secs must be between 1 and 3600 seconds, not {}",
+                self.subagents.max_turn_secs
+            );
+        }
+        if self.subagents.max_tool_calls > 500 {
+            bail!(
+                "subagents.max_tool_calls must be at most 500, not {}",
+                self.subagents.max_tool_calls
+            );
+        }
+        if let Some(profile) = self.subagents.profile.as_deref()
+            && let Err(msg) = self.resolve_profile(Some(profile))
+        {
+            bail!("subagents.profile: {msg}");
         }
         for (key, value) in [
             (
@@ -1304,6 +1375,17 @@ impl Config {
                 .thinking_label
                 .as_deref()
                 .map(|s| s.trim().to_string()),
+        })
+    }
+
+    /// Effective default profile name for delegated subagent turns when the
+    /// caller omits `profile`: `subagents.profile`, else `routing.fast_profile`
+    /// when `routing.enabled`, else `None` (base `[agent]`).
+    pub fn default_subagent_profile(&self) -> Option<&str> {
+        self.subagents.profile.as_deref().or_else(|| {
+            self.routing
+                .enabled
+                .then_some(self.routing.fast_profile.as_str())
         })
     }
 
@@ -1939,5 +2021,80 @@ mod tests {
 
         let fast = parsed.resolve_profile(Some("fast")).unwrap();
         assert_eq!(fast.inactivity, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn subagents_config_defaults_validation_and_reserved_mcp_name() {
+        let cfg = Config::default();
+        assert!(cfg.subagents.enabled);
+        assert_eq!(cfg.subagents.profile, None);
+        assert_eq!(cfg.subagents.max_concurrent, 4);
+        assert_eq!(cfg.subagents.max_queued, 16);
+        assert_eq!(cfg.subagents.max_turn_secs, 120.0);
+        assert_eq!(cfg.subagents.max_tool_calls, 25);
+        assert_eq!(cfg.default_subagent_profile(), None);
+        cfg.validate().unwrap();
+
+        let parsed: Config = toml::from_str(
+            r#"
+            [profiles.fast]
+            thought_level = "low"
+
+            [profiles.deep]
+            thought_level = "high"
+
+            [routing]
+            enabled = true
+            fast_profile = "fast"
+            deep_profile = "deep"
+
+            [subagents]
+            enabled = true
+            max_concurrent = 6
+            max_queued = 24
+            max_turn_secs = 90
+            max_tool_calls = 30
+            "#,
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+        // When `subagents.profile` is None and routing is enabled, falls back to `routing.fast_profile`.
+        assert_eq!(parsed.default_subagent_profile(), Some("fast"));
+
+        let explicit: Config = toml::from_str(
+            r#"
+            [profiles.fast]
+            thought_level = "low"
+            [profiles.deep]
+            thought_level = "high"
+            [routing]
+            enabled = true
+            fast_profile = "fast"
+            deep_profile = "deep"
+            [subagents]
+            profile = "deep"
+            max_tool_calls = 0
+            "#,
+        )
+        .unwrap();
+        explicit.validate().unwrap();
+        assert_eq!(explicit.default_subagent_profile(), Some("deep"));
+
+        for bad in [
+            "[mcp.subagents]\ncommand = \"/bin/true\"\n",
+            "[mcp.Subagents]\ncommand = \"/bin/true\"\n",
+            "[subagents]\nmax_concurrent = 0\n",
+            "[subagents]\nmax_concurrent = 17\n",
+            "[subagents]\nmax_queued = 0\n",
+            "[subagents]\nmax_queued = 65\n",
+            "[subagents]\nmax_turn_secs = 0\n",
+            "[subagents]\nmax_turn_secs = 0.5\n",
+            "[subagents]\nmax_turn_secs = 3601\n",
+            "[subagents]\nmax_tool_calls = 501\n",
+            "[subagents]\nprofile = \"missing\"\n",
+        ] {
+            let cfg: Config = toml::from_str(bad).unwrap();
+            assert!(cfg.validate().is_err(), "{bad} should fail validation");
+        }
     }
 }
