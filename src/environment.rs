@@ -1801,12 +1801,23 @@ mod tests {
         std::fs::set_permissions(&fake_xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let existing_path = std::env::var("PATH").unwrap_or_default();
-        let output = std::process::Command::new(&wrapper)
-            .arg("https://accounts.google.com/o/oauth2/auth")
-            .env("BROWSER", &wrapper)
-            .env("PATH", format!("{}:{existing_path}", fake_bin.display()))
-            .output()
-            .unwrap();
+        let mut attempts = 0u8;
+        let output = loop {
+            match std::process::Command::new("/bin/sh")
+                .arg(&wrapper)
+                .arg("https://accounts.google.com/o/oauth2/auth")
+                .env("BROWSER", &wrapper)
+                .env("PATH", format!("{}:{existing_path}", fake_bin.display()))
+                .output()
+            {
+                Ok(out) => break out,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 10 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("failed to run wrapper: {e}"),
+            }
+        };
         assert!(output.status.success(), "{output:?}");
         assert!(
             output.stdout.is_empty(),

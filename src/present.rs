@@ -2267,42 +2267,55 @@ pub async fn notify(
         if !config.notifications || config.notifier.is_empty() {
             return None;
         }
-        let mut command = Command::new(&config.notifier[0]);
-        command
-            .args(&config.notifier[1..])
-            .arg(format!("--app-name={APP_NAME}"))
-            .arg(match urgency {
-                Urgency::Low => "--urgency=low",
-                Urgency::Normal => "--urgency=normal",
-            })
-            .arg("--print-id");
-        if is_notify_send(&config.notifier[0]) {
-            command.arg("--hint=boolean:x-hey-computer:true");
-        }
-        if expire_ms > 0 {
-            command.arg(format!("--expire-time={expire_ms}"));
-        }
-        if let Some(id) = replaces {
-            command.arg(format!("--replace-id={id}"));
-        }
-        command
-            .arg("--")
-            .arg(summary)
-            .arg(body)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let output = match tokio::time::timeout(NOTIFIER_TIMEOUT, command.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => {
-                tracing::warn!("cannot run the notifier {}: {e}", config.notifier[0]);
-                return None;
+        let build_cmd = || {
+            let mut command = Command::new(&config.notifier[0]);
+            command
+                .args(&config.notifier[1..])
+                .arg(format!("--app-name={APP_NAME}"))
+                .arg(match urgency {
+                    Urgency::Low => "--urgency=low",
+                    Urgency::Normal => "--urgency=normal",
+                })
+                .arg("--print-id");
+            if is_notify_send(&config.notifier[0]) {
+                command.arg("--hint=boolean:x-hey-computer:true");
             }
-            Err(_) => {
-                tracing::warn!("the notifier took longer than {NOTIFIER_TIMEOUT:?}");
-                return None;
+            if expire_ms > 0 {
+                command.arg(format!("--expire-time={expire_ms}"));
+            }
+            if let Some(id) = replaces {
+                command.arg(format!("--replace-id={id}"));
+            }
+            command
+                .arg("--")
+                .arg(summary)
+                .arg(body)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            command
+        };
+
+        let mut attempts = 0u8;
+        let output = loop {
+            let mut command = build_cmd();
+            match tokio::time::timeout(NOTIFIER_TIMEOUT, command.output()).await {
+                Ok(Ok(output)) => break output,
+                Ok(Err(e))
+                    if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 10 =>
+                {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("cannot run the notifier {}: {e}", config.notifier[0]);
+                    return None;
+                }
+                Err(_) => {
+                    tracing::warn!("the notifier took longer than {NOTIFIER_TIMEOUT:?}");
+                    return None;
+                }
             }
         };
         if !output.status.success() {
@@ -2359,11 +2372,18 @@ impl ActionChildGuard {
             .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true);
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                tracing::warn!("cannot run the notifier {program_name}: {e}");
-                return None;
+        let mut attempts = 0u8;
+        let mut child = loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 20 => {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => {
+                    tracing::warn!("cannot run the notifier {program_name}: {e}");
+                    return None;
+                }
             }
         };
         let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
@@ -6859,7 +6879,7 @@ Here is the first sentence. Second sentence with *emphasis* and [image: chart](h
 
         let mut config = PresentConfig {
             notifier: vec![fake_notify_send.to_string_lossy().into_owned()],
-            clipboard: vec!["/bin/true".to_string()],
+            clipboard: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
             ..PresentConfig::default()
         };
         let id = notify(&config, "Title", "Body", Urgency::Normal, 0, None).await;
