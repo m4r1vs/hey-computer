@@ -1331,6 +1331,87 @@ pub fn run_openhue_plan(plan: &HueCommandPlan, timeout: Duration) -> Result<()> 
 }
 
 /* --------------------------------------------------------------------------
+Persistent Clipboard Copy (`present.clipboard`, e.g. `wl-copy`)
+-------------------------------------------------------------------------- */
+
+/// Pipe `text` verbatim to `clipboard_cmd` (e.g. `wl-copy`) without inheriting
+/// open pipes into a forked Wayland clipboard owner, so copied text survives
+/// closing `hey-computer-viewer`.
+pub fn copy_to_clipboard_persistent(
+    clipboard_cmd: &[String],
+    text: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let Some((program, args)) = clipboard_cmd.split_first() else {
+        bail!("no clipboard program configured");
+    };
+    if program.trim().is_empty() {
+        bail!("present.clipboard program is empty");
+    }
+
+    let mut child = Command::new(program)
+        .args(args)
+        .process_group(0)
+        .stdin(Stdio::piped())
+        // Never pipe stdout/stderr: Wayland clipboard owners like `wl-copy`
+        // fork a background process that inherits open FDs and would block
+        // readers or die from SIGPIPE when the viewer exits.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawning `{program}`"))?;
+
+    let pid = child.id() as i32;
+    let stdin_pipe = child.stdin.take();
+    let payload = text.as_bytes().to_vec();
+    let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
+        if let Some(mut stdin) = stdin_pipe {
+            if let Err(err) = stdin.write_all(&payload)
+                && err.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                return Err(err);
+            }
+            let _ = stdin.flush();
+        }
+        Ok(())
+    });
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    if pid > 0 {
+                        unsafe {
+                            libc::kill(-pid, libc::SIGKILL);
+                        }
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = writer_handle.join();
+                    bail!("`{program}` timed out after {timeout:?}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => {
+                let _ = writer_handle.join();
+                return Err(err).with_context(|| format!("waiting for `{program}`"));
+            }
+        }
+    };
+
+    if let Ok(Err(err)) = writer_handle.join() {
+        return Err(err).with_context(|| format!("writing to `{program}`"));
+    }
+
+    if !status.success() {
+        bail!("`{program}` exited with {status}");
+    }
+    Ok(())
+}
+
+/* --------------------------------------------------------------------------
 Atomic Filesystem Helpers
 -------------------------------------------------------------------------- */
 

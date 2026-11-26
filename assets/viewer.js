@@ -708,6 +708,33 @@
     return sel ? String(sel.toString() || "").trim() : "";
   }
 
+  function getNativeCopySelection() {
+    const active = document.activeElement;
+    if (
+      active &&
+      (active.tagName === "TEXTAREA" ||
+        (active.tagName === "INPUT" && !NON_TEXT_INPUT_TYPES[String(active.type || "text").toLowerCase()])) &&
+      typeof active.selectionStart === "number" &&
+      typeof active.selectionEnd === "number" &&
+      active.selectionEnd > active.selectionStart
+    ) {
+      return String(active.value || "").slice(active.selectionStart, active.selectionEnd);
+    }
+    const sel = window.getSelection ? window.getSelection() : null;
+    return sel ? String(sel.toString() || "") : "";
+  }
+
+  // Intercept native Ctrl+C / context-menu copies and hand them to the host's
+  // persistent clipboard program (`wl-copy`) so closing the viewer on Wayland
+  // does not drop clipboard ownership.
+  document.addEventListener("copy", function (ev) {
+    const selected = getNativeCopySelection();
+    if (!selected) return;
+    if (hostPost({ type: "copy", text: selected, silent: true })) {
+      ev.preventDefault();
+    }
+  });
+
   function copySelectionOrMarkdown(forceFull) {
     const selected = forceFull ? "" : getSelectedText();
     if (selected) {

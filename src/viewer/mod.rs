@@ -43,8 +43,9 @@ use webkit6::{
 };
 
 use self::actions::{
-    SnippetOutcome, approve_distill_changes, execute_snippet_with_timeout, plan_openhue_commands,
-    run_openhue_plan, save_skill_files, save_to_vault, toggle_vault_journal_task,
+    SnippetOutcome, approve_distill_changes, copy_to_clipboard_persistent,
+    execute_snippet_with_timeout, plan_openhue_commands, run_openhue_plan, save_skill_files,
+    save_to_vault, toggle_vault_journal_task,
 };
 use self::loader::{
     ViewerThread, load_activated_day_plan_dates, load_schedule_detail, load_schedule_summaries,
@@ -247,6 +248,7 @@ struct AppState {
     theme_monitors: RefCell<Vec<gio::FileMonitor>>,
     tts_cancel: RefCell<Option<tokio::sync::watch::Sender<bool>>>,
     tts_gen: Cell<u64>,
+    clipboard_workers: RefCell<Vec<std::thread::JoinHandle<()>>>,
 }
 
 const START_BRIDGE_JS: &str = r#"
@@ -469,6 +471,8 @@ struct IncomingMessage {
     #[serde(default)]
     label: Option<String>,
     #[serde(default)]
+    silent: bool,
+    #[serde(default)]
     code: Option<String>,
     #[serde(default)]
     lang: Option<String>,
@@ -683,6 +687,7 @@ pub fn run() -> Result<()> {
         theme_monitors: RefCell::new(Vec::new()),
         tts_cancel: RefCell::new(None),
         tts_gen: Cell::new(0),
+        clipboard_workers: RefCell::new(Vec::new()),
     });
 
     let app = gtk4::Application::builder()
@@ -697,6 +702,13 @@ pub fn run() -> Result<()> {
 
     // Pass empty argv so GTK does not reject clap's custom flags (`--turn-id`, `--snapshot`, etc.).
     let exit = app.run_with_args::<&str>(&[]);
+
+    // Drain any in-flight `wl-copy` / clipboard worker threads before exiting so
+    // copying right before `q`/`Esc` still completes handoff to the background owner.
+    for handle in state.clipboard_workers.borrow_mut().drain(..) {
+        let _ = handle.join();
+    }
+
     if exit != glib::ExitCode::SUCCESS {
         std::process::exit(1);
     }
@@ -1101,22 +1113,63 @@ fn handle_ipc_message(
     match msg.msg_type.as_str() {
         "copy" => {
             let text = msg.text.as_deref().unwrap_or("");
-            if let Some(display) = gdk::Display::default() {
+            let clipboard_cmd = state.config.present.clipboard.clone();
+            if !clipboard_cmd.is_empty() {
+                // Reap completed clipboard threads so the handle list stays tiny.
+                let mut workers = state.clipboard_workers.borrow_mut();
+                let mut i = 0;
+                while i < workers.len() {
+                    if workers[i].is_finished() {
+                        let _ = workers.swap_remove(i).join();
+                    } else {
+                        i += 1;
+                    }
+                }
+                let text_owned = text.to_string();
+                match std::thread::Builder::new()
+                    .name("hc-viewer-clipboard".to_string())
+                    .spawn(move || {
+                        if let Err(err) = copy_to_clipboard_persistent(
+                            &clipboard_cmd,
+                            &text_owned,
+                            Duration::from_secs(2),
+                        ) {
+                            tracing::debug!(
+                                "persistent clipboard command failed, falling back to GTK clipboard: {err:#}"
+                            );
+                            glib::idle_add_once(move || {
+                                if let Some(display) = gdk::Display::default() {
+                                    display.clipboard().set_text(&text_owned);
+                                }
+                            });
+                        }
+                    }) {
+                    Ok(handle) => workers.push(handle),
+                    Err(err) => {
+                        tracing::debug!("failed to spawn clipboard worker: {err}");
+                        if let Some(display) = gdk::Display::default() {
+                            display.clipboard().set_text(text);
+                        }
+                    }
+                }
+            } else if let Some(display) = gdk::Display::default() {
                 display.clipboard().set_text(text);
             }
-            let label = msg
-                .label
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("Copied to clipboard");
-            dispatch_to_js(
-                webview,
-                &json!({
-                    "type": "toast",
-                    "message": label,
-                    "kind": "ok"
-                }),
-            );
+            if !msg.silent {
+                let label = msg
+                    .label
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("Copied to clipboard");
+                dispatch_to_js(
+                    webview,
+                    &json!({
+                        "type": "toast",
+                        "message": label,
+                        "kind": "ok"
+                    }),
+                );
+            }
         }
         "find_search" => {
             if let Some(fc) = webview.find_controller() {
@@ -3725,5 +3778,66 @@ mod tests {
             std::slice::from_ref(&error_widget),
             &[]
         ));
+    }
+
+    #[test]
+    fn copy_to_clipboard_persistent_handles_forked_owner_errors_and_timeouts() {
+        use super::actions::copy_to_clipboard_persistent;
+
+        let dir = std::env::temp_dir().join(format!(
+            "hc-viewer-clipboard-{}-{}",
+            std::process::id(),
+            super::NEXT_ID.fetch_add(1, super::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let captured = dir.join("captured.txt");
+
+        // 1. Mimic `wl-copy`: read stdin verbatim, fork a background holder, and exit 0.
+        let ok_cmd = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("cat > '{}' ; (sleep 1 &) ; exit 0", captured.display()),
+        ];
+        let started = std::time::Instant::now();
+        copy_to_clipboard_persistent(
+            &ok_cmd,
+            "  indented line\nsecond line  ",
+            Duration::from_secs(2),
+        )
+        .expect("persistent clipboard copy succeeds without waiting on forked owner");
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "blocked on forked background clipboard owner"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&captured).unwrap(),
+            "  indented line\nsecond line  "
+        );
+
+        // 2. Empty command returns an error so the viewer falls back to GTK clipboard.
+        assert!(copy_to_clipboard_persistent(&[], "hello", Duration::from_secs(1)).is_err());
+
+        // 3. Non-zero exit returns an error.
+        let fail_cmd = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 3".to_string(),
+        ];
+        assert!(copy_to_clipboard_persistent(&fail_cmd, "hello", Duration::from_secs(1)).is_err());
+
+        // 4. Hanging clipboard program times out cleanly.
+        let hang_cmd = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 5".to_string(),
+        ];
+        let err = copy_to_clipboard_persistent(&hang_cmd, "hello", Duration::from_millis(120))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected timeout error: {err:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
