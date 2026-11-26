@@ -6,12 +6,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::bridge::config::{Allowlist, BridgeConfig, normalize_identifier};
@@ -1056,11 +1057,19 @@ fn stored_to_context_message(m: &crate::bridge::protocol::StoredMessage) -> Cont
 fn spawn_signal_desktop_sync_task(
     config: BridgeConfig,
     db_path: PathBuf,
+    sync_lock: Arc<Mutex<()>>,
     reply: Option<oneshot::Sender<BridgeEvent>>,
 ) {
-    tokio::task::spawn_blocking(move || {
-        let res = BridgeStore::open(&db_path)
-            .and_then(|mut store| signal_desktop::sync_signal_desktop(&config, &mut store));
+    tokio::spawn(async move {
+        let _guard = sync_lock.lock().await;
+        let res = tokio::task::spawn_blocking(move || {
+            BridgeStore::open(&db_path)
+                .and_then(|mut store| signal_desktop::sync_signal_desktop(&config, &mut store))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Signal Desktop sync worker panicked: {e}"))
+        .and_then(|r| r);
+
         match res {
             Ok(summary) => {
                 if summary.messages_imported > 0 {
@@ -1114,8 +1123,14 @@ pub async fn serve(
         }
     };
 
+    let sync_lock = Arc::new(Mutex::new(()));
     if config.resolved_signal_desktop_dir().is_some() {
-        spawn_signal_desktop_sync_task(config.clone(), core.db_path.clone(), None);
+        spawn_signal_desktop_sync_task(
+            config.clone(),
+            core.db_path.clone(),
+            sync_lock.clone(),
+            None,
+        );
     }
 
     let (raw_tx, mut raw_rx) = mpsc::channel::<RawAdapterEvent>(512);
@@ -1202,6 +1217,7 @@ pub async fn serve(
                         spawn_signal_desktop_sync_task(
                             core.config.clone(),
                             core.db_path.clone(),
+                            sync_lock.clone(),
                             Some(reply),
                         );
                     }
@@ -1212,6 +1228,7 @@ pub async fn serve(
                     spawn_signal_desktop_sync_task(
                         core.config.clone(),
                         core.db_path.clone(),
+                        sync_lock.clone(),
                         None,
                     );
                 }

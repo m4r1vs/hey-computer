@@ -9,9 +9,12 @@
 use std::collections::HashSet;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 
 use crate::bridge::config::{ensure_private_dir, normalize_identifier};
 pub use crate::bridge::protocol::{ChatSummary, Platform, SearchHit, StoredMessage};
@@ -176,12 +179,13 @@ impl BridgeStore {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(path, flags)
             .with_context(|| format!("opening bridge SQLite store {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(10))
+            .context("setting bridge SQLite busy_timeout")?;
 
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
+             PRAGMA foreign_keys = ON;",
         )
         .context("configuring bridge SQLite PRAGMAs")?;
 
@@ -209,11 +213,10 @@ impl BridgeStore {
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(path, flags)
             .with_context(|| format!("opening bridge database read-only at {}", path.display()))?;
-        conn.execute_batch(
-            "PRAGMA query_only = ON;
-             PRAGMA busy_timeout = 5000;",
-        )
-        .context("configuring read-only bridge SQLite PRAGMAs")?;
+        conn.busy_timeout(Duration::from_secs(10))
+            .context("setting read-only bridge SQLite busy_timeout")?;
+        conn.execute_batch("PRAGMA query_only = ON;")
+            .context("configuring read-only bridge SQLite PRAGMAs")?;
         Ok(Self { conn })
     }
 
@@ -254,7 +257,9 @@ impl BridgeStore {
         if meta.chat_id.trim().is_empty() {
             return Ok(());
         }
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         upsert_chat_meta_tx(&tx, meta)?;
         tx.commit()?;
         Ok(())
@@ -265,7 +270,9 @@ impl BridgeStore {
         if items.is_empty() {
             return Ok(());
         }
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for item in items {
             if !item.chat_id.trim().is_empty() {
                 upsert_chat_meta_tx(&tx, item)?;
@@ -286,7 +293,9 @@ impl BridgeStore {
         if msgs.is_empty() {
             return Ok(0);
         }
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut inserted_or_hydrated = 0usize;
         let mut touched_chats: HashSet<(Platform, String)> = HashSet::new();
 
