@@ -6,12 +6,30 @@
 
 ---
 
-## 1. Viewer, Shortcuts & Desktop UX
+## 1. Bugs & Fixes
 
-- [ ] `[Upstream]` `[Config]` **Quick-reopen shortcut & persistent viewer window (`Ctrl+Super+A`).**
-  - Add a `Ctrl+Super+A` shortcut to open the last opened thread at its exact scroll/reading position.
-  - Consider making `Cmd+Q` / `Esc` hide the GTK app instead of closing it.
-  - Evaluate placing the `hey-computer` frontend in a dedicated Hyprland special workspace.
+- [x] `[Upstream]` **Hide system prompts in the GTK viewer for scheduled & notification runs.**
+  - Morning brief and other scheduled/repeating actions display the full system prompt covering most of the screen when opened in the GTK viewer — hide it entirely for scheduled/repeating runs.
+  - Notification-acting has the same issue: a simple notification shows the full `<notification_task>` + `<untrusted_notification>` + `<untrusted_chat_context>` prompt wrapper (see Obsidian note `[[Hey Computer Notification Prompt Bug]]`).
+- [x] `[Upstream]` `[Config]` **Fix notification hold-and-enrich timing and audio sync.**
+  - The drafted reply is not always ready before the hold-back window expires — either always use an extremely fast model for notification triage/drafting or slightly increase the hold window.
+  - The notification sound for a held-back notification currently plays immediately; bring it back in sync with when the notification is actually released.
+- [x] `[Config]` **Fix Waybar `background` state styling.**
+  - When `hey-computer` background work is active (`waybar-hey-computer` `background` class), the module renders with an ugly background in Waybar.
+- [x] `[Config]` `[Upstream]` **Do not persist `hey-computer` notifications in SwayNC history.**
+  - Prevent `hey-computer` notifications from staying persisted in SwayNC's notification panel.
+- [x] `[Upstream]` **Fix clipboard clearing when closing the GTK visualizer.**
+  - Copying text and then closing the visualizer clears the clipboard (likely Wayland clipboard ownership); resolved by routing viewer copies (including native `Ctrl+C`) through `present.clipboard` (`wl-copy`) with GTK fallback.
+- [ ] `[Upstream]` **Auto-fix failed widget creations before rendering.**
+  - When widget creation fails, render/validate it and auto-fix any errors before displaying it instead of showing an error.
+
+---
+
+## 2. Viewer, Shortcuts & Desktop UX
+
+- [x] `[Upstream]` `[Config]` **Quick-reopen shortcut & persistent viewer window (`Ctrl+Super+A`).**
+  - Implemented `hey-computer view --resume` / `hey-computer-viewer --resume` persisting last viewed thread/schedule and exact scroll position in `<state_dir>/viewer_last.json` (`0600`), and bound `SUPER + CTRL + a` to it in `~/NixConfig/home-manager/modules/hyprland.nix`.
+  - *(Optional follow-ups)* Consider making `Cmd+Q` / `Esc` hide the GTK app instead of closing it, and evaluate a dedicated Hyprland special workspace.
 - [ ] `[Upstream]` **Share / export answers in multiple formats.**
   - Add ability to share/export answers as Markdown (and other formats), including via a keyboard shortcut.
 - [ ] `[Config]` **Disable `hey-computer` in super-light performance mode.**
@@ -19,8 +37,10 @@
 
 ---
 
-## 2. New Features & Workflows
+## 3. New Features & Workflows
 
+- [x] `[Upstream]` `[Config]` **`plan-my-day` workflow.**
+  - Especially for workdays: build a *"roter Faden"* for the day with concrete tasks and sub-TODOs, periodically reassess progress throughout the day, and optionally block time in Google Calendar for specific tasks.
 - [ ] `[npu-dictate]` `[Config]` **Hotword detection & TTS barge-in.**
   - Always-on, local detection of `"Hey Computer"`, then recording until silence (VAD) and transcribing with the existing `npu-dictate` backend.
   - Evaluate small wake-word models such as `openWakeWord` (custom phrase training) running on CPU or NPU; likely belongs in `npu-dictate` rather than `hey-computer`, with no daemon dependencies.
@@ -32,7 +52,7 @@
 
 ---
 
-## 3. Integrations & Tooling
+## 4. Integrations & Tooling
 
 - [ ] `[Config]` `[Upstream]` **`spotify_player` integration & Spotify info shortcut.**
   - Add `spotify_player` support/integration to `hey-computer` so the agent can search for tracks/albums and play them.
@@ -48,7 +68,7 @@
 
 ---
 
-## 4. Architecture, Packaging & Research
+## 5. Architecture, Packaging & Research
 
 - [ ] `[Upstream]` `[Config]` **Consolidate Nix definitions into `hey-computer`.**
   - Move `hey-computer`-related Nix definitions currently living in `~/NixConfig` into the `hey-computer` repository where it makes sense.
@@ -61,3 +81,11 @@
   - Research a browser extension so `hey-computer` better understands active browser pages and context.
 - [ ] `[Obsidian]` **Structure `hey-computer` ideas better in Obsidian.**
   - Organize `hey-computer` notes/ideas into a cleaner structure inside the vault.
+
+---
+
+## Recently Completed
+
+- [x] Add `hey-computer` to the Whisper glossary.
+- [x] Add `playerctl` support to `hey-computer`.
+- [x] Investigate duplicate Morning Brief appearing twice.
