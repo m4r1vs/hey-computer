@@ -174,7 +174,7 @@
 
         postFixup = ''
           wrapProgram $out/bin/hey-computer-bridge \
-            --prefix PATH : "${pkgs.lib.makeBinPath [baileysReader pkgs.signal-cli]}"
+            --prefix PATH : "${pkgs.lib.makeBinPath [baileysReader pkgs.signal-cli pkgs.qrencode]}"
         '';
 
         meta = with pkgs.lib; {

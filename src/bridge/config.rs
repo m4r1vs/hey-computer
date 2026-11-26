@@ -166,11 +166,11 @@ impl BridgeConfig {
         if self.max_message_age_secs == 0 || self.max_message_age_secs > 86_400 {
             bail!("max_message_age_secs must be between 1 and 86400");
         }
-        if self.signal.enabled
-            && self.signal.account.is_none()
-            && self.signal.account_file.is_none()
+        if let Some(acct) = &self.signal.account
+            && !acct.trim().is_empty()
+            && normalize_e164(acct).is_none()
         {
-            bail!("signal.enabled = true requires signal.account or signal.account_file");
+            bail!("signal.account must be a valid E.164 phone number");
         }
         Ok(())
     }
@@ -321,22 +321,100 @@ impl Allowlist {
     }
 }
 
-/// Load the Signal account E.164 number from `account_file` (preferred) or `account`.
-pub fn load_signal_account(cfg: &SignalConfig) -> Result<String> {
-    let raw = if let Some(path) = &cfg.account_file {
+/// Resolve the Signal account E.164 number from `account_file`, `account`, or
+/// `<signal_cfg_dir>/data/accounts.json` written by `signal-cli link`.
+/// Returns `Ok(None)` when no explicit account is configured and `signal-cli`
+/// has not been linked yet.
+pub fn resolve_signal_account(
+    cfg: &SignalConfig,
+    signal_cfg_dir: Option<&Path>,
+) -> Result<Option<String>> {
+    if let Some(path) = &cfg.account_file {
         let contents = read_bounded_secret_file(path)?;
-        contents
+        if let Some(line) = contents
             .lines()
             .map(|l| l.split('#').next().unwrap_or("").trim())
             .find(|l| !l.is_empty())
-            .map(ToString::to_string)
-            .with_context(|| format!("no account found in {}", path.display()))?
-    } else if let Some(acct) = &cfg.account {
-        acct.trim().to_string()
-    } else {
-        bail!("signal.account or signal.account_file must be set");
+        {
+            let e164 = normalize_e164(line).with_context(|| {
+                format!(
+                    "signal account in {} must be a valid E.164 phone number",
+                    path.display()
+                )
+            })?;
+            return Ok(Some(e164));
+        }
+    }
+    if let Some(acct) = &cfg.account
+        && !acct.trim().is_empty()
+    {
+        let e164 =
+            normalize_e164(acct).context("signal account must be a valid E.164 phone number")?;
+        return Ok(Some(e164));
+    }
+    if let Some(dir) = signal_cfg_dir
+        && let Some(discovered) = discover_linked_signal_account(dir)
+    {
+        return Ok(Some(discovered));
+    }
+    Ok(None)
+}
+
+/// Inspect `<signal_cfg_dir>/data/accounts.json` created by `signal-cli link`
+/// and return the first valid E.164 account number if present.
+pub fn discover_linked_signal_account(signal_cfg_dir: &Path) -> Option<String> {
+    let accounts_path = signal_cfg_dir.join("data").join("accounts.json");
+    let raw = read_bounded_secret_file(&accounts_path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let accounts = parsed.get("accounts")?.as_array()?;
+    for entry in accounts {
+        if let Some(num) = entry.get("number").and_then(|v| v.as_str())
+            && let Some(e164) = normalize_e164(num)
+        {
+            return Some(e164);
+        }
+    }
+    None
+}
+
+/// RAII lockfile marker (`<dir>/.pairing.lock`) held during interactive QR
+/// pairing so a running `hey-computer-messenger-bridge` daemon waits quietly
+/// until pairing completes and then attaches automatically.
+pub struct PairingLockGuard {
+    path: PathBuf,
+}
+
+impl PairingLockGuard {
+    pub fn acquire(dir: &Path) -> Self {
+        let path = dir.join(".pairing.lock");
+        let _ = std::fs::write(&path, format!("{}\n", std::process::id()));
+        Self { path }
+    }
+}
+
+impl Drop for PairingLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Whether `<dir>/.pairing.lock` currently belongs to a live pairing process.
+pub fn is_pairing_in_progress(dir: &Path) -> bool {
+    let lock_path = dir.join(".pairing.lock");
+    let Ok(raw) = std::fs::read_to_string(&lock_path) else {
+        return false;
     };
-    normalize_e164(&raw).context("signal account must be a valid E.164 phone number")
+    if let Ok(pid) = raw.trim().parse::<libc::pid_t>()
+        && pid > 0
+    {
+        // SAFETY: kill(pid, 0) checks process existence without sending a signal.
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+            return true;
+        }
+    }
+    let _ = std::fs::remove_file(&lock_path);
+    false
 }
 
 /// Strip device suffix (`:NN`) from a WhatsApp JID (`1234:2@s.whatsapp.net` -> `1234@s.whatsapp.net`).
@@ -483,5 +561,35 @@ mod tests {
         assert!(list.matches_any(["4915100000001@s.whatsapp.net"]));
         assert!(list.matches_any(["550e8400-e29b-41d4-a716-446655440000"]));
         assert!(!list.matches_any(["+4915100000099"]));
+    }
+
+    #[test]
+    fn resolves_signal_account_from_commented_file_and_accounts_json() {
+        let dir = std::env::temp_dir().join(format!("hc-sig-acct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = dir.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let acct_file = dir.join("signal-account");
+        std::fs::write(&acct_file, "# leave commented to auto-discover\n\n").unwrap();
+
+        let cfg = SignalConfig {
+            enabled: true,
+            account_file: Some(acct_file),
+            ..SignalConfig::default()
+        };
+        assert_eq!(resolve_signal_account(&cfg, Some(&dir)).unwrap(), None);
+
+        std::fs::write(
+            data_dir.join("accounts.json"),
+            r#"{"accounts":[{"number":"+4915100000042","uuid":"550e8400-e29b-41d4-a716-446655440000"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_signal_account(&cfg, Some(&dir)).unwrap().as_deref(),
+            Some("+4915100000042")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

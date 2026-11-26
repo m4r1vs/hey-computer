@@ -23,7 +23,8 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
 
 use crate::bridge::config::{
-    BridgeConfig, ensure_private_dir, load_signal_account, normalize_e164, normalize_identifier,
+    BridgeConfig, PairingLockGuard, ensure_private_dir, is_pairing_in_progress, normalize_e164,
+    normalize_identifier, resolve_signal_account,
 };
 use crate::bridge::context::{InboundRawMessage, RawAdapterEvent};
 use crate::bridge::protocol::{MAX_BRIDGE_LINE, Platform, PlatformState};
@@ -256,20 +257,6 @@ pub async fn run(
     tx: mpsc::Sender<RawAdapterEvent>,
     mut stop: watch::Receiver<bool>,
 ) {
-    let own_e164 = match load_signal_account(&config.signal) {
-        Ok(acct) => acct,
-        Err(e) => {
-            let _ = tx
-                .send(RawAdapterEvent::PlatformStateChanged {
-                    platform: Platform::Signal,
-                    state: PlatformState::AuthRequired,
-                    detail: Some(format!("Signal account configuration error: {e:#}")),
-                })
-                .await;
-            return;
-        }
-    };
-
     let cfg_dir = match signal_config_dir(&config) {
         Ok(dir) => dir,
         Err(e) => {
@@ -299,12 +286,69 @@ pub async fn run(
     };
 
     let (program, base_args) = signal_program(&config);
+    let uses_default_cli = config.signal.command.is_empty();
+    let accounts_json = cfg_dir.join("data").join("accounts.json");
     let mut backoff_secs = 2u64;
 
     loop {
         if *stop.borrow() {
             break;
         }
+
+        let mut resolved_account = match resolve_signal_account(&config.signal, Some(&cfg_dir)) {
+            Ok(acct) => acct,
+            Err(e) => {
+                let _ = tx
+                    .send(RawAdapterEvent::PlatformStateChanged {
+                        platform: Platform::Signal,
+                        state: PlatformState::AuthRequired,
+                        detail: Some(format!("Signal account configuration error: {e:#}")),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        if is_pairing_in_progress(&cfg_dir)
+            || resolved_account.is_none()
+            || (uses_default_cli && !accounts_json.is_file())
+        {
+            let _ = tx
+                .send(RawAdapterEvent::PlatformStateChanged {
+                    platform: Platform::Signal,
+                    state: PlatformState::AuthRequired,
+                    detail: Some(
+                        "Signal device not linked yet — run `hey-computer-bridge pair signal --name hey-computer`."
+                            .to_string(),
+                    ),
+                })
+                .await;
+            while !*stop.borrow() {
+                if wait_or_stop(Duration::from_secs(2), &mut stop).await {
+                    return;
+                }
+                if is_pairing_in_progress(&cfg_dir) {
+                    continue;
+                }
+                if uses_default_cli && !accounts_json.is_file() {
+                    continue;
+                }
+                if let Ok(Some(acct)) = resolve_signal_account(&config.signal, Some(&cfg_dir)) {
+                    resolved_account = Some(acct);
+                    break;
+                }
+            }
+            if *stop.borrow() {
+                break;
+            }
+        }
+
+        let Some(own_e164) = resolved_account else {
+            continue;
+        };
+        let accounts_mtime_before = std::fs::metadata(&accounts_json)
+            .and_then(|m| m.modified())
+            .ok();
 
         let _ = std::fs::remove_file(&sock_path);
         let _ = tx
@@ -407,17 +451,27 @@ pub async fn run(
                             platform: Platform::Signal,
                             state: PlatformState::AuthRequired,
                             detail: Some(
-                                "Signal account is not linked; run `hey-computer-bridge pair signal`."
+                                "Signal account is not linked; run `hey-computer-bridge pair signal --name hey-computer`."
                                     .to_string(),
                             ),
                         })
                         .await;
                     while !*stop.borrow() {
-                        if stop.changed().await.is_err() {
+                        if wait_or_stop(Duration::from_secs(2), &mut stop).await {
+                            return;
+                        }
+                        if is_pairing_in_progress(&cfg_dir) {
+                            continue;
+                        }
+                        let mtime_now = std::fs::metadata(&accounts_json)
+                            .and_then(|m| m.modified())
+                            .ok();
+                        if mtime_now.is_some() && mtime_now != accounts_mtime_before {
+                            backoff_secs = 2;
                             break;
                         }
                     }
-                    return;
+                    continue;
                 }
 
                 tracing::warn!("signal-cli socket failed to become ready: {e:#}");
@@ -884,6 +938,7 @@ fn extract_attachment_placeholder(msg: &Value) -> Option<String> {
 /// (`hey-computer-bridge pair signal --name hey-computer`).
 pub async fn pair_signal(config: &BridgeConfig, device_name: &str) -> Result<()> {
     let cfg_dir = signal_config_dir(config)?;
+    let _pair_lock = PairingLockGuard::acquire(&cfg_dir);
     let (program, base_args) = signal_program(config);
 
     let mut child = Command::new(&program)

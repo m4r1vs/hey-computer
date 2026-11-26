@@ -16,7 +16,8 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
 
 use crate::bridge::config::{
-    BridgeConfig, ensure_private_dir, normalize_e164, normalize_identifier, normalize_jid,
+    BridgeConfig, PairingLockGuard, ensure_private_dir, is_pairing_in_progress, normalize_e164,
+    normalize_identifier, normalize_jid,
 };
 use crate::bridge::context::{InboundRawMessage, RawAdapterEvent};
 use crate::bridge::protocol::{MAX_BRIDGE_LINE, Platform, PlatformState};
@@ -115,12 +116,40 @@ pub async fn run(
     };
 
     let (program, base_args) = reader_program(&config);
+    let uses_default_reader = config.whatsapp.reader_command.is_empty();
+    let creds_path = session_dir.join("creds.json");
     let mut backoff_secs = 2u64;
 
     loop {
         if *stop.borrow() {
             break;
         }
+
+        if uses_default_reader && (!creds_path.is_file() || is_pairing_in_progress(&session_dir)) {
+            let _ = tx
+                .send(RawAdapterEvent::PlatformStateChanged {
+                    platform: Platform::Whatsapp,
+                    state: PlatformState::AuthRequired,
+                    detail: Some(
+                        "WhatsApp device not linked yet — run `hey-computer-bridge pair whatsapp`."
+                            .to_string(),
+                    ),
+                })
+                .await;
+            while !*stop.borrow() && (!creds_path.is_file() || is_pairing_in_progress(&session_dir))
+            {
+                if wait_or_stop(Duration::from_secs(2), &mut stop).await {
+                    return;
+                }
+            }
+            if *stop.borrow() {
+                break;
+            }
+        }
+
+        let creds_mtime_before = std::fs::metadata(&creds_path)
+            .and_then(|m| m.modified())
+            .ok();
 
         let _ = tx
             .send(RawAdapterEvent::PlatformStateChanged {
@@ -299,14 +328,25 @@ pub async fn run(
             break;
         }
         if auth_required {
-            tracing::warn!("whatsapp adapter stopped due to auth_required (401)");
-            // Wait until shutdown so we do not tight-loop reconnect while unlinked.
+            tracing::warn!(
+                "whatsapp adapter paused due to auth_required (401); waiting for re-pair"
+            );
             while !*stop.borrow() {
-                if stop.changed().await.is_err() {
+                if wait_or_stop(Duration::from_secs(2), &mut stop).await {
+                    return;
+                }
+                if is_pairing_in_progress(&session_dir) {
+                    continue;
+                }
+                let creds_mtime_now = std::fs::metadata(&creds_path)
+                    .and_then(|m| m.modified())
+                    .ok();
+                if creds_mtime_now.is_some() && creds_mtime_now != creds_mtime_before {
+                    backoff_secs = 2;
                     break;
                 }
             }
-            break;
+            continue;
         }
 
         tracing::warn!(
@@ -436,6 +476,7 @@ fn normalize_baileys_message(
 /// Interactive one-time QR pairing for WhatsApp (`hey-computer-bridge pair whatsapp`).
 pub async fn pair_whatsapp(config: &BridgeConfig) -> Result<()> {
     let session_dir = whatsapp_session_dir(config)?;
+    let _pair_lock = PairingLockGuard::acquire(&session_dir);
     let (program, base_args) = reader_program(config);
     let status = Command::new(&program)
         .args(&base_args)
