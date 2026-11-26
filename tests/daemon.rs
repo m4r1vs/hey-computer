@@ -3144,9 +3144,18 @@ async fn phase5_mcp_ui_streaming_reply_to_resumption_and_voice_tts_modality() {
             && echoed.contains("resume_after_close"),
         "expected DB-seeded history block, got: {echoed}"
     );
-    let resumed_row = hey_computer::store::get_turn(&h.dir.join("state"), resumed_id)
-        .unwrap()
-        .unwrap();
+    let store_deadline = Instant::now() + Duration::from_secs(2);
+    let resumed_row = loop {
+        let row = hey_computer::store::get_turn(&h.dir.join("state"), resumed_id)
+            .unwrap()
+            .unwrap();
+        if row.status == hey_computer::store::TurnStatus::Completed
+            || Instant::now() >= store_deadline
+        {
+            break row;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
     assert_eq!(resumed_row.conversation_id, Some(bg_id));
 
     // 5. Voice vs. text modality + post-turn `cancel` stopping TTS playback:
@@ -4793,9 +4802,18 @@ async fn notify_hold_two_stage_triage_skips_banter_and_enriches_date_questions_w
         } => {
             assert_eq!(ctx, "Samstag ab 19:00 frei (nur Brunch 11:00–13:00)");
             assert_eq!(draft, "Ja, Samstag 19 Uhr passt mir super!");
-            let turn = hey_computer::store::get_turn(&h.dir.join("state"), tid)
-                .unwrap()
-                .expect("persisted Stage 2 turn");
+            let store_deadline = Instant::now() + Duration::from_secs(2);
+            let turn = loop {
+                let row = hey_computer::store::get_turn(&h.dir.join("state"), tid)
+                    .unwrap()
+                    .expect("persisted Stage 2 turn");
+                if row.status == hey_computer::store::TurnStatus::Completed
+                    || Instant::now() >= store_deadline
+                {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
             assert_eq!(turn.lane, hey_computer::store::Lane::Restricted);
             assert_eq!(turn.profile, "notify-enrich");
         }
