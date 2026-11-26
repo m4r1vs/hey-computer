@@ -260,7 +260,7 @@ impl BridgeStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        upsert_chat_meta_tx(&tx, meta)?;
+        upsert_chat_meta_tx(&tx, meta, true)?;
         tx.commit()?;
         Ok(())
     }
@@ -275,7 +275,7 @@ impl BridgeStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for item in items {
             if !item.chat_id.trim().is_empty() {
-                upsert_chat_meta_tx(&tx, item)?;
+                upsert_chat_meta_tx(&tx, item, true)?;
             }
         }
         tx.commit()?;
@@ -403,6 +403,10 @@ impl BridgeStore {
                         title: explicit_title,
                         raw_jid: msg.raw_jid.clone(),
                     },
+                    // Group subjects and self-chat labels are authoritative; for
+                    // 1:1 DMs, never overwrite an existing contact title (e.g.
+                    // "Alex Mercer") with an incoming message's shorter pushName.
+                    msg.is_group || msg.is_self_chat,
                 )?;
 
                 let sender_id = if msg.sender_id.trim().is_empty() {
@@ -540,17 +544,20 @@ impl BridgeStore {
             return Ok(tier3);
         }
 
-        // Tier 2 (exact case-insensitive title) & Tier 1 (substring title).
+        // Tier 3 (exact case-insensitive title), Tier 2 (title contains query),
+        // Tier 1 (query contains title at word boundaries, e.g. "Alex Mercer" -> "Alex").
         let candidates = self.list_chats(platform, true, true, 10_000)?;
-        let mut best: Option<(u8, i64, ChatSummary)> = None;
+        let mut best: Option<(u8, usize, i64, ChatSummary)> = None;
         for chat in candidates {
             if chat.title.is_empty() {
                 continue;
             }
             let title_lower = chat.title.to_lowercase();
             let tier = if title_lower == raw_lower {
-                2u8
+                3u8
             } else if title_lower.contains(&raw_lower) {
+                2u8
+            } else if query_matches_title_word_boundary(&raw_lower, &title_lower) {
                 1u8
             } else {
                 0u8
@@ -558,17 +565,22 @@ impl BridgeStore {
             if tier == 0 {
                 continue;
             }
+            let title_chars = title_lower.chars().count();
             let replace = match &best {
                 None => true,
-                Some((b_tier, b_ts, _)) => {
-                    tier > *b_tier || (tier == *b_tier && chat.last_message_ms > *b_ts)
+                Some((b_tier, b_chars, b_ts, _)) => {
+                    tier > *b_tier
+                        || (tier == *b_tier && tier == 1 && title_chars > *b_chars)
+                        || (tier == *b_tier
+                            && (tier != 1 || title_chars == *b_chars)
+                            && chat.last_message_ms > *b_ts)
                 }
             };
             if replace {
-                best = Some((tier, chat.last_message_ms, chat));
+                best = Some((tier, title_chars, chat.last_message_ms, chat));
             }
         }
-        Ok(best.map(|(_, _, c)| c))
+        Ok(best.map(|(_, _, _, c)| c))
     }
 
     /// List indexed chats ordered by `last_message_ms DESC`.
@@ -796,7 +808,39 @@ impl BridgeStore {
     }
 }
 
-fn upsert_chat_meta_tx(tx: &Transaction<'_>, meta: &ChatMetaRecord) -> Result<()> {
+/// Whether `query_lower` contains `title_lower` as complete word(s) (at least 3
+/// characters so 1–2 char nicknames do not false-match unrelated contacts).
+pub(crate) fn query_matches_title_word_boundary(query_lower: &str, title_lower: &str) -> bool {
+    let title = title_lower.trim();
+    if title.chars().count() < 3 || query_lower.len() <= title.len() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(rel) = query_lower[start..].find(title) {
+        let idx = start + rel;
+        let end = idx + title.len();
+        let before_ok = query_lower[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = query_lower[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        let step = query_lower[idx..].chars().next().map_or(1, char::len_utf8);
+        start = idx + step;
+    }
+    false
+}
+
+fn upsert_chat_meta_tx(
+    tx: &Transaction<'_>,
+    meta: &ChatMetaRecord,
+    overwrite_title: bool,
+) -> Result<()> {
     let canonical = normalize_identifier(&meta.chat_id);
     if canonical.is_empty() {
         return Ok(());
@@ -819,7 +863,15 @@ fn upsert_chat_meta_tx(tx: &Transaction<'_>, meta: &ChatMetaRecord) -> Result<()
          ON CONFLICT(platform, chat_id) DO UPDATE SET
             is_group = CASE WHEN excluded.is_group != 0 THEN 1 ELSE chats.is_group END,
             is_self_chat = CASE WHEN excluded.is_self_chat != 0 THEN 1 ELSE chats.is_self_chat END,
-            title = CASE WHEN excluded.title != '' THEN excluded.title ELSE chats.title END,
+            title = CASE
+                WHEN excluded.title = '' THEN chats.title
+                WHEN ?7 != 0
+                  OR chats.title = ''
+                  OR chats.title LIKE '+%∙%'
+                  OR chats.title LIKE '%@%'
+                THEN excluded.title
+                ELSE chats.title
+            END,
             raw_jid = COALESCE(excluded.raw_jid, chats.raw_jid)",
         params![
             meta.platform.as_str(),
@@ -828,6 +880,7 @@ fn upsert_chat_meta_tx(tx: &Transaction<'_>, meta: &ChatMetaRecord) -> Result<()
             i64::from(meta.is_self_chat),
             clean_title,
             clean_raw_jid,
+            i64::from(overwrite_title),
         ],
     )?;
 
@@ -1211,6 +1264,107 @@ mod tests {
                 [],
             )
             .unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dm_message_upsert_preserves_contact_title_and_resolve_chat_matches_word_boundaries() {
+        let dir =
+            std::env::temp_dir().join(format!("hey-computer-bridge-title-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("history.db");
+        let mut store = BridgeStore::open(&db_path).unwrap();
+
+        // Authoritative contact sync sets the full phone-book name.
+        store
+            .upsert_chat_meta(&ChatMetaRecord {
+                platform: Platform::Whatsapp,
+                chat_id: "+4915100000101".to_string(),
+                aliases: vec!["111111111@lid".to_string()],
+                is_group: false,
+                is_self_chat: false,
+                title: Some("Alex Mercer".to_string()),
+                raw_jid: Some("111111111@lid".to_string()),
+            })
+            .unwrap();
+
+        // A later incoming DM carrying only a shorter pushName ("Alex") must NOT
+        // clobber the authoritative phone-book contact title.
+        store
+            .upsert_messages_batch(
+                &[StoredMessageInput {
+                    platform: Platform::Whatsapp,
+                    chat_id: "+4915100000101".to_string(),
+                    chat_aliases: vec!["111111111@lid".to_string()],
+                    raw_jid: Some("111111111@lid".to_string()),
+                    msg_id: "dm-1".to_string(),
+                    timestamp_ms: 1000,
+                    from_me: false,
+                    is_group: false,
+                    is_self_chat: false,
+                    chat_title: Some("Alex".to_string()),
+                    sender_id: "+4915100000101".to_string(),
+                    sender_name: "Alex".to_string(),
+                    text: "Coming Monday".to_string(),
+                    quoted_text: None,
+                    media_placeholder: None,
+                }],
+                0,
+            )
+            .unwrap();
+
+        let chat = store
+            .resolve_chat(Some(Platform::Whatsapp), "Alex Mercer")
+            .unwrap()
+            .expect("exact title preserved");
+        assert_eq!(chat.title, "Alex Mercer");
+
+        // Conversely, if a chat currently only has a shorter pushName ("Sam"),
+        // querying with the desktop notification's full contact name ("Sam Rivera")
+        // still resolves via word-boundary matching, while 2-char titles ("Al") do not.
+        store
+            .upsert_chat_meta(&ChatMetaRecord {
+                platform: Platform::Whatsapp,
+                chat_id: "+4915100000102".to_string(),
+                aliases: vec![],
+                is_group: false,
+                is_self_chat: false,
+                title: Some("Sam".to_string()),
+                raw_jid: None,
+            })
+            .unwrap();
+        store
+            .upsert_chat_meta(&ChatMetaRecord {
+                platform: Platform::Whatsapp,
+                chat_id: "+4915100000103".to_string(),
+                aliases: vec![],
+                is_group: false,
+                is_self_chat: false,
+                title: Some("Al".to_string()),
+                raw_jid: None,
+            })
+            .unwrap();
+
+        let resolved_sam = store
+            .resolve_chat(Some(Platform::Whatsapp), "Sam Rivera")
+            .unwrap()
+            .expect("word-boundary match for Sam Rivera -> Sam");
+        assert_eq!(resolved_sam.chat_id, "+4915100000102");
+
+        // Must not falsely match substring inside a word ("Samuel" != "Sam") or 2-char "Al".
+        assert!(
+            store
+                .resolve_chat(Some(Platform::Whatsapp), "Samuel Jones")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .resolve_chat(Some(Platform::Whatsapp), "Al Smith")
+                .unwrap()
+                .is_none()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

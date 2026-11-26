@@ -2401,7 +2401,7 @@ async fn ask(
                 } else {
                     ("The assistant did not take the request", format!("{e:#}"))
                 };
-                present::notify(
+                present::notify_error(
                     &config.present,
                     summary,
                     &present::escape_markup(&body),

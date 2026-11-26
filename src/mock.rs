@@ -322,7 +322,14 @@ impl Mock {
                 } else {
                     format!(" mcp=[{}]", mcp_names.join(","))
                 };
-                self.log.line(&format!("new {session}{extra}{mcp_tag}"));
+                let cwd_tag = params
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
+                    .map(|name| format!(" cwd={name}"))
+                    .unwrap_or_default();
+                self.log
+                    .line(&format!("new {session}{extra}{mcp_tag}{cwd_tag}"));
                 self.respond(
                     id,
                     json!({

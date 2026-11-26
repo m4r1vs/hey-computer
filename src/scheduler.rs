@@ -1160,10 +1160,9 @@ fn route_failure(
                 } else {
                     message.to_string()
                 };
-                presenter.present(Presentation::Notice {
+                presenter.present(Presentation::Error {
                     summary,
                     body,
-                    urgency: Urgency::Normal,
                     replaces_id: None,
                 });
             }

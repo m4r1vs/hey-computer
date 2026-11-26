@@ -2239,7 +2239,7 @@ async fn scheduler_runs_no_agent_pre_collector_and_split_failure_routing() {
             items.iter().any(|i| {
                 matches!(
                     i,
-                    Presentation::Notice { summary, body, .. }
+                    Presentation::Error { summary, body, .. }
                         if summary.contains("broken-check") && body.contains("auth expired")
                 )
             })
@@ -4819,6 +4819,132 @@ async fn notify_hold_two_stage_triage_skips_banter_and_enriches_date_questions_w
         }
         other => panic!("expected ShowEnriched from Stage 2, got {other:?}"),
     }
+
+    // Verify Stage 2 opened in `restricted-enrich-workspace` (never full `workspace`).
+    assert!(
+        h.log_count("cwd=restricted-enrich-workspace") >= 1,
+        "expected Stage 2 notify-enrich to open in restricted-enrich-workspace; mock log:\n{}",
+        h.log_lines().join("\n")
+    );
+
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn notify_hold_stage2_failure_releases_raw_and_emits_persistent_error_notification() {
+    use hey_computer::config::Profile;
+    use hey_computer::notify_filter::NotificationAppRule;
+    use hey_computer::present::Presentation;
+    use hey_computer::protocol::NotifyReleaseAction;
+
+    let script = r##"{
+      "turns": [
+        {
+          "match": "<notification_task>",
+          "steps": [
+            {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-bad",
+                "name": "run_command",
+                "kind": "execute",
+                "status": "in_progress",
+                "title": "hey-computer-bridge messages Alex",
+                "rawInput": {"CommandLine": "hey-computer-bridge messages Alex"}
+              }
+            }
+          ]
+        },
+        {
+          "match": "preview: Komme Montag",
+          "steps": [
+            {"chunk": "true"}
+          ]
+        }
+      ],
+      "default": [{"chunk": "false"}]
+    }"##;
+
+    let h = Harness::start(script, |cfg| {
+        cfg.profiles.insert(
+            "notify-triage".to_string(),
+            Profile {
+                model: Some("gemini-3.8-flash".to_string()),
+                thought_level: Some("low".to_string()),
+                ..Profile::default()
+            },
+        );
+        cfg.profiles.insert(
+            "notify-enrich".to_string(),
+            Profile {
+                model: Some("gemini-4-hydrogen".to_string()),
+                thought_level: Some("medium".to_string()),
+                ..Profile::default()
+            },
+        );
+        cfg.notifications.enabled = true;
+        cfg.notifications.triage_profile = Some("notify-triage".to_string());
+        cfg.notifications.profile = Some("notify-enrich".to_string());
+        cfg.notifications.max_tool_calls = 4;
+        cfg.notifications.per_sender_cooldown_secs = 0.0;
+        cfg.notifications.dedupe_window_secs = 0.0;
+        cfg.notifications.apps.insert(
+            "whatsapp".to_string(),
+            NotificationAppRule {
+                match_apps: vec!["whatsapp-electron".to_string()],
+                allow_senders: vec!["*".to_string()],
+                ..NotificationAppRule::default()
+            },
+        );
+    })
+    .await;
+
+    let mut client = Client::send(
+        &h.socket,
+        &Request::NotifyHold {
+            noti_id: 301,
+            replaces_id: 0,
+            app_name: "whatsapp-electron".to_string(),
+            desktop_entry: "whatsapp-electron".to_string(),
+            summary: "Alex Mercer".to_string(),
+            body: "Komme Montag".to_string(),
+            category: "im.received".to_string(),
+            urgency: "normal".to_string(),
+            has_default_action: true,
+            dnd: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        client.next(Some(Duration::from_secs(5))).await.unwrap(),
+        Reply::NotifyAccepted { .. }
+    ));
+    let release = client.next(Some(Duration::from_secs(5))).await.unwrap();
+    assert!(
+        matches!(
+            release,
+            Reply::NotifyRelease {
+                action: NotifyReleaseAction::ShowRaw,
+                reason: Some(ref why),
+                ..
+            } if why == "failed"
+        ),
+        "expected ShowRaw(failed), got {release:?}"
+    );
+
+    let items = h.recorder.items();
+    assert!(
+        items.iter().any(|p| matches!(
+            p,
+            Presentation::Error { summary, body, .. }
+                if summary.contains("enrichment failed")
+                    && summary.contains("Alex Mercer")
+                    && body.contains("hey-computer-bridge")
+        )),
+        "expected persistent Presentation::Error on Stage 2 failure, got {items:?}"
+    );
 
     h.stop().await;
 }

@@ -238,45 +238,61 @@ impl ContextCache {
         let norm_query = normalize_identifier(query);
         let lower_query = query.to_lowercase();
 
-        let mut best: Option<(u8, u64, Platform, &ChatEntry)> = None;
+        let mut best: Option<(u8, usize, u64, Platform, &ChatEntry)> = None;
         for ((plat, key), entry) in &self.chats {
             if let Some(filter) = platform
                 && *plat != filter
             {
                 continue;
             }
-            let score = if *key == norm_query || entry.aliases.contains(&norm_query) {
-                3u8
-            } else if entry
-                .display_names
-                .iter()
-                .any(|n| n.to_lowercase() == lower_query)
-            {
-                2u8
-            } else if entry
-                .display_names
-                .iter()
-                .any(|n| n.to_lowercase().contains(&lower_query))
-            {
-                1u8
-            } else {
-                0u8
-            };
+            let (score, matched_chars) =
+                if *key == norm_query || entry.aliases.contains(&norm_query) {
+                    (4u8, 0usize)
+                } else if entry
+                    .display_names
+                    .iter()
+                    .any(|n| n.to_lowercase() == lower_query)
+                {
+                    (3u8, 0usize)
+                } else if entry
+                    .display_names
+                    .iter()
+                    .any(|n| n.to_lowercase().contains(&lower_query))
+                {
+                    (2u8, 0usize)
+                } else if let Some(max_len) = entry
+                    .display_names
+                    .iter()
+                    .map(|n| n.to_lowercase())
+                    .filter(|nl| {
+                        crate::bridge::store::query_matches_title_word_boundary(&lower_query, nl)
+                    })
+                    .map(|nl| nl.chars().count())
+                    .max()
+                {
+                    (1u8, max_len)
+                } else {
+                    (0u8, 0usize)
+                };
             if score == 0 {
                 continue;
             }
             let replace = match best {
                 None => true,
-                Some((best_score, best_touch, _, _)) => {
-                    score > best_score || (score == best_score && entry.last_touched > best_touch)
+                Some((best_score, best_chars, best_touch, _, _)) => {
+                    score > best_score
+                        || (score == best_score && score == 1 && matched_chars > best_chars)
+                        || (score == best_score
+                            && (score != 1 || matched_chars == best_chars)
+                            && entry.last_touched > best_touch)
                 }
             };
             if replace {
-                best = Some((score, entry.last_touched, *plat, entry));
+                best = Some((score, matched_chars, entry.last_touched, *plat, entry));
             }
         }
 
-        let (_, _, plat, entry) = best?;
+        let (_, _, _, plat, entry) = best?;
         let mut msgs: Vec<ContextMessage> = entry.messages.iter().cloned().collect();
         if let Some(limit) = limit
             && msgs.len() > limit

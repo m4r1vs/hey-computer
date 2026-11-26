@@ -21,7 +21,7 @@ use crate::messenger::{self, MessengerHandle};
 use crate::notify_filter::{
     self, EnrichmentResult, FilterDecision, IncomingNotification, NotificationFilter,
 };
-use crate::present::{self, Desktop, Presenter};
+use crate::present::{self, Desktop, Presentation, Presenter};
 use crate::protocol::{
     self, DraftAction, FailReason, InputSource, MAX_REQUEST_LINE, NotifyReleaseAction, Reply,
     Request,
@@ -91,6 +91,7 @@ struct DaemonServices {
     store: Store,
     notify_filter: Arc<NotificationFilter>,
     messenger: MessengerHandle,
+    presenter: Arc<dyn Presenter>,
 }
 
 /// Serve on `socket` with injectable ambient context provider and keyring
@@ -155,7 +156,7 @@ pub async fn serve_with_deps(
         Arc::clone(&config),
         handle.clone(),
         store.clone(),
-        presenter,
+        Arc::clone(&presenter),
     );
     let services = DaemonServices {
         config: Arc::clone(&config),
@@ -164,6 +165,7 @@ pub async fn serve_with_deps(
         store: store.clone(),
         notify_filter: Arc::new(NotificationFilter::new(config.notifications.clone())),
         messenger: messenger_handle.clone(),
+        presenter,
     };
     tokio::pin!(shutdown);
     let mut connections = tokio::task::JoinSet::new();
@@ -631,20 +633,46 @@ async fn handle_notify_hold(
         let triage_rx = svc
             .handle
             .triage_notification(triage_prompt, Arc::clone(&triage_cancel));
-        let actionable = tokio::select! {
-            res = triage_rx => res.unwrap_or(false),
+        let triage_res = tokio::select! {
+            res = triage_rx => res,
             () = hung_up(reader) => {
                 tracing::debug!("notify_hold client disconnected during Stage 1 triage");
                 triage_cancel.cancel(FailReason::Cancelled);
                 return Ok(());
             }
         };
-        if !actionable {
-            return send(write, &show_raw_reply("triage_skip")).await;
+        match triage_res {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                return send(write, &show_raw_reply("triage_skip")).await;
+            }
+            Ok(Err((reason, message))) => {
+                if !matches!(
+                    reason,
+                    FailReason::Cancelled | FailReason::Superseded | FailReason::KeyringLocked
+                ) {
+                    svc.presenter.present(Presentation::Error {
+                        summary: format!(
+                            "{} triage failed ({})",
+                            prepared.app_name, prepared.sender
+                        ),
+                        body: format!("{}: {message}", reason.headline()),
+                        replaces_id: None,
+                    });
+                }
+                return send(write, &show_raw_reply("triage_failed")).await;
+            }
+            Err(_) => {
+                return send(write, &show_raw_reply("triage_failed")).await;
+            }
         }
     }
 
-    let prompt = notify_filter::build_enrichment_prompt(&prepared, &recent_chat);
+    let prompt = notify_filter::build_enrichment_prompt_with_tools(
+        &prepared,
+        &recent_chat,
+        &svc.config.notifications.allowed_mcp_tools,
+    );
     let (tx, rx) = oneshot::channel();
     let turn_id = match svc.handle.ask(
         conductor::AskParams {
@@ -666,7 +694,15 @@ async fn handle_notify_hold(
     ) {
         Ok(id) => id,
         Err(msg) => {
-            tracing::debug!("notify_hold failed to queue restricted turn: {msg}");
+            tracing::warn!("notify_hold failed to queue restricted turn: {msg}");
+            svc.presenter.present(Presentation::Error {
+                summary: format!(
+                    "{} enrichment failed ({})",
+                    prepared.app_name, prepared.sender
+                ),
+                body: msg,
+                replaces_id: None,
+            });
             return send(write, &show_raw_reply("queue_full")).await;
         }
     };
@@ -682,13 +718,38 @@ async fn handle_notify_hold(
         }
     };
 
-    let Ok(Reply::Answer {
-        text,
-        suppressed: false,
-        ..
-    }) = reply
-    else {
-        return send(write, &show_raw_reply("suppressed")).await;
+    let text = match reply {
+        Ok(Reply::Answer {
+            text,
+            suppressed: false,
+            ..
+        }) => text,
+        Ok(Reply::Answer {
+            suppressed: true, ..
+        }) => {
+            return send(write, &show_raw_reply("suppressed")).await;
+        }
+        Ok(Reply::Failed {
+            reason, message, ..
+        }) => {
+            if !matches!(
+                reason,
+                FailReason::Cancelled | FailReason::Superseded | FailReason::KeyringLocked
+            ) {
+                svc.presenter.present(Presentation::Error {
+                    summary: format!(
+                        "{} enrichment failed ({})",
+                        prepared.app_name, prepared.sender
+                    ),
+                    body: format!("#{turn_id} · {}: {message}", reason.headline()),
+                    replaces_id: None,
+                });
+            }
+            return send(write, &show_raw_reply("failed")).await;
+        }
+        Ok(_) | Err(_) => {
+            return send(write, &show_raw_reply("suppressed")).await;
+        }
     };
 
     let EnrichmentResult::Enriched {
@@ -721,6 +782,14 @@ async fn handle_notify_hold(
         Ok(cp) => cp,
         Err(e) => {
             tracing::warn!("cannot persist draft checkpoint for turn {turn_id}: {e:#}");
+            svc.presenter.present(Presentation::Error {
+                summary: format!(
+                    "{} draft save failed ({})",
+                    prepared.app_name, prepared.sender
+                ),
+                body: format!("{e:#}"),
+                replaces_id: None,
+            });
             return send(write, &show_raw_reply("store_error")).await;
         }
     };

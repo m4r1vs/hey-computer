@@ -227,7 +227,7 @@ enum Message {
     TriageNotification {
         prompt: String,
         token: Arc<CancelToken>,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<std::result::Result<bool, (FailReason, String)>>,
     },
     FinishTriage {
         session: String,
@@ -289,16 +289,20 @@ impl Handle {
     }
 
     /// Run Stage 1 ultra-fast binary notification triage (`true`/`false`) in
-    /// memory without creating a `turns` row in `history.db`. Fails open (`false`)
-    /// on timeout, error, or shutdown.
+    /// memory without creating a `turns` row in `history.db`. Returns
+    /// `Err((reason, message))` on failure so callers can surface unexpected
+    /// errors while still releasing notifications cleanly.
     pub fn triage_notification(
         &self,
         prompt: String,
         token: Arc<CancelToken>,
-    ) -> oneshot::Receiver<bool> {
+    ) -> oneshot::Receiver<std::result::Result<bool, (FailReason, String)>> {
         let (tx, rx) = oneshot::channel();
         if self.is_locked() {
-            let _ = tx.send(false);
+            let _ = tx.send(Err((
+                FailReason::KeyringLocked,
+                "The login keyring is still locked.".to_string(),
+            )));
             return rx;
         }
         if let Err(mpsc::error::SendError(Message::TriageNotification { reply, .. })) =
@@ -308,7 +312,10 @@ impl Handle {
                 reply: tx,
             })
         {
-            let _ = reply.send(false);
+            let _ = reply.send(Err((
+                FailReason::AgentDown,
+                "The assistant conductor stopped.".to_string(),
+            )));
         }
         rx
     }
@@ -1551,7 +1558,10 @@ impl Conductor {
                     );
                 }
                 Message::TriageNotification { reply, .. } => {
-                    let _ = reply.send(false);
+                    let _ = reply.send(Err((
+                        FailReason::Cancelled,
+                        "The daemon is shutting down.".to_string(),
+                    )));
                 }
                 Message::FinishTriage { .. } | Message::Wake | Message::Shutdown => {}
             }
@@ -2922,27 +2932,42 @@ impl Conductor {
         &mut self,
         prompt: String,
         token: Arc<CancelToken>,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<std::result::Result<bool, (FailReason, String)>>,
     ) {
-        if self.keyring_locked || token.reason().is_some() || self.stop.reason().is_some() {
-            let _ = reply.send(false);
+        if self.keyring_locked {
+            let _ = reply.send(Err((
+                FailReason::KeyringLocked,
+                "The login keyring is still locked.".to_string(),
+            )));
+            return;
+        }
+        if let Some(reason) = token.reason().or_else(|| self.stop.reason()) {
+            let _ = reply.send(Err((reason, "The request was cancelled.".to_string())));
             return;
         }
         let Some(triage_prof) = self.config.notifications.triage_profile.clone() else {
-            let _ = reply.send(true);
+            let _ = reply.send(Ok(true));
             return;
         };
-        let Ok(resolved) = self.config.resolve_profile(Some(&triage_prof)) else {
-            let _ = reply.send(false);
-            return;
+        let resolved = match self.config.resolve_profile(Some(&triage_prof)) {
+            Ok(r) => r,
+            Err(msg) => {
+                let _ = reply.send(Err((FailReason::AgentError, msg)));
+                return;
+            }
         };
-        if self.live.is_none() && self.start_agent().await.is_err() {
+        if self.live.is_none()
+            && let Err(e) = self.start_agent().await
+        {
             self.schedule_restart_if_warm();
-            let _ = reply.send(false);
+            let _ = reply.send(Err((
+                FailReason::AgentDown,
+                format!("Cannot start the assistant: {e:#}"),
+            )));
             return;
         }
-        if token.reason().is_some() {
-            let _ = reply.send(false);
+        if let Some(reason) = token.reason() {
+            let _ = reply.send(Err((reason, "The request was cancelled.".to_string())));
             return;
         }
 
@@ -2961,20 +2986,33 @@ impl Conductor {
                 .session
         } else {
             let Some(cwd) = self.paths.as_ref().map(|p| p.restricted_workspace.clone()) else {
-                let _ = reply.send(false);
+                let _ = reply.send(Err((
+                    FailReason::AgentDown,
+                    "The assistant is not running.".to_string(),
+                )));
                 return;
             };
             match self.new_session_in_dir(&resolved, &cwd).await {
                 Ok(s) => s,
-                Err(_) => {
-                    let _ = reply.send(false);
+                Err(Outcome::Failed { reason, message }) => {
+                    let _ = reply.send(Err((reason, message)));
+                    return;
+                }
+                Err(Outcome::Answer { .. }) => {
+                    let _ = reply.send(Err((
+                        FailReason::AgentError,
+                        "Unexpected session creation result.".to_string(),
+                    )));
                     return;
                 }
             }
         };
 
         let Some(live) = &self.live else {
-            let _ = reply.send(false);
+            let _ = reply.send(Err((
+                FailReason::AgentDown,
+                "The assistant exited.".to_string(),
+            )));
             return;
         };
         let client = live.conn.client();
@@ -3029,9 +3067,9 @@ impl Conductor {
             let end = turn(&client, sub, &session, blocks, interrupts, &ctx).await;
             let verdict = match &end.outcome {
                 Outcome::Answer { text, .. } => {
-                    crate::notify_filter::parse_triage_verdict(text).unwrap_or(false)
+                    Ok(crate::notify_filter::parse_triage_verdict(text).unwrap_or(false))
                 }
-                Outcome::Failed { .. } => false,
+                Outcome::Failed { reason, message } => Err((*reason, message.clone())),
             };
             let _ = reply.send(verdict);
             let _ = inbox_tx.send(Message::FinishTriage {
@@ -3226,14 +3264,14 @@ impl Conductor {
             .config
             .resolve_profile(requested)
             .map_err(|e| Outcome::failed(FailReason::AgentError, e))?;
-        let use_full_workspace = self.config.notifications.max_tool_calls > 0
+        let use_enrich_workspace = self.config.notifications.max_tool_calls > 0
             || !self.config.notifications.allowed_mcp_tools.is_empty();
         let cwd = self
             .paths
             .as_ref()
             .map(|p| {
-                if use_full_workspace {
-                    p.workspace.clone()
+                if use_enrich_workspace {
+                    p.restricted_enrich_workspace.clone()
                 } else {
                     p.restricted_workspace.clone()
                 }

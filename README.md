@@ -75,7 +75,9 @@ answer matches `--suppress-token`, e.g. `HEARTBEAT_OK` for systemd timers).
 Inspect or manage them with `hey-computer tasks`.
 
 **Timeouts and budgets.** A request is cancelled if the agent sends nothing for
-45 s (`agent.inactivity_timeout_secs`). To stop runaway retry loops even while
+45 s (`agent.inactivity_timeout_secs`; named profiles with `thought_level = "high"`
+automatically raise their default inactivity floor to 120 s when
+`profiles.<name>.inactivity_timeout_secs` is omitted). To stop runaway retry loops even while
 updates keep arriving, each turn also has generous hard caps of 300 s wall-clock
 time (`agent.max_turn_secs`), 20 distinct tool calls (`agent.max_tool_calls`;
 internal `read_file` lookups on local MCP tool schemas do not count), and a
@@ -339,7 +341,7 @@ desktop = false                     # prepend active Hyprland workspace/window, 
 
 [present]
 notifications = true                # every notification, errors included
-transient = true                    # pass --hint=boolean:transient:true to notify-send (skip history panel)
+transient = true                    # pass --hint=boolean:transient:true to routine popups; error alerts always persist in the notification center
 progress = true                     # "Thinking…" while a request runs (with live tool progress)
 max_chars = 230                     # longer answers go to the viewer
 max_lines = 4                       # so do answers with more lines

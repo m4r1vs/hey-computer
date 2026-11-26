@@ -108,13 +108,22 @@ pub enum Presentation {
         background: bool,
         icons: Vec<String>,
     },
-    /// A standalone notification (e.g. scheduled reminder, split failure alert,
-    /// or background-delegation notice). Replaces an active progress popup only
-    /// when `replaces_id` matches that request's id.
+    /// A standalone notification (e.g. scheduled reminder, or background-delegation
+    /// notice). Replaces an active progress popup only when `replaces_id` matches
+    /// that request's id.
     Notice {
         summary: String,
         body: String,
         urgency: Urgency,
+        replaces_id: Option<u64>,
+    },
+    /// A persistent error notification (omits `--hint=boolean:transient:true`
+    /// and tags `--category=x-hey-computer.error`) so failures in scheduled
+    /// jobs, background tasks, or notification triage/enrichment remain visible
+    /// in the desktop notification center until dismissed.
+    Error {
+        summary: String,
+        body: String,
         replaces_id: Option<u64>,
     },
     /// Fallback desktop notification for a persisted notification/messenger draft
@@ -1645,6 +1654,7 @@ impl Worker {
             item,
             Presentation::TaskComplete { .. }
                 | Presentation::Notice { .. }
+                | Presentation::Error { .. }
                 | Presentation::DraftReady { .. }
                 | Presentation::Failure {
                     background: true,
@@ -1745,7 +1755,7 @@ impl Worker {
                     &with_profile(&format!("Task: {}", reason.headline()), profile.as_deref()),
                     &icons,
                 );
-                self.notify(
+                self.notify_error(
                     &summary,
                     &escape_markup(&message),
                     Urgency::Normal,
@@ -1807,6 +1817,36 @@ impl Worker {
                 self.notify(&summary, &escape_markup(&body), urgency, expire, replaces)
                     .await;
             }
+            Presentation::Error {
+                summary,
+                body,
+                replaces_id,
+            } => {
+                let replaces = match (&self.progress, replaces_id) {
+                    (
+                        Some(ProgressSlot::Active {
+                            request_id,
+                            notif_id,
+                            ..
+                        }),
+                        Some(target),
+                    ) if *request_id == target => {
+                        let id = *notif_id;
+                        self.progress = None;
+                        self.pending = None;
+                        Some(id)
+                    }
+                    _ => None,
+                };
+                self.notify_error(
+                    &summary,
+                    &escape_markup(&body),
+                    Urgency::Normal,
+                    FAILURE_EXPIRE_MS,
+                    replaces,
+                )
+                .await;
+            }
             Presentation::DraftReady {
                 id,
                 turn_id,
@@ -1839,7 +1879,7 @@ impl Worker {
                 let replaces = self.take_progress_id();
                 let summary =
                     self.with_icons(&with_profile(reason.headline(), profile.as_deref()), &icons);
-                self.notify(
+                self.notify_error(
                     &summary,
                     &escape_markup(&message),
                     Urgency::Normal,
@@ -2041,7 +2081,7 @@ impl Worker {
             Ok(file) => file,
             Err(e) => {
                 tracing::warn!("cannot write the answer file: {e:#}");
-                self.notify(
+                self.notify_error(
                     "Cannot show the answer",
                     &escape_markup(&format!("{e:#}")),
                     Urgency::Normal,
@@ -2270,11 +2310,27 @@ impl Worker {
     ) -> Option<u32> {
         notify(&self.config, summary, body, urgency, expire_ms, replaces).await
     }
+
+    /// Show one persistent error popup (omits `--hint=boolean:transient:true`
+    /// and tags `--category=x-hey-computer.error`).
+    async fn notify_error(
+        &self,
+        summary: &str,
+        body: &str,
+        urgency: Urgency,
+        expire_ms: u32,
+        replaces: Option<u32>,
+    ) -> Option<u32> {
+        notify_error(&self.config, summary, body, urgency, expire_ms, replaces).await
+    }
 }
 
 fn is_notify_send(program: &str) -> bool {
     Path::new(program).file_name().and_then(|n| n.to_str()) == Some("notify-send")
 }
+
+/// Notification category attached to persistent `hey-computer` error alerts.
+pub const ERROR_NOTIFICATION_CATEGORY: &str = "x-hey-computer.error";
 
 /// Run the notifier once. `body` is Pango markup and must be escaped.
 /// Returns the notification's id, so a later one can replace it.
@@ -2285,6 +2341,32 @@ pub async fn notify(
     urgency: Urgency,
     expire_ms: u32,
     replaces: Option<u32>,
+) -> Option<u32> {
+    notify_with_options(config, summary, body, urgency, expire_ms, replaces, false).await
+}
+
+/// Run the notifier for an error alert that persists in the desktop
+/// notification center (omits `--hint=boolean:transient:true` and attaches
+/// `--category=x-hey-computer.error`).
+pub async fn notify_error(
+    config: &PresentConfig,
+    summary: &str,
+    body: &str,
+    urgency: Urgency,
+    expire_ms: u32,
+    replaces: Option<u32>,
+) -> Option<u32> {
+    notify_with_options(config, summary, body, urgency, expire_ms, replaces, true).await
+}
+
+async fn notify_with_options(
+    config: &PresentConfig,
+    summary: &str,
+    body: &str,
+    urgency: Urgency,
+    expire_ms: u32,
+    replaces: Option<u32>,
+    persist_error: bool,
 ) -> Option<u32> {
     {
         if !config.notifications || config.notifier.is_empty() {
@@ -2302,7 +2384,9 @@ pub async fn notify(
                 .arg("--print-id");
             if is_notify_send(&config.notifier[0]) {
                 command.arg("--hint=boolean:x-hey-computer:true");
-                if config.transient {
+                if persist_error {
+                    command.arg(format!("--category={ERROR_NOTIFICATION_CATEGORY}"));
+                } else if config.transient {
                     command.arg("--hint=boolean:transient:true");
                 }
             }
@@ -3334,7 +3418,7 @@ async fn report_viewer_failure(
     tracing::warn!("the viewer did not start");
     tracing::debug!("the viewer: {detail}");
     let body = format!("{detail}\n{}", file.display());
-    notify(
+    notify_error(
         config,
         "Cannot open the viewer",
         &escape_markup(&body),
@@ -7012,5 +7096,75 @@ Here is the first sentence. Second sentence with *emphasis* and [image: chart](h
             draft_ready_summary(&icons, "signal", "Carol"),
             "Draft reply (signal) · Carol"
         );
+    }
+
+    #[tokio::test]
+    async fn error_and_failure_notifications_persist_while_routine_popups_stay_transient() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "hey-computer-persist-errors-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("notify.log");
+        let fake_notify_send = dir.join("notify-send");
+        std::fs::write(
+            &fake_notify_send,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\necho 21\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_notify_send, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let config = PresentConfig {
+            notifier: vec![fake_notify_send.to_string_lossy().into_owned()],
+            transient: true,
+            ..PresentConfig::default()
+        };
+        let desktop = Desktop::spawn(&config, dir.join("answers"));
+        desktop.present(Presentation::Failure {
+            id: 1,
+            reason: FailReason::Timeout,
+            message: "Timed out after 120 s".to_string(),
+            profile: Some("deep".to_string()),
+            background: false,
+            icons: vec![],
+        });
+        desktop.present(Presentation::Failure {
+            id: 2,
+            reason: FailReason::Denied,
+            message: "Denied tool in background".to_string(),
+            profile: Some("notify-enrich".to_string()),
+            background: true,
+            icons: vec![],
+        });
+        desktop.present(Presentation::Error {
+            summary: "WhatsApp enrichment failed (Alex)".to_string(),
+            body: "#111 · Denied: attempted shell call".to_string(),
+            replaces_id: None,
+        });
+        desktop.finish().await;
+
+        let recorded = std::fs::read_to_string(&calls).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(lines.len(), 3, "{recorded}");
+        for line in &lines {
+            assert!(
+                line.contains("--hint=boolean:x-hey-computer:true"),
+                "missing x-hey-computer hint: {line}"
+            );
+            assert!(
+                line.contains("--category=x-hey-computer.error"),
+                "missing error category: {line}"
+            );
+            assert!(
+                !line.contains("--hint=boolean:transient:true"),
+                "error notification must persist (no transient hint): {line}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

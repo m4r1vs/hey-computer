@@ -681,6 +681,12 @@ in {
         description = "Explicit `server/tool` MCP subset permitted on Stage 2 restricted notification enrichment turns (strictly read-only lookups).";
       };
 
+      extraInstructions = mkOption {
+        type = types.str;
+        default = "";
+        description = "Optional concise read-only context appended to `restricted-enrich-workspace/AGENTS.md` (e.g. Google account emails and reply language conventions) without exposing shell-tool instructions.";
+      };
+
       maxConcurrent = mkOption {
         type = types.nullOr types.ints.positive;
         default = null;
@@ -909,6 +915,7 @@ in {
         triage_timeout_secs = mkDefault cfg.notifications.triageTimeoutSecs;
         profile = mkIf (cfg.notifications.profile != null) (mkDefault cfg.notifications.profile);
         allowed_mcp_tools = mkIf (cfg.notifications.allowedMcpTools != []) (mkDefault cfg.notifications.allowedMcpTools);
+        extra_instructions = mkIf (cfg.notifications.extraInstructions != "") (mkDefault cfg.notifications.extraInstructions);
         max_concurrent = mkIf (cfg.notifications.maxConcurrent != null) (mkDefault cfg.notifications.maxConcurrent);
         max_queued = mkIf (cfg.notifications.maxQueued != null) (mkDefault cfg.notifications.maxQueued);
         max_hold_secs = mkDefault cfg.notifications.maxHoldSecs;

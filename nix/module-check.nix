@@ -291,6 +291,10 @@ in
       done
       test -d "$XDG_STATE_HOME/hey-computer/artifacts" || { echo "missing artifacts dir" >&2; exit 1; }
       test -f "$XDG_STATE_HOME/hey-computer/restricted-workspace/AGENTS.md" || { echo "missing restricted-workspace AGENTS.md" >&2; exit 1; }
+      test -f "$XDG_STATE_HOME/hey-computer/restricted-enrich-workspace/AGENTS.md" || { echo "missing restricted-enrich-workspace AGENTS.md" >&2; exit 1; }
+      grep -q "hey-computer-bridge" "$XDG_STATE_HOME/hey-computer/restricted-enrich-workspace/AGENTS.md"
+      grep -q "run_command" "$XDG_STATE_HOME/hey-computer/restricted-enrich-workspace/AGENTS.md"
+      grep -qv "Voice assistant" "$XDG_STATE_HOME/hey-computer/restricted-enrich-workspace/AGENTS.md"
       grep -q "Alice's Notes" $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md
       grep -q "Prefer metric units." $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md
       grep -q "report the failure plainly" $XDG_STATE_HOME/hey-computer/workspace/AGENTS.md

@@ -341,6 +341,66 @@ const lidToPnCache = new Map();
 const groupSubjects = new Map();
 const contactNames = new Map();
 
+const contactNamesCachePath = path.join(sessionDir, "contact-names.json");
+let contactNamesSaveTimer = null;
+
+function loadContactNamesCache() {
+  try {
+    const raw = fs.readFileSync(contactNamesCachePath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof k === "string" && typeof v === "string" && k && v.trim()) {
+          contactNames.set(k, v.trim());
+        }
+      }
+    }
+  } catch {
+    // Cache may not exist on first start.
+  }
+}
+
+function scheduleSaveContactNamesCache() {
+  if (contactNamesSaveTimer) return;
+  contactNamesSaveTimer = setTimeout(() => {
+    contactNamesSaveTimer = null;
+    try {
+      const obj = Object.fromEntries(contactNames.entries());
+      const tmpPath = `${contactNamesCachePath}.${process.pid}.tmp`;
+      const fd = fs.openSync(tmpPath, "w", 0o600);
+      try {
+        fs.writeFileSync(fd, JSON.stringify(obj));
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      fs.renameSync(tmpPath, contactNamesCachePath);
+      try {
+        fs.chmodSync(contactNamesCachePath, 0o600);
+      } catch {
+        // Best-effort.
+      }
+    } catch {
+      // Non-fatal: in-memory map stays authoritative for this session.
+    }
+  }, 500);
+  if (typeof contactNamesSaveTimer.unref === "function") {
+    contactNamesSaveTimer.unref();
+  }
+}
+
+function setContactName(key, name) {
+  if (!key || !name) return;
+  const trimmed = String(name).trim();
+  if (!trimmed) return;
+  if (contactNames.get(key) !== trimmed) {
+    contactNames.set(key, trimmed);
+    scheduleSaveContactNamesCache();
+  }
+}
+
+loadContactNamesCache();
+
 function recordLidPnMapping(lidCandidate, pnCandidate) {
   const lidDigits = extractLidDigits(
     typeof lidCandidate === "string" ? lidCandidate : "",
@@ -465,7 +525,7 @@ function processContactsList(contacts) {
         groupSubjects.set(primaryJid, name);
       } else {
         for (const key of [id, lid, pn]) {
-          if (key) contactNames.set(key, name);
+          if (key) setContactName(key, name);
         }
       }
     }
@@ -667,19 +727,23 @@ async function convertWaMessage(sock, selfJid, selfLid, selfE164, msg, upsertTyp
       Boolean(selfLid && remoteJid === selfLid) ||
       Boolean(selfE164 && resolvedChatE164 === selfE164));
 
+  const contactTitle =
+    contactNames.get(remoteJid) ||
+    (remoteJidAlt ? contactNames.get(remoteJidAlt) : null) ||
+    null;
+
   const pushName =
     (typeof msg.pushName === "string" && msg.pushName.trim()) ||
     (!fromMe && senderRaw ? contactNames.get(senderRaw) || null : null);
 
+  // Prefer the synced phone-book contact name over `msg.pushName` so shorter
+  // self-chosen WhatsApp nicknames never clobber full contact display names.
   const chatTitle = isGroup
     ? groupSubjects.get(remoteJid) || null
     : fromMe
-      ? contactNames.get(remoteJid) ||
-        (remoteJidAlt ? contactNames.get(remoteJidAlt) : null) ||
-        null
-      : (typeof msg.pushName === "string" && msg.pushName.trim()) ||
-        contactNames.get(remoteJid) ||
-        (remoteJidAlt ? contactNames.get(remoteJidAlt) : null) ||
+      ? contactTitle
+      : contactTitle ||
+        (typeof msg.pushName === "string" && msg.pushName.trim()) ||
         null;
 
   return {
@@ -1057,7 +1121,9 @@ async function startSocket() {
           if (isGroup) {
             groupSubjects.set(cid, title);
           } else {
-            contactNames.set(cid, title);
+            setContactName(cid, title);
+            if (lidJid) setContactName(lidJid, title);
+            if (pnJid) setContactName(pnJid, title);
           }
         }
 

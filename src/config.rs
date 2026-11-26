@@ -702,6 +702,32 @@ pub fn secs(value: f64) -> Option<Duration> {
     (value > 0.0 && value.is_finite()).then(|| Duration::from_secs_f64(value))
 }
 
+/// Minimum default inactivity timeout for high-effort profiles when
+/// `profiles.<name>.inactivity_timeout_secs` is not explicitly configured.
+/// High-effort models (`thought_level = "high"`) routinely spend >45 s
+/// synthesizing or streaming large `write_file` tool-call payloads before
+/// `agy acp` emits the next `session/update`.
+const HIGH_THOUGHT_MIN_INACTIVITY: Duration = Duration::from_secs(120);
+
+fn default_inactivity_for_thought_level(
+    base: Duration,
+    thought_level: &str,
+    max_turn: Option<Duration>,
+) -> Duration {
+    let is_high = matches!(
+        thought_level.trim().to_ascii_lowercase().as_str(),
+        "high" | "xhigh" | "max"
+    );
+    if !is_high {
+        return base;
+    }
+    let raised = base.max(HIGH_THOUGHT_MIN_INACTIVITY);
+    match max_turn {
+        Some(cap) => raised.min(cap.max(base)),
+        None => raised,
+    }
+}
+
 impl Config {
     /// `~/.config/hey-computer/config.toml`.
     pub fn default_path() -> Option<PathBuf> {
@@ -1251,21 +1277,26 @@ impl Config {
                 chosen
             }
         };
+        let max_turn = secs(profile.max_turn_secs.unwrap_or(self.agent.max_turn_secs));
+        let thought_level = profile
+            .thought_level
+            .clone()
+            .unwrap_or_else(|| self.agent.thought_level.clone());
+        let inactivity = profile
+            .inactivity_timeout_secs
+            .and_then(secs)
+            .unwrap_or_else(|| {
+                default_inactivity_for_thought_level(base_inactivity, &thought_level, max_turn)
+            });
         Ok(ResolvedProfile {
             name: Some(name.to_string()),
             model: profile
                 .model
                 .clone()
                 .unwrap_or_else(|| self.agent.model.clone()),
-            thought_level: profile
-                .thought_level
-                .clone()
-                .unwrap_or_else(|| self.agent.thought_level.clone()),
-            inactivity: profile
-                .inactivity_timeout_secs
-                .and_then(secs)
-                .unwrap_or(base_inactivity),
-            max_turn: secs(profile.max_turn_secs.unwrap_or(self.agent.max_turn_secs)),
+            thought_level,
+            inactivity,
+            max_turn,
             max_tool_calls: (max_tool_calls > 0).then_some(max_tool_calls),
             max_repeat_tool_calls: (max_repeat_tool_calls > 0).then_some(max_repeat_tool_calls),
             mcp_servers,
@@ -1861,5 +1892,50 @@ mod tests {
             let cfg: Config = toml::from_str(bad).unwrap();
             assert!(cfg.validate().is_err(), "{bad} should fail validation");
         }
+    }
+
+    #[test]
+    fn high_thought_profile_raises_default_inactivity_floor_and_respects_explicit_override() {
+        let parsed: Config = toml::from_str(
+            r#"
+            [agent]
+            inactivity_timeout_secs = 45
+            thought_level = "low"
+
+            [profiles.deep]
+            model = "gemini-4-neon"
+            thought_level = "high"
+            max_turn_secs = 900
+
+            [profiles.deep_short]
+            model = "gemini-4-neon"
+            thought_level = "high"
+            max_turn_secs = 80
+
+            [profiles.deep_explicit]
+            model = "gemini-4-neon"
+            thought_level = "high"
+            inactivity_timeout_secs = 180
+            max_turn_secs = 900
+
+            [profiles.fast]
+            model = "gemini-4-hydrogen"
+            thought_level = "low"
+            "#,
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+
+        let deep = parsed.resolve_profile(Some("deep")).unwrap();
+        assert_eq!(deep.inactivity, Duration::from_secs(120));
+
+        let deep_short = parsed.resolve_profile(Some("deep_short")).unwrap();
+        assert_eq!(deep_short.inactivity, Duration::from_secs(80));
+
+        let deep_explicit = parsed.resolve_profile(Some("deep_explicit")).unwrap();
+        assert_eq!(deep_explicit.inactivity, Duration::from_secs(180));
+
+        let fast = parsed.resolve_profile(Some("fast")).unwrap();
+        assert_eq!(fast.inactivity, Duration::from_secs(45));
     }
 }

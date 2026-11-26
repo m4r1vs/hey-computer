@@ -40,7 +40,7 @@ use crate::notify_filter::{
     self, ChatContextMessage, EnrichmentResult, LocalTime, PreparedNotification,
 };
 use crate::present::{Presentation, Presenter, Urgency};
-use crate::protocol::{InputSource, Reply};
+use crate::protocol::{FailReason, InputSource, Reply};
 use crate::store::{self, NewDraftCheckpoint, Store};
 
 /// Strict wall-clock cap for opportunistic `GetContext` enrichment calls from `NotifyHold`.
@@ -166,7 +166,7 @@ impl MessengerHandle {
         let body_l = text.trim().to_ascii_lowercase();
         state.recent_holds.iter().any(|h| {
             h.channel == chan
-                && (h.sender_lower == sender_l
+                && (names_likely_same(&h.sender_lower, &sender_l)
                     || h.sender_lower == chat_l
                     || (!body_l.is_empty()
                         && (h.body_lower == body_l || body_l.contains(&h.body_lower))))
@@ -437,10 +437,9 @@ async fn handle_event(
                         "{platform} session unlinked; run `hey-computer-bridge pair {platform}` to re-link."
                     )
                 });
-                presenter.present(Presentation::Notice {
+                presenter.present(Presentation::Error {
                     summary: format!("Messenger bridge: {platform} needs re-linking"),
                     body,
-                    urgency: Urgency::Normal,
                     replaces_id: None,
                 });
             }
@@ -524,7 +523,14 @@ async fn handle_event(
                         "queued verified {platform} self-chat turn #{id} (background={background})"
                     );
                 }
-                Err(msg) => tracing::warn!("rejected {platform} self-chat turn: {msg}"),
+                Err(msg) => {
+                    tracing::warn!("rejected {platform} self-chat turn: {msg}");
+                    presenter.present(Presentation::Error {
+                        summary: format!("{platform} self-chat failed"),
+                        body: msg,
+                        replaces_id: None,
+                    });
+                }
             }
         }
         BridgeEvent::Message {
@@ -597,6 +603,7 @@ async fn handle_event(
                 .or_else(|| config.notifications.profile.clone());
             let settle_for_desktop_hold = config.notifications.enabled;
             let use_triage = config.notifications.triage_profile.is_some();
+            let allowed_mcp_tools = config.notifications.allowed_mcp_tools.clone();
             let draft_ttl_ms = (config.notifications.draft_ttl_secs * 1000.0).round() as i64;
             let store = store.clone();
             let presenter = Arc::clone(presenter);
@@ -620,10 +627,28 @@ async fn handle_event(
                 if use_triage {
                     let triage_prompt = notify_filter::build_triage_prompt(&prepared, &ctx);
                     let triage_tok = Arc::new(crate::conductor::CancelToken::default());
-                    let actionable = conductor
+                    let actionable = match conductor
                         .triage_notification(triage_prompt, triage_tok)
                         .await
-                        .unwrap_or(false);
+                    {
+                        Ok(Ok(val)) => val,
+                        Ok(Err((reason, message))) => {
+                            if !matches!(
+                                reason,
+                                FailReason::Cancelled
+                                    | FailReason::Superseded
+                                    | FailReason::KeyringLocked
+                            ) {
+                                presenter.present(Presentation::Error {
+                                    summary: format!("{app_name} triage failed ({display_sender})"),
+                                    body: format!("{}: {message}", reason.headline()),
+                                    replaces_id: None,
+                                });
+                            }
+                            false
+                        }
+                        Err(_) => false,
+                    };
                     if !actionable {
                         return;
                     }
@@ -632,7 +657,11 @@ async fn handle_event(
                     }
                 }
 
-                let prompt = notify_filter::build_enrichment_prompt(&prepared, &ctx);
+                let prompt = notify_filter::build_enrichment_prompt_with_tools(
+                    &prepared,
+                    &ctx,
+                    &allowed_mcp_tools,
+                );
                 let (tx, rx) = oneshot::channel();
                 let turn_id = match conductor.ask(
                     AskParams {
@@ -654,18 +683,43 @@ async fn handle_event(
                 ) {
                     Ok(id) => id,
                     Err(msg) => {
-                        tracing::debug!("skipping bridge DM draft for {platform}: {msg}");
+                        tracing::warn!("failed to queue bridge DM draft for {platform}: {msg}");
+                        presenter.present(Presentation::Error {
+                            summary: format!("{app_name} enrichment failed ({display_sender})"),
+                            body: msg,
+                            replaces_id: None,
+                        });
                         return;
                     }
                 };
 
-                let Ok(Reply::Answer {
-                    text: answer,
-                    suppressed: false,
-                    ..
-                }) = rx.await
-                else {
-                    return;
+                let answer = match rx.await {
+                    Ok(Reply::Answer {
+                        text,
+                        suppressed: false,
+                        ..
+                    }) => text,
+                    Ok(Reply::Answer {
+                        suppressed: true, ..
+                    }) => return,
+                    Ok(Reply::Failed {
+                        reason, message, ..
+                    }) => {
+                        if !matches!(
+                            reason,
+                            FailReason::Cancelled
+                                | FailReason::Superseded
+                                | FailReason::KeyringLocked
+                        ) {
+                            presenter.present(Presentation::Error {
+                                summary: format!("{app_name} enrichment failed ({display_sender})"),
+                                body: format!("#{turn_id} · {}: {message}", reason.headline()),
+                                replaces_id: None,
+                            });
+                        }
+                        return;
+                    }
+                    Ok(_) | Err(_) => return,
                 };
                 if handle_clone.was_recently_held(platform, &sender_name, &chat_id, &body) {
                     return;
@@ -684,7 +738,7 @@ async fn handle_event(
                     .create_draft_checkpoint(NewDraftCheckpoint {
                         turn_id: Some(turn_id),
                         channel: channel.clone(),
-                        app_name,
+                        app_name: app_name.clone(),
                         sender: display_sender.clone(),
                         chat_target: chat_id,
                         source_notif_id: None,
@@ -710,6 +764,11 @@ async fn handle_event(
                     }
                     Err(e) => {
                         tracing::warn!("cannot persist bridge draft checkpoint: {e:#}");
+                        presenter.present(Presentation::Error {
+                            summary: format!("{app_name} draft save failed ({display_sender})"),
+                            body: format!("{e:#}"),
+                            replaces_id: None,
+                        });
                     }
                 }
             });
@@ -783,6 +842,25 @@ fn format_self_chat_prompt(
     )
 }
 
+fn names_likely_same(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    is_word_prefix(a, b) || is_word_prefix(b, a)
+}
+
+fn is_word_prefix(short: &str, long: &str) -> bool {
+    if short.chars().count() < 3 || long.len() <= short.len() {
+        return false;
+    }
+    long.strip_prefix(short)
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|ch| !ch.is_alphanumeric())
+}
+
 fn preview_text(text: &str, max_chars: usize) -> String {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = normalized.chars();
@@ -803,5 +881,35 @@ mod tests {
         assert_eq!(preview_text("  hello \n\t world  ", 20), "hello world");
         assert_eq!(preview_text("abcdef", 4), "abcd…");
         assert_eq!(preview_text("abcd", 4), "abcd");
+    }
+
+    #[test]
+    fn was_recently_held_matches_full_and_first_name_word_prefixes() {
+        let handle = MessengerHandle::inactive();
+        handle.record_notify_hold("whatsapp", "Alex Mercer", "Coming Monday");
+        assert!(handle.was_recently_held(
+            Platform::Whatsapp,
+            "Alex",
+            "+4915100000101",
+            "different text"
+        ));
+        assert!(handle.was_recently_held(
+            Platform::Whatsapp,
+            "alex mercer",
+            "+4915100000101",
+            "different text"
+        ));
+        assert!(!handle.was_recently_held(
+            Platform::Whatsapp,
+            "Alexander",
+            "+4915100000102",
+            "different text"
+        ));
+        assert!(!handle.was_recently_held(
+            Platform::Whatsapp,
+            "Al",
+            "+4915100000103",
+            "different text"
+        ));
     }
 }
