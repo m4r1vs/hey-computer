@@ -42,7 +42,7 @@ One workspace, two packages, three binaries: `packages.default` ships `hey-compu
 `ask`, `cancel`, `status`, `speak`, `distill`, `view`, `last`, `tasks`, `recall`, `schedule`,
 `draft`, internal `mcp-ui`, and `debug` — pure Rust, never linking GTK4/WebKitGTK at runtime)
 and `hey-computer-viewer` (native GTK4 + WebKitGTK 6.0 viewer with `application_id =
-"hey-computer.answer"`, `NON_UNIQUE`); `packages.messenger-bridge` ships `hey-computer-bridge`
+"hey_computer.answer"`, `NON_UNIQUE`); `packages.messenger-bridge` ships `hey-computer-bridge`
 wrapped with `hey-computer-baileys-reader` (Node 22 + Baileys v7) and `signal-cli` for strictly
 read-only WhatsApp & Signal context and phone self-chat. `daemon` owns the socket; every other
 subcommand is a client.
@@ -180,6 +180,10 @@ subcommand is a client.
   merges into the first window as an editor tab. Unsetting `DBUS_SESSION_BUS_ADDRESS` is not
   enough (GLib falls back to `$XDG_RUNTIME_DIR/bus`); `DBUS_SESSION_BUS_ADDRESS=disabled:`
   gives one preview window per answer. `--name=hey-computer.answer` sets the Wayland app id.
+- Viewer app id: no `-` outside the last element (`hey_computer.answer`). GLib allows it,
+  xdg-desktop-portal does not, and WebKitGTK puts the id into its sandbox's `.flatpak-info`;
+  `hey-computer.answer` made xdg-desktop-portal 1.20.4 segfault on WebKit's `Realtime` call
+  every time a viewer opened. `is_valid_app_id` checks both rules.
 - Hyprland 0.55 with a Lua config: `hyprctl dispatch X` evaluates `hl.dispatch(X)`; errors
   still exit 0; a stale `HYPRLAND_INSTANCE_SIGNATURE` gives exit 4, and
   `hyprctl instances -j` finds the live instance.

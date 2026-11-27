@@ -993,6 +993,7 @@ fn is_self_app_id(id: &str) -> bool {
         id,
         "hey-computer" | "hey-computer-viewer" | "hey-computer.answer" | "npu-dictate"
     ) || id.starts_with("hey-computer.")
+        || id.starts_with("hey_computer.")
 }
 
 fn is_system_or_privacy_boilerplate(summary: &str, body: &str) -> bool {

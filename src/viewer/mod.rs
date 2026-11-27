@@ -58,7 +58,21 @@ use self::stream::{
     send_schedule_reload_best_effort, send_schedule_run, spawn_ask_stream, spawn_tts_stream,
 };
 
-const DEFAULT_APP_ID: &str = "hey-computer.answer";
+/// No `-` outside the last element: see [`is_valid_app_id`].
+const DEFAULT_APP_ID: &str = "hey_computer.answer";
+
+/// GLib accepts `-` in every element of an application ID, xdg-desktop-portal
+/// only in the last one. WebKitGTK writes the ID into the `.flatpak-info` of
+/// its bubblewrap sandbox, so the portal treats the web process as a Flatpak
+/// app; with an ID it rejects, every portal call from that process fails, and
+/// xdg-desktop-portal 1.20.4 crashes on it (a NULL `GError` in
+/// `authorize_callback`, hit by WebKit's `Realtime` request).
+fn is_valid_app_id(id: &str) -> bool {
+    gio::Application::id_is_valid(id)
+        && id
+            .rsplit_once('.')
+            .is_some_and(|(head, _)| !head.contains('-'))
+}
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -787,7 +801,7 @@ pub fn run() -> Result<()> {
     });
     let boot_json = escape_json_for_inline_script(&serde_json::to_string(&boot_payload)?);
 
-    let app_id = if gio::Application::id_is_valid(&cli.name) {
+    let app_id = if is_valid_app_id(&cli.name) {
         cli.name.clone()
     } else {
         eprintln!(
@@ -3199,8 +3213,8 @@ mod tests {
     use super::palette::parse_palette_json;
     use super::stream::normalize_ask_profile;
     use super::{
-        Cli, ForceTheme, build_shell_html, escape_json_for_inline_script, parse_optional_u64,
-        safe_join_asset, smartcase_find_options,
+        Cli, DEFAULT_APP_ID, ForceTheme, build_shell_html, escape_json_for_inline_script, gio,
+        is_valid_app_id, parse_optional_u64, safe_join_asset, smartcase_find_options,
     };
     use clap::Parser;
     use hey_computer::config::{Config, History as HistoryConfig};
@@ -3258,7 +3272,7 @@ mod tests {
             "--height",
             "900",
             "--name",
-            "hey-computer.custom",
+            "hey_computer.custom",
         ])
         .expect("parse production viewer CLI");
 
@@ -3277,7 +3291,19 @@ mod tests {
         assert_eq!(cli.force_theme, Some(ForceTheme::Dark));
         assert_eq!(cli.width, 1200);
         assert_eq!(cli.height, 900);
-        assert_eq!(cli.name, "hey-computer.custom");
+        assert_eq!(cli.name, "hey_computer.custom");
+    }
+
+    #[test]
+    fn app_id_validation_follows_xdg_desktop_portal() {
+        assert!(is_valid_app_id(DEFAULT_APP_ID));
+        assert!(is_valid_app_id("hey_computer.custom"));
+        assert!(is_valid_app_id("org.example.my-app"));
+        // GLib accepts these, xdg-desktop-portal does not.
+        assert!(gio::Application::id_is_valid("hey-computer.answer"));
+        assert!(!is_valid_app_id("hey-computer.answer"));
+        assert!(!is_valid_app_id("org.my-org.app"));
+        assert!(!is_valid_app_id("nodot"));
     }
 
     #[test]

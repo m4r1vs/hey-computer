@@ -593,7 +593,7 @@ running, the agent edits the vault's files directly.
 
 Long or rich answers—and any turn carrying structured `mcp-ui` widgets—open in
 `hey-computer-viewer`, a native **GTK4 + WebKitGTK 6.0** viewer built directly in
-this package (`application_id = "hey-computer.answer"`, `NON_UNIQUE` so each
+this package (`application_id = "hey_computer.answer"`, `NON_UNIQUE` so each
 answer gets its own floating Wayland window while keeping session D-Bus active
 for dark/light portal updates):
 

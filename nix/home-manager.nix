@@ -646,7 +646,7 @@ in {
           HTML-disarmed Markdown file and `{id}` is the SQLite turn ID). Started
           in a systemd user scope of its own so the window outlives daemon
           restarts. Empty shows the file's path in a notification instead. With
-          the built-in viewer, the Wayland app id is `hey-computer.answer`.
+          the built-in viewer, the Wayland app id is `hey_computer.answer`.
         '';
       };
     };
